@@ -1,0 +1,35 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>Proposals Inbox</h2>
+        <div class="inline-actions">
+            <a class="button ghost" href="/proposals">All</a>
+            <a class="button ghost" href="/proposals?status_filter=pending">Pending</a>
+            <a class="button ghost" href="/proposals?status_filter=executed">Executed</a>
+        </div>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Connector</th>
+                <th>Risk</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for proposal in proposals %}
+                {% include "partials/proposal_row.html" %}
+            {% else %}
+            <tr>
+                <td colspan="6" class="muted">No proposals found.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}
+

@@ -1,0 +1,30 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>Approval UI</h2>
+        <p class="muted">Approve or reject pending proposals. Approvals immediately trigger execution.</p>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Proposal</th>
+                <th>Connector</th>
+                <th>Risk</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Approval</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for proposal in proposals %}
+                {% include "partials/proposal_row.html" with context %}
+            {% else %}
+            <tr>
+                <td colspan="6" class="muted">No pending proposals.</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

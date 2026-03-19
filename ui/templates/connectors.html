@@ -1,0 +1,22 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <h2>Connector Status</h2>
+        <p class="muted">All connectors are local-first, modular, and approval-aware.</p>
+    </div>
+    <div class="grid cards three">
+        {% for connector in connectors %}
+        <article class="card inset">
+            <div class="card-header">
+                <h3>{{ connector.name }}</h3>
+                <span class="badge {{ 'ok' if connector.available else 'warn' }}">{{ "available" if connector.available else "degraded" }}</span>
+            </div>
+            <p>{{ connector.description }}</p>
+            <pre>{{ connector | tojson(indent=2) }}</pre>
+        </article>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}
+

@@ -1,0 +1,14 @@
+{% if result %}
+<div class="panel {{ 'success-panel' if result.ok else 'danger-panel' }}">
+    <p><strong>{{ result.provider_name }}</strong> / {{ result.model_name }}</p>
+    <p>{{ result.message }}</p>
+    {% if result.content %}
+    <pre>{{ result.content }}</pre>
+    {% endif %}
+</div>
+{% else %}
+<div class="panel">
+    <p class="muted">Run a provider test to see the response here.</p>
+</div>
+{% endif %}
+

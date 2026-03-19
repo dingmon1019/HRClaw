@@ -1,0 +1,87 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card">
+    <div class="card-header">
+        <div>
+            <h2>{{ proposal.title }}</h2>
+            <p class="muted">{{ proposal.description }}</p>
+        </div>
+        <div class="stack tight align-end">
+            <span class="badge {{ proposal.risk_level.value }}">{{ proposal.risk_level.value }}</span>
+            <span class="badge {{ proposal.status.value }}">{{ proposal.status.value }}</span>
+        </div>
+    </div>
+
+    <div class="grid two">
+        <article class="panel">
+            <h3>Action</h3>
+            <p><strong>Connector:</strong> {{ proposal.connector }}</p>
+            <p><strong>Action Type:</strong> {{ proposal.action_type }}</p>
+            <p><strong>Requires Approval:</strong> {{ "yes" if proposal.requires_approval else "no" }}</p>
+            <p><strong>Created:</strong> {{ proposal.created_at }}</p>
+            <p><strong>Objective:</strong> {{ proposal.objective }}</p>
+            <p><strong>Rationale:</strong> {{ proposal.rationale }}</p>
+            <pre>{{ proposal.payload | tojson(indent=2) }}</pre>
+        </article>
+
+        <article class="panel">
+            <h3>Policy Notes</h3>
+            <ul class="flat-list">
+                {% for note in proposal.policy_notes %}
+                <li>{{ note }}</li>
+                {% else %}
+                <li class="muted">No policy notes.</li>
+                {% endfor %}
+            </ul>
+
+            {% if proposal.status.value == "pending" %}
+            <div class="actions">
+                <form method="post" action="/proposals/{{ proposal.id }}/approve">
+                    <input type="hidden" name="actor" value="operator">
+                    <input type="hidden" name="reason" value="Approved from proposal detail view">
+                    <button class="button primary" type="submit">Approve and Execute</button>
+                </form>
+                <form method="post" action="/proposals/{{ proposal.id }}/reject">
+                    <input type="hidden" name="actor" value="operator">
+                    <input type="hidden" name="reason" value="Rejected from proposal detail view">
+                    <button class="button danger" type="submit">Reject</button>
+                </form>
+            </div>
+            {% endif %}
+        </article>
+    </div>
+</section>
+
+<section class="grid two">
+    <article class="card">
+        <h3>Approval Log</h3>
+        <div class="stack">
+            {% for approval in approvals %}
+            <div class="list-item">
+                <strong>{{ approval.decision }}</strong>
+                <p>{{ approval.actor }}{% if approval.reason %}: {{ approval.reason }}{% endif %}</p>
+                <small>{{ approval.created_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No approval records yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <h3>Execution Log</h3>
+        <div class="stack">
+            {% for entry in history %}
+            <div class="list-item">
+                <strong>{{ entry.status }}</strong>
+                <p>{{ entry.action_type }}</p>
+                <pre>{{ entry.output | tojson(indent=2) if entry.output else entry.error_text or "No output" }}</pre>
+            </div>
+            {% else %}
+            <p class="muted">No execution history yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+{% endblock %}
+

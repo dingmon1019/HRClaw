@@ -1,0 +1,128 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h2>Runtime Settings</h2>
+            <p class="muted">Persistent settings are stored in SQLite and merged with `.env` defaults.</p>
+        </div>
+        <form method="post" action="/settings" class="stack form-grid">
+            <div class="grid two">
+                <label>
+                    Runtime Mode
+                    <select name="runtime_mode">
+                        <option value="safe" {% if settings.runtime_mode.value == "safe" %}selected{% endif %}>safe</option>
+                        <option value="relaxed" {% if settings.runtime_mode.value == "relaxed" %}selected{% endif %}>relaxed</option>
+                    </select>
+                </label>
+                <label>
+                    Provider
+                    <select name="provider">
+                        {% for provider in providers %}
+                        <option value="{{ provider.name }}" {% if settings.provider == provider.name %}selected{% endif %}>{{ provider.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+            </div>
+
+            <div class="grid two">
+                <label>
+                    Fallback Provider
+                    <input type="text" name="fallback_provider" value="{{ settings.fallback_provider or '' }}">
+                </label>
+                <label>
+                    Model
+                    <input type="text" name="model" value="{{ settings.model }}">
+                </label>
+            </div>
+
+            <div class="grid two">
+                <label>
+                    Base URL
+                    <input type="text" name="base_url" value="{{ settings.base_url or '' }}">
+                </label>
+                <label>
+                    API Key Env
+                    <input type="text" name="api_key_env" value="{{ settings.api_key_env }}">
+                </label>
+            </div>
+
+            <div class="grid two">
+                <label>
+                    Generic HTTP Endpoint
+                    <input type="text" name="generic_http_endpoint" value="{{ settings.generic_http_endpoint or '' }}">
+                </label>
+                <label>
+                    Provider Timeout Seconds
+                    <input type="number" step="1" min="1" name="provider_timeout_seconds" value="{{ settings.provider_timeout_seconds }}">
+                </label>
+            </div>
+
+            <div class="grid two">
+                <label>
+                    Provider Max Retries
+                    <input type="number" min="0" name="provider_max_retries" value="{{ settings.provider_max_retries }}">
+                </label>
+                <label class="checkbox">
+                    <input type="checkbox" name="json_audit_enabled" value="true" {% if settings.json_audit_enabled %}checked{% endif %}>
+                    Enable JSON audit log
+                </label>
+            </div>
+
+            <label>
+                Allowed Filesystem Roots
+                <input type="text" name="allowed_filesystem_roots" value="{{ settings.allowed_filesystem_roots | join(',') }}">
+            </label>
+
+            <label>
+                Allowed HTTP Hosts
+                <input type="text" name="allowed_http_hosts" value="{{ settings.allowed_http_hosts | join(',') }}">
+            </label>
+
+            <label>
+                PowerShell Allowlist
+                <input type="text" name="powershell_allowlist" value="{{ settings.powershell_allowlist | join(',') }}">
+            </label>
+
+            <div class="actions">
+                <button type="submit" class="button primary">Save Settings</button>
+            </div>
+        </form>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h2>Provider Smoke Test</h2>
+            <p class="muted">Run a live provider test without leaving the page.</p>
+        </div>
+        <form
+            class="stack"
+            hx-post="/settings/test-provider"
+            hx-target="#provider-test-result"
+            hx-swap="innerHTML"
+        >
+            <label>
+                Provider
+                <select name="provider_name">
+                    {% for provider in providers %}
+                    <option value="{{ provider.name }}">{{ provider.name }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>
+                Model
+                <input type="text" name="model_name" value="{{ settings.model }}">
+            </label>
+            <label>
+                Prompt
+                <textarea name="prompt" rows="4">Return a one-line readiness confirmation.</textarea>
+            </label>
+            <button type="submit" class="button ghost">Test Provider</button>
+        </form>
+        <div id="provider-test-result" class="mt-16">
+            {% include "partials/provider_test_result.html" %}
+        </div>
+    </article>
+</section>
+{% endblock %}
+

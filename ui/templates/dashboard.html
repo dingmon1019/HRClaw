@@ -1,0 +1,104 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="grid cards four">
+    <article class="card stat-card">
+        <span>Pending</span>
+        <strong>{{ counts["pending"] }}</strong>
+    </article>
+    <article class="card stat-card">
+        <span>Approved</span>
+        <strong>{{ counts["approved"] }}</strong>
+    </article>
+    <article class="card stat-card">
+        <span>Executed</span>
+        <strong>{{ counts["executed"] }}</strong>
+    </article>
+    <article class="card stat-card">
+        <span>Failed / Blocked</span>
+        <strong>{{ counts["failed"] + counts["blocked"] }}</strong>
+    </article>
+</section>
+
+<section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h2>Recent Summaries</h2>
+            <a href="/run">New run</a>
+        </div>
+        <div class="stack">
+            {% for summary in recent_summaries %}
+            <div class="list-item">
+                <strong>{{ summary.objective }}</strong>
+                <p>{{ summary.summary_text }}</p>
+                <small>{{ summary.created_at }} via {{ summary.provider_name }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No summaries yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h2>Recent Action History</h2>
+            <a href="/history">View all</a>
+        </div>
+        <div class="stack">
+            {% for entry in recent_history %}
+            <div class="list-item">
+                <strong>{{ entry.action_type }}</strong>
+                <p>{{ entry.status }} for proposal {{ entry.proposal_id }}</p>
+                <small>{{ entry.started_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No execution history yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+
+<section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h2>Provider Status</h2>
+            <a href="/settings">Configure</a>
+        </div>
+        <table>
+            <thead>
+                <tr><th>Name</th><th>Configured</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+                {% for provider in providers %}
+                <tr>
+                    <td>{{ provider.name }}</td>
+                    <td><span class="badge {{ 'ok' if provider.configured else 'warn' }}">{{ "yes" if provider.configured else "no" }}</span></td>
+                    <td>{{ provider.description }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h2>Connector Status</h2>
+            <a href="/connectors">Inspect</a>
+        </div>
+        <table>
+            <thead>
+                <tr><th>Name</th><th>Available</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+                {% for connector in connectors %}
+                <tr>
+                    <td>{{ connector.name }}</td>
+                    <td><span class="badge {{ 'ok' if connector.available else 'warn' }}">{{ "online" if connector.available else "degraded" }}</span></td>
+                    <td>{{ connector.description }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </article>
+</section>
+{% endblock %}
+

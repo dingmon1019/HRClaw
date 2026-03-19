@@ -1,0 +1,6 @@
+{
+  "objective": "Inspect the docs folder and create a follow-up task.",
+  "filesystem_path": ".\\docs",
+  "task_title": "Review collected docs findings",
+  "task_details": "Use the generated proposal set to decide the next action."
+}

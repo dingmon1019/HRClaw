@@ -1,0 +1,89 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card wide">
+    <div class="card-header">
+        <h2>Run Agent</h2>
+        <p class="muted">Collect context, summarize it, and generate approval-ready proposals. The runtime does not execute during this step.</p>
+    </div>
+    <form method="post" action="/run" class="stack form-grid">
+        <label>
+            Objective
+            <textarea name="objective" rows="4" placeholder="Describe the task you want the runtime to plan." required></textarea>
+        </label>
+
+        <div class="grid two">
+            <label>
+                Filesystem Path
+                <input type="text" name="filesystem_path" placeholder=".\docs\notes.txt or C:\work\folder">
+            </label>
+            <label>
+                Provider Override
+                <select name="provider_name">
+                    <option value="">Default ({{ settings.provider }})</option>
+                    {% for provider in providers %}
+                    <option value="{{ provider.name }}">{{ provider.name }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+        </div>
+
+        <label>
+            File Content
+            <textarea name="file_content" rows="4" placeholder="If set, the planner proposes a write or append action."></textarea>
+        </label>
+
+        <div class="grid three">
+            <label>
+                HTTP URL
+                <input type="text" name="http_url" placeholder="http://127.0.0.1:8000/api">
+            </label>
+            <label>
+                HTTP Method
+                <select name="http_method">
+                    <option>GET</option>
+                    <option>POST</option>
+                    <option>PUT</option>
+                    <option>PATCH</option>
+                    <option>DELETE</option>
+                </select>
+            </label>
+            <label>
+                Model Override
+                <input type="text" name="model_name" placeholder="{{ settings.model }}">
+            </label>
+        </div>
+
+        <label>
+            HTTP Headers
+            <textarea name="http_headers_text" rows="3" placeholder='{"Authorization":"Bearer ..."} or Header: value'></textarea>
+        </label>
+
+        <label>
+            HTTP Body
+            <textarea name="http_body" rows="4" placeholder="Optional request body for non-GET actions."></textarea>
+        </label>
+
+        <div class="grid two">
+            <label>
+                Task Title
+                <input type="text" name="task_title" placeholder="Optional local task title">
+            </label>
+            <label>
+                PowerShell Command
+                <input type="text" name="powershell_command" placeholder="Get-ChildItem .\docs">
+            </label>
+        </div>
+
+        <label>
+            Task Details
+            <textarea name="task_details" rows="3" placeholder="Optional task details for the local task connector."></textarea>
+        </label>
+
+        <div class="actions">
+            <button type="submit" class="button primary">Collect, Summarize, Propose</button>
+            <a href="/proposals" class="button ghost">View existing proposals</a>
+        </div>
+    </form>
+</section>
+{% endblock %}
+

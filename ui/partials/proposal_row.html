@@ -1,0 +1,40 @@
+<tr id="proposal-row-{{ proposal.id }}">
+    <td>
+        <strong>{{ proposal.title }}</strong>
+        <div class="muted small">{{ proposal.action_type }}</div>
+    </td>
+    <td>{{ proposal.connector }}</td>
+    <td><span class="badge {{ proposal.risk_level.value }}">{{ proposal.risk_level.value }}</span></td>
+    <td><span class="badge {{ proposal.status.value }}">{{ proposal.status.value }}</span></td>
+    <td>{{ proposal.created_at }}</td>
+    <td>
+        <div class="inline-actions">
+            <a class="button mini ghost" href="/proposals/{{ proposal.id }}">View</a>
+            {% if proposal.status.value == "pending" %}
+            <form
+                method="post"
+                action="/approvals/{{ proposal.id }}/approve"
+                hx-post="/approvals/{{ proposal.id }}/approve"
+                hx-target="#proposal-row-{{ proposal.id }}"
+                hx-swap="outerHTML"
+            >
+                <input type="hidden" name="actor" value="operator">
+                <input type="hidden" name="reason" value="Approved from inbox">
+                <button class="button mini primary" type="submit">Approve</button>
+            </form>
+            <form
+                method="post"
+                action="/approvals/{{ proposal.id }}/reject"
+                hx-post="/approvals/{{ proposal.id }}/reject"
+                hx-target="#proposal-row-{{ proposal.id }}"
+                hx-swap="outerHTML"
+            >
+                <input type="hidden" name="actor" value="operator">
+                <input type="hidden" name="reason" value="Rejected from inbox">
+                <button class="button mini danger" type="submit">Reject</button>
+            </form>
+            {% endif %}
+        </div>
+    </td>
+</tr>
+

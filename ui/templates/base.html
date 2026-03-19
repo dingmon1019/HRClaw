@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title or "Win Agent Runtime" }}</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</head>
+<body>
+    <header class="shell-header">
+        <div>
+            <p class="eyebrow">Inspired architecture</p>
+            <h1>Win Agent Runtime</h1>
+            <p class="subhead">Windows-first, localhost-native, approval-gated agent runtime inspired by NemoClaw and multi-provider patterns similar to OpenClaw.</p>
+        </div>
+        <nav class="shell-nav">
+            <a href="/">Dashboard</a>
+            <a href="/run">Run Agent</a>
+            <a href="/proposals">Proposals</a>
+            <a href="/approvals">Approval UI</a>
+            <a href="/history">History</a>
+            <a href="/connectors">Connectors</a>
+            <a href="/settings">Settings</a>
+        </nav>
+    </header>
+
+    <main class="page-shell">
+        {% if message %}
+        <section class="notice success">{{ message }}</section>
+        {% endif %}
+        {% if error %}
+        <section class="notice danger">{{ error }}</section>
+        {% endif %}
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>
+

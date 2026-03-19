@@ -1,0 +1,47 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="grid two">
+    <article class="card">
+        <h2>Action History</h2>
+        <table>
+            <thead>
+                <tr><th>Action</th><th>Status</th><th>Started</th><th>Proposal</th></tr>
+            </thead>
+            <tbody>
+                {% for entry in history %}
+                <tr>
+                    <td>{{ entry.action_type }}</td>
+                    <td><span class="badge {{ entry.status }}">{{ entry.status }}</span></td>
+                    <td>{{ entry.started_at }}</td>
+                    <td><a href="/proposals/{{ entry.proposal_id }}">{{ entry.proposal_id }}</a></td>
+                </tr>
+                {% else %}
+                <tr><td colspan="4" class="muted">No action history yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </article>
+
+    <article class="card">
+        <h2>Connector Runs</h2>
+        <table>
+            <thead>
+                <tr><th>Connector</th><th>Operation</th><th>Status</th><th>Created</th></tr>
+            </thead>
+            <tbody>
+                {% for run in connector_runs %}
+                <tr>
+                    <td>{{ run.connector }}</td>
+                    <td>{{ run.operation }}</td>
+                    <td><span class="badge {{ run.status }}">{{ run.status }}</span></td>
+                    <td>{{ run.created_at }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="4" class="muted">No connector runs yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </article>
+</section>
+{% endblock %}
+
