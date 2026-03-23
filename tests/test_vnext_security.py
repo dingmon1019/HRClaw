@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from app import cli as cli_module
+from app.api.app import create_app
 from app.config.settings import AppSettings
 from app.core.container import AppContainer
 from app.core.errors import AuthorizationError
@@ -318,6 +319,23 @@ def test_sensitive_payload_is_externalized_from_proposal_rows(container):
     assert materialized["content"] == secret_text
 
 
+def test_sensitive_request_material_is_not_duplicated_in_agent_runs(container):
+    secret_text = "duplicate-me-not"
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Write a note safely",
+            filesystem_path="note.txt",
+            file_content=secret_text,
+        )
+    )
+
+    rows = container.database.fetch_all("SELECT input_json, output_json FROM agent_runs WHERE run_id = ?", (result.run_id,))
+
+    assert rows
+    combined = "\n".join(f"{row['input_json']}\n{row['output_json']}" for row in rows)
+    assert secret_text not in combined
+
+
 def test_fail_closed_storage_blocks_sensitive_payload_without_override(tmp_path):
     settings = AppSettings(
         app_name="Fail Closed Storage Test",
@@ -345,6 +363,52 @@ def test_fail_closed_storage_blocks_sensitive_payload_without_override(tmp_path)
         )
 
 
+def test_generated_session_secret_requires_strong_protection_or_override(tmp_path):
+    settings = AppSettings(
+        app_name="Session Secret Protection Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        local_protection_mode="unprotected-local",
+        allow_insecure_local_storage=False,
+        session_secret=None,
+    )
+
+    with pytest.raises(ValueError, match="Strong local protection is required to store session-secret"):
+        create_app(settings)
+
+
+def test_secret_text_file_is_refused_when_only_unprotected_storage_is_available(tmp_path):
+    insecure_settings = AppSettings(
+        app_name="Secret File Protection Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        local_protection_mode="unprotected-local",
+        allow_insecure_local_storage=True,
+        session_secret="test-session-secret",
+    )
+    insecure_container = AppContainer(insecure_settings)
+    secret_path = insecure_container.base_settings.resolved_secrets_dir / "legacy-token.bin"
+    insecure_container.protected_storage.write_secret_text(secret_path, "temporary-token", purpose="cli-token")
+
+    strict_settings = insecure_settings.model_copy(update={"allow_insecure_local_storage": False})
+    strict_container = AppContainer(strict_settings)
+
+    with pytest.raises(ValueError, match="cli-token is stored with unprotected local fallback"):
+        strict_container.protected_storage.read_secret_text(secret_path, purpose="cli-token")
+
+
 def test_history_sanitization_redacts_sensitive_fields(container):
     sanitized = container.data_governance_service.sanitize_for_history(
         {
@@ -363,6 +427,23 @@ def test_history_sanitization_redacts_sensitive_fields(container):
     assert sanitized["headers"]["Accept"] == "application/json"
     assert "this should not be stored in full"[:32] in sanitized["rationale"]
     assert "top-secret" not in json.dumps(sanitized)
+
+
+def test_object_aware_agent_input_redaction(container):
+    sanitized = container.data_governance_service.sanitize_for_history(
+        {
+            "objective": "Review a file",
+            "request": {
+                "filesystem_path": "secret.txt",
+                "file_content": "do not duplicate",
+            },
+        },
+        object_type="agent_input",
+    )
+
+    assert sanitized["objective"].startswith("Review a file")
+    assert sanitized["request"]["redacted"] is True
+    assert "do not duplicate" not in json.dumps(sanitized)
 
 
 def test_full_file_digest_detects_same_size_content_change(container):
@@ -461,6 +542,25 @@ def test_cli_sensitive_command_uses_secure_prompt_without_token_env(container, m
     assert "CliSecure123!" not in output
 
 
+def test_cli_token_file_mode_is_disabled_without_strong_protection(container, monkeypatch):
+    username = "token-file-operator"
+    password = "CliSecure123!"
+    container.auth_service.create_initial_user(username, password)
+    strict_settings = container.base_settings.model_copy(
+        update={
+            "local_protection_mode": "unprotected-local",
+            "allow_insecure_local_storage": False,
+        }
+    )
+    strict_container = AppContainer(strict_settings)
+    monkeypatch.setattr(cli_module, "AppContainer", lambda: strict_container)
+    monkeypatch.setattr(sys, "argv", ["app.cli", "issue-cli-token", "--username", username, "--purpose", "worker", "--token-file", "worker.token"])
+    monkeypatch.setattr(cli_module, "getpass", lambda _: password)
+
+    with pytest.raises(ValueError, match="Strong local protection is required to store cli-token"):
+        cli_module.main()
+
+
 def test_cli_parser_rejects_password_stdin_legacy_flag():
     parser = cli_module.build_parser()
 
@@ -517,5 +617,9 @@ def test_release_archive_uses_allowlist(tmp_path):
     assert all(".venv/" not in name for name in names)
     assert all("/data/" not in name for name in names)
     assert any(name.endswith("README.md") for name in names)
+    assert result.sha256_path is not None and result.sha256_path.exists()
+    assert manifest["runtime_state_outside_repo"] is True
+    assert manifest["runtime_state_outside_repo_statement"]
     assert manifest["excluded_policy"]["forbidden_segments"]
+    assert manifest["include_policy"]
     assert manifest["included_paths"]

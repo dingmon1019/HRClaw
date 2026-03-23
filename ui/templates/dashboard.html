@@ -1,5 +1,46 @@
 {% extends "templates/base.html" %}
 {% block content %}
+<section class="card wide">
+    <div class="card-header">
+        <div>
+            <h2>Ask The Agent</h2>
+            <p class="muted">기본 진입점은 자연어 목표입니다. supervisor가 목표를 해석하고, planner가 bounded action을 만들고, reviewer가 위험과 egress를 검토한 뒤, 승인된 단계만 worker가 실행합니다.</p>
+        </div>
+        <div class="stack tight align-end">
+            <span class="badge ok">Assistant-First</span>
+            <span class="badge {{ 'danger' if storage_posture.posture == 'refused' else 'warn' if storage_posture.posture == 'unprotected-local' else 'ok' }}">{{ storage_posture.posture }}</span>
+        </div>
+    </div>
+    <form method="post" action="/run" class="stack form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+            Objective
+            <textarea name="objective" rows="4" placeholder="Example: Review files in workspace\\notes, summarize the current state, and propose a safe update before anything runs." required></textarea>
+        </label>
+        <div class="grid two">
+            <div class="panel">
+                <h3>Execution Guardrails</h3>
+                <ul class="flat-list">
+                    <li>typed proposals only</li>
+                    <li>manifest-bound approvals</li>
+                    <li>worker-only execution</li>
+                    <li>audit + history trace</li>
+                </ul>
+            </div>
+            <div class="panel">
+                <h3>Current Local Protection</h3>
+                <div class="metric-row"><span>Posture</span><strong>{{ storage_posture.posture }}</strong></div>
+                <div class="metric-row"><span>Sensitive blobs</span><strong>{{ storage_posture.sensitive_blob_storage }}</strong></div>
+                <div class="metric-row"><span>Secret persistence</span><strong>{{ "enabled" if storage_posture.secret_persistence_available else "disabled" }}</strong></div>
+            </div>
+        </div>
+        <div class="actions">
+            <button type="submit" class="button primary">Interpret and Prepare</button>
+            <a href="/run" class="button ghost">Open Expert Workbench</a>
+        </div>
+    </form>
+</section>
+
 <section class="grid cards four">
     <article class="card stat-card">
         <span>Pending</span>
@@ -79,6 +120,10 @@
             <div class="metric-row">
                 <span>Startup Script</span>
                 <strong>scripts/install-console-startup-task.ps1</strong>
+            </div>
+            <div class="metric-row">
+                <span>Secret Persistence</span>
+                <strong>{{ "enabled" if storage_posture.secret_persistence_available else "disabled" }}</strong>
             </div>
         </div>
     </article>

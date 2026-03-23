@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -55,6 +56,10 @@ FORBIDDEN_SUFFIXES = {
     ".pyo",
     ".pyd",
 }
+RUNTIME_STATE_OUTSIDE_REPO_STATEMENT = (
+    "Live runtime state belongs outside the repository by default under %LOCALAPPDATA%\\WinAgentRuntime "
+    "and must not be shipped inside release archives."
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,8 @@ class PackageResult:
     archive_path: Path
     file_count: int
     revision: str | None = None
+    archive_sha256: str | None = None
+    sha256_path: Path | None = None
 
 
 def _iter_allowed_files(root: Path):
@@ -131,6 +138,24 @@ def build_archive(root: Path, *, version: str | None = None) -> PackageResult:
     file_count = 0
     included_paths: list[str] = []
     revision = _git_revision(root)
+    manifest = {
+        "archive_prefix": ARCHIVE_PREFIX,
+        "version": suffix,
+        "build_time_utc": datetime.now(timezone.utc).isoformat(),
+        "git_revision": revision,
+        "include_policy": sorted(ALLOWED_PATHS),
+        "included_paths": [],
+        "excluded_policy": {
+            "forbidden_segments": sorted(FORBIDDEN_SEGMENTS),
+            "forbidden_filenames": sorted(FORBIDDEN_FILENAMES),
+            "forbidden_suffixes": sorted(FORBIDDEN_SUFFIXES),
+        },
+        "runtime_state_outside_repo": True,
+        "runtime_state_outside_repo_statement": RUNTIME_STATE_OUTSIDE_REPO_STATEMENT,
+        "working_tree_preflight_default": True,
+        "working_tree_verification_available": True,
+        "archive_sha256_sidecar": f"{archive_path.name}.sha256",
+    }
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as handle:
         for absolute, relative in _iter_allowed_files(root):
             _validate_relative(relative)
@@ -139,27 +164,22 @@ def build_archive(root: Path, *, version: str | None = None) -> PackageResult:
             file_count += 1
             included_paths.append(relative.as_posix())
         manifest_relative = Path(f"{ARCHIVE_PREFIX}-{suffix}") / "release_manifest.json"
+        manifest["included_paths"] = sorted(included_paths)
         handle.writestr(
             manifest_relative.as_posix(),
-            json.dumps(
-                {
-                    "archive_prefix": ARCHIVE_PREFIX,
-                    "version": suffix,
-                    "build_time_utc": datetime.now(timezone.utc).isoformat(),
-                    "git_revision": revision,
-                    "included_paths": sorted(included_paths),
-                    "excluded_policy": {
-                        "forbidden_segments": sorted(FORBIDDEN_SEGMENTS),
-                        "forbidden_filenames": sorted(FORBIDDEN_FILENAMES),
-                        "forbidden_suffixes": sorted(FORBIDDEN_SUFFIXES),
-                    },
-                    "working_tree_verification_available": True,
-                },
-                indent=2,
-            ),
+            json.dumps(manifest, indent=2),
         )
     verify_archive(archive_path)
-    return PackageResult(archive_path=archive_path, file_count=file_count, revision=revision)
+    archive_sha256 = _sha256_file(archive_path)
+    sha256_path = archive_path.with_suffix(f"{archive_path.suffix}.sha256")
+    sha256_path.write_text(f"{archive_sha256}  {archive_path.name}\n", encoding="utf-8")
+    return PackageResult(
+        archive_path=archive_path,
+        file_count=file_count,
+        revision=revision,
+        archive_sha256=archive_sha256,
+        sha256_path=sha256_path,
+    )
 
 
 def verify_archive(archive_path: Path) -> None:
@@ -171,6 +191,11 @@ def verify_archive(archive_path: Path) -> None:
                 continue
             if Path(*relative).name == "release_manifest.json":
                 manifest_found = True
+                manifest = json.loads(handle.read(member).decode("utf-8"))
+                if not manifest.get("runtime_state_outside_repo"):
+                    raise ValueError("Release manifest must declare that runtime state stays outside the repo.")
+                if not manifest.get("runtime_state_outside_repo_statement"):
+                    raise ValueError("Release manifest is missing the runtime-state statement.")
                 continue
             _validate_relative(Path(*relative))
     if not manifest_found:
@@ -196,6 +221,14 @@ def _git_revision(root: Path) -> str | None:
     return revision or None
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a clean release archive from an allowlist.")
     parser.add_argument("--version", default=None, help="Optional version label used in the archive name.")
@@ -219,6 +252,11 @@ def main() -> None:
         action="store_true",
         help="CI-oriented mode: clean dist, verify working tree artifacts, then build and verify the release archive.",
     )
+    parser.add_argument(
+        "--allow-dirty-working-tree",
+        action="store_true",
+        help="Explicitly bypass the working-tree runtime-artifact preflight. Use only for development smoke builds.",
+    )
     args = parser.parse_args()
 
     if args.verify_archive:
@@ -229,16 +267,20 @@ def main() -> None:
     if args.ci:
         args.clean = True
         args.verify_working_tree = True
+    verify_working_tree_by_default = not args.allow_dirty_working_tree
     if args.clean:
         clean_dist()
-    if args.verify_working_tree:
+    if args.verify_working_tree or verify_working_tree_by_default:
         findings = verify_working_tree(ROOT_DIR)
         if findings:
             joined = ", ".join(findings)
             raise SystemExit(f"Working tree still contains ignored local artifacts: {joined}")
     result = build_archive(ROOT_DIR, version=args.version)
     revision = f" @ {result.revision}" if result.revision else ""
-    print(f"Created {result.archive_path} with {result.file_count} files{revision}.")
+    print(
+        f"Created {result.archive_path} with {result.file_count} files{revision}. "
+        f"sha256={result.archive_sha256}"
+    )
 
 
 if __name__ == "__main__":

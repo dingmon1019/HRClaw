@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
-from pathlib import Path
 from typing import Any, Iterable
 
 from app.core.utils import json_dumps, sha256_hex
@@ -45,6 +44,110 @@ class DataGovernanceService:
         "system.test_path": {"path": NON_SENSITIVE},
         "system.get_time": {},
     }
+    OBJECT_FIELD_REGISTRY: dict[str, dict[str, str]] = {
+        "proposal_payload": {
+            "content": PRIVILEGED_SENSITIVE,
+            "body": PRIVILEGED_SENSITIVE,
+            "details": SENSITIVE_LOCAL,
+            "headers": SENSITIVE_LOCAL,
+            "query": SENSITIVE_LOCAL,
+            "query_string": SENSITIVE_LOCAL,
+            "params": SENSITIVE_LOCAL,
+            "rationale": PREVIEW_ONLY,
+            "summary": PREVIEW_ONLY,
+            "task_details": SENSITIVE_LOCAL,
+            "affected_resources": PREVIEW_ONLY,
+        },
+        "run_request": {
+            "objective": PREVIEW_ONLY,
+            "file_content": PRIVILEGED_SENSITIVE,
+            "http_headers_text": SENSITIVE_LOCAL,
+            "http_body": PRIVILEGED_SENSITIVE,
+            "task_details": SENSITIVE_LOCAL,
+            "system_path": NON_SENSITIVE,
+        },
+        "summary_payload": {
+            "objective": PREVIEW_ONLY,
+            "collected": PREVIEW_ONLY,
+            "summary_text": PREVIEW_ONLY,
+            "operator_summary": PREVIEW_ONLY,
+        },
+        "connector_input": {
+            "path": NON_SENSITIVE,
+            "url": NON_SENSITIVE,
+            "headers": SENSITIVE_LOCAL,
+            "body": PRIVILEGED_SENSITIVE,
+            "details": SENSITIVE_LOCAL,
+        },
+        "connector_output": {
+            "content": SENSITIVE_LOCAL,
+            "body": PRIVILEGED_SENSITIVE,
+            "details": SENSITIVE_LOCAL,
+            "summary": PREVIEW_ONLY,
+            "tasks": PREVIEW_ONLY,
+            "items": PREVIEW_ONLY,
+            "entries": PREVIEW_ONLY,
+        },
+        "agent_input": {
+            "objective": PREVIEW_ONLY,
+            "request": SENSITIVE_LOCAL,
+            "subtasks": PREVIEW_ONLY,
+            "collected_keys": NON_SENSITIVE,
+            "proposal_count": NON_SENSITIVE,
+            "proposal_ids": NON_SENSITIVE,
+            "proposal_titles": PREVIEW_ONLY,
+            "summary_id": NON_SENSITIVE,
+            "intent_summary": PREVIEW_ONLY,
+        },
+        "agent_output": {
+            "operator_summary": PREVIEW_ONLY,
+            "intent_summary": PREVIEW_ONLY,
+            "subtasks": PREVIEW_ONLY,
+            "proposal_ids": NON_SENSITIVE,
+            "proposal_titles": PREVIEW_ONLY,
+            "result": SENSITIVE_LOCAL,
+            "error": PREVIEW_ONLY,
+        },
+        "handoff_payload": {
+            "intent_summary": PREVIEW_ONLY,
+            "subtasks": PREVIEW_ONLY,
+            "proposal_count": NON_SENSITIVE,
+            "proposal_ids": NON_SENSITIVE,
+            "summary_id": NON_SENSITIVE,
+        },
+        "task_node_details": {
+            "request": PREVIEW_ONLY,
+            "intent_summary": PREVIEW_ONLY,
+            "operator_summary": PREVIEW_ONLY,
+            "subtasks": PREVIEW_ONLY,
+            "proposal_titles": PREVIEW_ONLY,
+            "proposal_ids": NON_SENSITIVE,
+            "summary_id": NON_SENSITIVE,
+            "memory_namespace": NON_SENSITIVE,
+            "error": PREVIEW_ONLY,
+            "result": PREVIEW_ONLY,
+            "connector_output": PREVIEW_ONLY,
+        },
+        "audit_payload": {
+            "objective": PREVIEW_ONLY,
+            "reason": PREVIEW_ONLY,
+            "error": PREVIEW_ONLY,
+            "result": PREVIEW_ONLY,
+            "proposal_ids": NON_SENSITIVE,
+            "manifest_hash": NON_SENSITIVE,
+        },
+        "history_payload": {
+            "input": PREVIEW_ONLY,
+            "output": PREVIEW_ONLY,
+            "error_text": PREVIEW_ONLY,
+            "result": PREVIEW_ONLY,
+        },
+        "provider_prompt": {
+            "prompt": SENSITIVE_LOCAL,
+            "system_prompt": PREVIEW_ONLY,
+            "summary": PREVIEW_ONLY,
+        },
+    }
     GENERIC_FIELD_CLASSES = {
         "content": PRIVILEGED_SENSITIVE,
         "body": PRIVILEGED_SENSITIVE,
@@ -80,10 +183,16 @@ class DataGovernanceService:
         purpose: str,
         action_type: str | None = None,
         connector: str | None = None,
+        object_type: str | None = None,
     ) -> dict[str, Any]:
         protected = deepcopy(payload)
         for key in list(payload):
-            storage_class = self.classify_field(key, action_type=action_type, connector=connector)
+            storage_class = self.classify_field(
+                key,
+                action_type=action_type,
+                connector=connector,
+                object_type=object_type,
+            )
             value = protected.get(key)
             if self._is_empty(value):
                 continue
@@ -127,6 +236,7 @@ class DataGovernanceService:
         *,
         action_type: str | None = None,
         connector: str | None = None,
+        object_type: str | None = None,
         field_name: str | None = None,
     ) -> Any:
         if isinstance(value, dict):
@@ -138,7 +248,12 @@ class DataGovernanceService:
                 if key == "headers" and isinstance(child, dict):
                     redacted[key] = self._sanitize_headers(child)
                     continue
-                storage_class = self.classify_field(key, action_type=action_type, connector=connector)
+                storage_class = self.classify_field(
+                    key,
+                    action_type=action_type,
+                    connector=connector,
+                    object_type=object_type,
+                )
                 if storage_class in self.STORAGE_FIELDS:
                     redacted[key] = self._redacted_descriptor(child, storage_class)
                     continue
@@ -149,20 +264,44 @@ class DataGovernanceService:
                     child,
                     action_type=action_type,
                     connector=connector,
+                    object_type=object_type,
                     field_name=key,
                 )
             return redacted
         if isinstance(value, list):
             preview_items = value[:100]
-            if field_name and self.classify_field(field_name, action_type=action_type, connector=connector) == self.PREVIEW_ONLY:
+            if field_name and self.classify_field(
+                field_name,
+                action_type=action_type,
+                connector=connector,
+                object_type=object_type,
+            ) == self.PREVIEW_ONLY:
                 return [self._preview_value(item) for item in preview_items]
             return [
-                self.sanitize_for_history(item, action_type=action_type, connector=connector)
+                self.sanitize_for_history(
+                    item,
+                    action_type=action_type,
+                    connector=connector,
+                    object_type=object_type,
+                )
                 for item in preview_items
             ]
         if isinstance(value, str):
-            if field_name and self.classify_field(field_name, action_type=action_type, connector=connector) in self.STORAGE_FIELDS:
-                return self._redacted_descriptor(value, self.classify_field(field_name, action_type=action_type, connector=connector))
+            if field_name and self.classify_field(
+                field_name,
+                action_type=action_type,
+                connector=connector,
+                object_type=object_type,
+            ) in self.STORAGE_FIELDS:
+                return self._redacted_descriptor(
+                    value,
+                    self.classify_field(
+                        field_name,
+                        action_type=action_type,
+                        connector=connector,
+                        object_type=object_type,
+                    ),
+                )
             return value[: self.PREVIEW_LIMIT]
         return value
 
@@ -172,8 +311,14 @@ class DataGovernanceService:
         *,
         action_type: str | None = None,
         connector: str | None = None,
+        object_type: str | None = None,
     ) -> Any:
-        return self.sanitize_for_history(value, action_type=action_type, connector=connector)
+        return self.sanitize_for_history(
+            value,
+            action_type=action_type,
+            connector=connector,
+            object_type=object_type,
+        )
 
     def purge_unreferenced_blobs(self, referenced_blob_ids: Iterable[str]) -> int:
         referenced = set(referenced_blob_ids)
@@ -189,7 +334,14 @@ class DataGovernanceService:
             removed += 1
         return removed
 
-    def classification_overview(self, payload: dict[str, Any], *, action_type: str | None = None, connector: str | None = None) -> list[dict[str, str]]:
+    def classification_overview(
+        self,
+        payload: dict[str, Any],
+        *,
+        action_type: str | None = None,
+        connector: str | None = None,
+        object_type: str | None = None,
+    ) -> list[dict[str, str]]:
         overview: list[dict[str, str]] = []
         for key in payload:
             if any(key.endswith(suffix) for suffix in self.METADATA_SUFFIXES):
@@ -197,19 +349,49 @@ class DataGovernanceService:
             overview.append(
                 {
                     "field": key,
-                    "storage_class": self.classify_field(key, action_type=action_type, connector=connector),
+                    "storage_class": self.classify_field(
+                        key,
+                        action_type=action_type,
+                        connector=connector,
+                        object_type=object_type,
+                    ),
                 }
             )
         return overview
 
-    def classify_field(self, field_name: str, *, action_type: str | None = None, connector: str | None = None) -> str:
+    def classify_field(
+        self,
+        field_name: str,
+        *,
+        action_type: str | None = None,
+        connector: str | None = None,
+        object_type: str | None = None,
+    ) -> str:
         if action_type:
             action_rule = self.ACTION_FIELD_REGISTRY.get(action_type, {})
             if field_name in action_rule:
                 return action_rule[field_name]
+        if object_type:
+            object_rule = self.OBJECT_FIELD_REGISTRY.get(object_type, {})
+            if field_name in object_rule:
+                return object_rule[field_name]
         if connector and field_name in self.ACTION_FIELD_REGISTRY.get(connector, {}):
             return self.ACTION_FIELD_REGISTRY[connector][field_name]
         return self.GENERIC_FIELD_CLASSES.get(field_name, self.NON_SENSITIVE)
+
+    def collect_blob_ids(self, value: Any) -> set[str]:
+        blob_ids: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.endswith("_blob_id") and isinstance(child, str):
+                    blob_ids.add(child)
+                    continue
+                blob_ids.update(self.collect_blob_ids(child))
+            return blob_ids
+        if isinstance(value, list):
+            for item in value:
+                blob_ids.update(self.collect_blob_ids(item))
+        return blob_ids
 
     @staticmethod
     def _serialize_value(value: Any) -> tuple[str, str]:

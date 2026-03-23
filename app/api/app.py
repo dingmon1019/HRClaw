@@ -28,6 +28,7 @@ def _load_session_secret(container: AppContainer) -> str:
     return container.protected_storage.ensure_secret_text(
         container.base_settings.resolved_session_secret_path,
         length=32,
+        purpose="session-secret",
     ).strip()
 
 

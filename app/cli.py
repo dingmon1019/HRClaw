@@ -111,7 +111,8 @@ def _resolve_cli_token(container: AppContainer, args, purpose: str):
     token: str | None = None
     if getattr(args, "token_file", None):
         token = container.protected_storage.read_secret_text(
-            _resolve_token_file(container, args.token_file)
+            _resolve_token_file(container, args.token_file),
+            purpose="cli-token",
         ).strip()
     elif getattr(args, "username", None):
         password = _read_password(args)
@@ -219,9 +220,10 @@ def main() -> None:
         }
         if args.token_file:
             token_path = _resolve_token_file(container, args.token_file)
-            container.protected_storage.write_secret_text(token_path, token)
+            container.protected_storage.write_secret_text(token_path, token, purpose="cli-token")
             response["token_file"] = str(token_path)
             response["storage_mode"] = container.protected_storage.storage_mode
+            response["storage_posture"] = container.protected_storage.posture_label
         if args.emit_token:
             response["token"] = token
         print(json.dumps(response, indent=2))

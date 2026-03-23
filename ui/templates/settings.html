@@ -343,6 +343,14 @@
                     <p class="small muted">CLI auth mode: {{ settings.cli_auth_mode }}</p>
                     <p class="small muted">Protected local storage mode: {{ protected_storage_mode }}</p>
                     <p class="small muted">Storage posture: {{ protected_storage_posture }}</p>
+                    <p class="small muted">Provider secret handling: {{ storage_posture.provider_secret_handling }}</p>
+                    {% if storage_posture.disabled_features %}
+                    <ul class="flat-list small mt-16">
+                        {% for feature in storage_posture.disabled_features %}
+                        <li>{{ feature }} disabled until strong protection or explicit insecure-dev override is available.</li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
                 </div>
 
             <form method="post" action="/settings/test-provider" class="stack form-grid">
@@ -449,20 +457,32 @@
                 </div>
             </div>
 
-            <div class="stack tight">
-                <div class="metric-row">
-                    <span>Used By</span>
-                    <strong>{{ entry.usage | join(', ') if entry.usage else "not currently selected" }}</strong>
+                <div class="stack tight">
+                    <div class="metric-row">
+                        <span>Used By</span>
+                        <strong>{{ entry.usage | join(', ') if entry.usage else "not currently selected" }}</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Privacy Posture</span>
+                        <strong>{{ entry.posture.privacy_posture }}</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Egress Posture</span>
+                        <strong>{{ entry.posture.egress_posture }}</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Capabilities</span>
+                        <strong>{{ status.capabilities | join(', ') if status else "-" }}</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Allowed Destinations</span>
+                        <strong>{{ entry.posture.destination_summary }}</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Recent Usage</span>
+                        <strong>{{ entry.runtime_usage.agent_steps }} agent steps / {{ entry.runtime_usage.executions }} executions</strong>
+                    </div>
                 </div>
-                <div class="metric-row">
-                    <span>Capabilities</span>
-                    <strong>{{ status.capabilities | join(', ') if status else "-" }}</strong>
-                </div>
-                <div class="metric-row">
-                    <span>Allowed Destinations</span>
-                    <strong>{{ config.allowed_hosts | join(', ') if config.allowed_hosts else "inherits global allowlist" }}</strong>
-                </div>
-            </div>
 
             <form method="post" action="/settings/provider-config" class="stack form-grid mt-16">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

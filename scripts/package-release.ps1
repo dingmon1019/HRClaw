@@ -1,6 +1,7 @@
 param(
     [string]$Version = "local",
     [switch]$VerifyWorkingTree,
+    [switch]$AllowDirtyWorkingTree,
     [switch]$Clean,
     [switch]$CI,
     [string]$VerifyArchive
@@ -17,6 +18,12 @@ if ($VerifyArchive) {
 }
 if ($VerifyWorkingTree) {
     $args += "--verify-working-tree"
+}
+elseif (-not $AllowDirtyWorkingTree -and -not $VerifyArchive) {
+    $args += "--verify-working-tree"
+}
+if ($AllowDirtyWorkingTree) {
+    $args += "--allow-dirty-working-tree"
 }
 if ($Clean) {
     $args += "--clean"

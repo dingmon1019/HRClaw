@@ -231,6 +231,7 @@ def _proposal_preview(container: AppContainer, proposal: ProposalRecord) -> dict
             runtime_payload,
             action_type=proposal.action_type,
             connector=proposal.connector,
+            object_type="proposal_payload",
         ),
         "rollback": _rollback_indicator(proposal),
     }
@@ -261,13 +262,16 @@ def _proposal_snapshot_context(container: AppContainer, proposal: ProposalRecord
     preview = _proposal_preview(container, proposal)
     if live_against_approval["live"]:
         preview.update(live_against_approval["live"].preview)
+    changed_fields = live_against_approval["changed_fields"]
+    drift_messages = [_humanize_drift_field(field) for field in changed_fields]
     return {
         "created_snapshot": created_snapshot,
         "approved_snapshot": approved_snapshot,
         "live_snapshot": live_against_approval["live"],
         "stale": live_against_approval["stale"],
         "stale_reason": proposal.stale_reason or live_against_approval["reason"],
-        "changed_fields": live_against_approval["changed_fields"],
+        "changed_fields": changed_fields,
+        "drift_messages": drift_messages,
         "preview": preview,
     }
 
@@ -285,17 +289,21 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
         "agent_runs": agent_runs,
         "handoffs": handoffs,
         "task_nodes": task_nodes,
-        "task_tree": _build_task_tree(task_nodes),
+        "task_tree": _build_task_tree(task_nodes, proposals),
         "connector_runs": connector_runs,
     }
 
 
-def _build_task_tree(task_nodes) -> list[dict[str, Any]]:
+def _build_task_tree(task_nodes, proposals) -> list[dict[str, Any]]:
+    proposal_lookup = {proposal.id: proposal for proposal in proposals}
     nodes = {
         node.id: {
             "node": node,
             "children": [],
             "dependency_titles": [],
+            "summary_lines": [],
+            "status_note": _task_status_note(node),
+            "proposal": None,
         }
         for node in task_nodes
     }
@@ -305,6 +313,10 @@ def _build_task_tree(task_nodes) -> list[dict[str, Any]]:
             for dependency_id in item["node"].depends_on
             if dependency_id in nodes
         ]
+        item["summary_lines"] = _task_summary_lines(item["node"], proposal_lookup)
+        proposal_id = item["node"].details.get("proposal_id")
+        if proposal_id and proposal_id in proposal_lookup:
+            item["proposal"] = proposal_lookup[proposal_id]
     roots: list[dict[str, Any]] = []
     for item in nodes.values():
         parent_id = item["node"].parent_task_node_id
@@ -336,8 +348,106 @@ def _provider_profile_usage(settings, provider_name: str) -> list[str]:
     return usage
 
 
+def _humanize_drift_field(field: str) -> str:
+    mapping = {
+        "action": "Action payload no longer matches the approved proposal.",
+        "policy": "Policy evaluation or risk classification changed after approval.",
+        "settings": "Relevant runtime or provider settings changed after approval.",
+        "resources": "Observed file, directory, or target resource state changed after approval.",
+    }
+    return mapping.get(field, f"{field} changed after approval.")
+
+
+def _task_status_note(node) -> str:
+    if node.status == "waiting_approval":
+        return "This node will not execute until an operator approves it."
+    if node.status == "blocked":
+        return "This node is waiting on dependencies or a reviewer decision."
+    if node.status == "ready":
+        return "This node is ready once its dependencies are satisfied."
+    if node.status == "running":
+        return "This node is currently in progress."
+    if node.status == "completed":
+        return "This node completed and unblocked its downstream steps."
+    if node.status == "failed":
+        return "This node failed. Inspect the stored error or output summary."
+    return "This node follows the persisted runtime state."
+
+
+def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> list[str]:
+    details = node.details or {}
+    lines: list[str] = []
+    if details.get("phase"):
+        lines.append(f"phase: {details['phase']}")
+    if details.get("input_source"):
+        lines.append(f"input: {details['input_source']}")
+    if node.provider_profile:
+        lines.append(f"profile: {node.provider_profile}")
+    if node.provider_name:
+        lines.append(f"provider: {node.provider_name}")
+    if details.get("proposal_id") and details["proposal_id"] in proposal_lookup:
+        proposal = proposal_lookup[details["proposal_id"]]
+        lines.append(f"proposal: {proposal.connector} / {proposal.action_type}")
+        lines.append(f"risk: {proposal.risk_level.value}")
+        if proposal.requires_approval:
+            lines.append("approval: required")
+    if details.get("planned_provider_profile"):
+        lines.append(f"planned profile: {details['planned_provider_profile']}")
+    if details.get("proposal_count") is not None:
+        lines.append(f"proposal count: {details['proposal_count']}")
+    if details.get("subtask_count") is not None:
+        lines.append(f"subtasks: {details['subtask_count']}")
+    if details.get("operator_summary"):
+        lines.append(f"report: {str(details['operator_summary'])[:140]}")
+    if details.get("intent_summary"):
+        lines.append(f"intent: {str(details['intent_summary'])[:140]}")
+    if details.get("error"):
+        lines.append(f"error: {str(details['error'])[:140]}")
+    return lines
+
+
+def _storage_posture_context(container: AppContainer) -> dict[str, Any]:
+    posture = container.protected_storage.feature_posture()
+    posture["secret_env_override_available"] = bool(container.base_settings.session_secret)
+    posture["provider_secret_handling"] = "environment variables only"
+    posture["provider_secret_supports_local_storage"] = False
+    return posture
+
+
+def _provider_runtime_usage(container: AppContainer) -> dict[str, dict[str, int]]:
+    usage: dict[str, dict[str, int]] = {}
+    for row in container.database.fetch_all(
+        "SELECT provider_name, COUNT(*) AS count FROM agent_runs WHERE provider_name IS NOT NULL GROUP BY provider_name"
+    ):
+        usage.setdefault(row["provider_name"], {})["agent_steps"] = int(row["count"])
+    for row in container.database.fetch_all(
+        "SELECT provider_name, COUNT(*) AS count FROM action_history WHERE provider_name IS NOT NULL GROUP BY provider_name"
+    ):
+        usage.setdefault(row["provider_name"], {})["executions"] = int(row["count"])
+    return usage
+
+
+def _provider_posture_summary(status, config, settings) -> dict[str, str]:
+    if status:
+        privacy_posture = status.privacy_posture
+        egress_posture = status.egress_posture
+        destination_summary = status.destination_summary
+    else:
+        privacy_posture = "external-egress"
+        egress_posture = "disabled" if not config.enabled else "inherits global allowlist"
+        destination_summary = ", ".join(config.allowed_hosts) if config.allowed_hosts else ", ".join(settings.provider_allowed_hosts)
+        if not destination_summary:
+            destination_summary = "no outbound host configured"
+    return {
+        "privacy_posture": privacy_posture,
+        "egress_posture": egress_posture,
+        "destination_summary": destination_summary,
+    }
+
+
 def _unsafe_warnings(container: AppContainer) -> list[str]:
     settings = container.settings_service.get_effective_settings()
+    storage_posture = _storage_posture_context(container)
     warnings: list[str] = []
     project_root = container.base_settings.project_root.resolve()
     runtime_root = container.base_settings.resolved_runtime_state_root
@@ -357,9 +467,9 @@ def _unsafe_warnings(container: AppContainer) -> list[str]:
         warnings.append("Provider private-network egress is enabled. Local LLM endpoints can receive prompts.")
     if settings.allow_restricted_provider_egress:
         warnings.append("Restricted data egress to remote providers is enabled. Review provider trust carefully.")
-    if not container.protected_storage.is_strongly_protected:
-        warnings.append("Sensitive local storage is not strongly protected. Install pywin32 for DPAPI or treat this host as development-only.")
-    if settings.allow_insecure_local_storage:
+    if storage_posture["posture"] == "refused":
+        warnings.append("Strong local protection is unavailable. Generated session-secret files and CLI token-file mode are disabled unless you opt into insecure development storage.")
+    elif storage_posture["posture"] == "unprotected-local":
         warnings.append("Insecure local storage override is enabled. Restricted payload blobs can be written without strong host protection.")
     return warnings
 
@@ -406,11 +516,15 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
     settings = container.settings_service.get_effective_settings()
     provider_statuses = container.provider_service.list_statuses()
     provider_status_map = {status.name: status for status in provider_statuses}
+    provider_usage = _provider_runtime_usage(container)
+    storage_posture = _storage_posture_context(container)
     provider_catalog = [
         {
             "status": provider_status_map.get(config.provider_name),
             "config": config,
             "usage": _provider_profile_usage(settings, config.provider_name),
+            "runtime_usage": provider_usage.get(config.provider_name, {"agent_steps": 0, "executions": 0}),
+            "posture": _provider_posture_summary(provider_status_map.get(config.provider_name), config, settings),
         }
         for config in settings.provider_configs
     ]
@@ -419,6 +533,7 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
         "settings": settings,
         "protected_storage_mode": container.protected_storage.storage_mode,
         "protected_storage_posture": container.protected_storage.posture_label,
+        "storage_posture": storage_posture,
         "providers": provider_statuses,
         "provider_catalog": provider_catalog,
         "unsafe_warnings": _unsafe_warnings(container),
@@ -437,6 +552,16 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
                 "title": "Register startup task",
                 "command": r".\scripts\install-console-startup-task.ps1",
                 "detail": "Registers a current-user startup task for the localhost console without bundling runtime data into the repo.",
+            },
+            {
+                "title": "Open runtime folders",
+                "command": r".\scripts\open-runtime-folders.ps1",
+                "detail": "Launches Explorer for the LocalAppData runtime root, workspace, logs, or secrets locations.",
+            },
+            {
+                "title": "Show runtime posture",
+                "command": r".\scripts\show-runtime-posture.ps1",
+                "detail": "Prints the Windows runtime root, LocalAppData paths, and whether strong local protection is active.",
             },
             {
                 "title": "Remove startup task",
@@ -584,6 +709,7 @@ def dashboard(
         "connectors": container.connector_registry.list_health(),
         "settings": settings,
         "protected_storage_posture": container.protected_storage.posture_label,
+        "storage_posture": _storage_posture_context(container),
         "audit_status": audit_status,
         "unsafe_warnings": _unsafe_warnings(container),
         "blocked_count": counts["blocked"],

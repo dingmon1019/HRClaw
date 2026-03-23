@@ -126,6 +126,8 @@ def test_provider_specific_config_is_persisted_and_visible(container):
     assert loaded.default_model == "local-model"
     assert statuses["openai-compatible"].base_url == "http://127.0.0.1:11434/v1"
     assert statuses["openai-compatible"].allowed_hosts == ["127.0.0.1", "localhost"]
+    assert statuses["openai-compatible"].privacy_posture == "external-egress"
+    assert statuses["openai-compatible"].destination_summary == "127.0.0.1, localhost"
 
 
 def test_disabled_provider_is_removed_from_candidate_chain(tmp_path):

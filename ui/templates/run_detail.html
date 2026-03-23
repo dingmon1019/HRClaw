@@ -1,14 +1,41 @@
 {% extends "templates/base.html" %}
 {% macro render_task_branch(branch, depth=0) -%}
 <div class="list-item" style="margin-left: {{ depth * 18 }}px;">
-    <strong>{{ branch.node.title }}</strong>
-    <p>{{ branch.node.role.value }} / {{ branch.node.node_type }} / <span class="badge {{ branch.node.status }}">{{ branch.node.status }}</span></p>
+    <div class="card-header">
+        <div>
+            <strong>{{ branch.node.title }}</strong>
+            <p>{{ branch.node.role.value }} / {{ branch.node.node_type }} / <span class="badge {{ branch.node.status }}">{{ branch.node.status }}</span></p>
+        </div>
+        {% if branch.proposal %}
+        <div class="stack tight align-end">
+            <span class="badge {{ branch.proposal.risk_level.value }}">{{ branch.proposal.risk_level.value }}</span>
+            <span class="badge {{ branch.proposal.status.value }}">{{ branch.proposal.status.value }}</span>
+        </div>
+        {% endif %}
+    </div>
     <small>
         {% if branch.node.provider_profile %}profile {{ branch.node.provider_profile }}{% endif %}
         {% if branch.node.provider_name %} / provider {{ branch.node.provider_name }}{% endif %}
         {% if branch.dependency_titles %} / depends on {{ branch.dependency_titles | join(", ") }}{% endif %}
     </small>
-    <pre>{{ branch.node.details | tojson(indent=2) }}</pre>
+    <p class="muted small">{{ branch.status_note }}</p>
+    <ul class="flat-list">
+        {% for line in branch.summary_lines %}
+        <li>{{ line }}</li>
+        {% endfor %}
+    </ul>
+    {% if branch.proposal %}
+    <p class="small">
+        proposal <a href="/proposals/{{ branch.proposal.id }}">{{ branch.proposal.id }}</a>
+        {% if branch.proposal.requires_approval %} / approval required{% endif %}
+    </p>
+    {% endif %}
+    {% if branch.node.details %}
+    <details class="mt-16">
+        <summary>Stored node details</summary>
+        <pre>{{ branch.node.details | tojson(indent=2) }}</pre>
+    </details>
+    {% endif %}
 </div>
 {% for child in branch.children %}
 {{ render_task_branch(child, depth + 1) }}
@@ -48,6 +75,7 @@
             <div class="metric-row"><span>Handoffs</span><strong>{{ handoffs|length }}</strong></div>
             <div class="metric-row"><span>Task Nodes</span><strong>{{ task_nodes|length }}</strong></div>
             <div class="metric-row"><span>Connector Collects</span><strong>{{ connector_runs|length }}</strong></div>
+            <div class="metric-row"><span>Approval Waits</span><strong>{{ proposals | selectattr("requires_approval") | list | length }}</strong></div>
         </article>
     </div>
 </section>
@@ -58,6 +86,7 @@
             <h3>Task Graph</h3>
             <span class="badge ok">{{ task_nodes|length }} nodes</span>
         </div>
+        <p class="muted">Supervisor objective 아래에 planner branches가 준비되고, reviewer/reporter가 의존 관계를 따라 이어집니다. proposal node는 승인 대기 여부와 risk를 함께 표시합니다.</p>
         <div class="stack">
             {% for branch in task_tree %}
             {{ render_task_branch(branch) }}
@@ -79,7 +108,10 @@
                 <p>{{ step.role.value }} / {{ step.status }} / profile {{ step.provider_profile }}{% if step.provider_name %} / provider {{ step.provider_name }}{% endif %}</p>
                 <small>{{ step.started_at }}{% if step.completed_at %} -> {{ step.completed_at }}{% endif %}</small>
                 {% if step.output %}
-                <pre>{{ step.output | tojson(indent=2) }}</pre>
+                <details class="mt-16">
+                    <summary>Stored output</summary>
+                    <pre>{{ step.output | tojson(indent=2) }}</pre>
+                </details>
                 {% endif %}
             </div>
             {% else %}
@@ -99,7 +131,10 @@
                 <strong>{{ handoff.title }}</strong>
                 <p>to {{ handoff.to_agent_role.value }}</p>
                 <small>{{ handoff.created_at }} / {{ handoff.status }}</small>
-                <pre>{{ handoff.payload | tojson(indent=2) }}</pre>
+                <details class="mt-16">
+                    <summary>Stored handoff payload</summary>
+                    <pre>{{ handoff.payload | tojson(indent=2) }}</pre>
+                </details>
             </div>
             {% else %}
             <p class="muted">No handoffs were recorded.</p>
@@ -154,7 +189,10 @@
             <p>{{ entry.operation }} / {{ entry.status }}{% if entry.agent_role %} / requested by {{ entry.agent_role }}{% endif %}</p>
             <small>{{ entry.created_at }}</small>
             {% if entry.output %}
-            <pre>{{ entry.output | tojson(indent=2) }}</pre>
+            <details class="mt-16">
+                <summary>Collected output</summary>
+                <pre>{{ entry.output | tojson(indent=2) }}</pre>
+            </details>
             {% endif %}
         </div>
         {% else %}

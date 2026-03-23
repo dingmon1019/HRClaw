@@ -6,6 +6,7 @@ from app.config.settings import AppSettings
 from app.runtime.executor import ExecutionDispatcher
 from app.schemas.actions import ExecutionJobStatus, ProposalStatus
 from app.schemas.agents import AgentRole
+from app.services.data_governance_service import DataGovernanceService
 from app.services.execution_queue_service import ExecutionQueueService
 from app.services.proposal_service import ProposalService
 
@@ -20,6 +21,7 @@ class ExecutionWorker:
         dispatcher: ExecutionDispatcher,
         audit_service: AuditService,
         agent_service: AgentService,
+        data_governance_service: DataGovernanceService,
     ):
         self.worker_id = worker_id
         self.base_settings = base_settings
@@ -28,6 +30,7 @@ class ExecutionWorker:
         self.dispatcher = dispatcher
         self.audit_service = audit_service
         self.agent_service = agent_service
+        self.data_governance_service = data_governance_service
 
     def run_once(self) -> dict | None:
         claimed = self.queue_service.claim_next_job(
@@ -39,11 +42,15 @@ class ExecutionWorker:
             return None
 
         job, attempt = claimed
+        proposal = self.proposal_service.get(job.proposal_id)
         executor_agent = self.agent_service.get_by_role(AgentRole.EXECUTOR)
         executor_run = self.agent_service.start_run(
             job.run_id,
             executor_agent,
-            input_payload={"job_id": job.id, "proposal_id": job.proposal_id},
+            input_payload=self.data_governance_service.sanitize_for_history(
+                {"job_id": job.id, "proposal_id": job.proposal_id},
+                object_type="agent_input",
+            ),
             provider_profile="local-only",
             correlation_id=job.correlation_id,
         )
@@ -70,7 +77,12 @@ class ExecutionWorker:
             self.agent_service.complete_run(
                 executor_run.id,
                 status="completed",
-                output_payload={"result": result, "job_id": job.id},
+                output_payload=self.data_governance_service.sanitize_for_history(
+                    {"result": result, "job_id": job.id},
+                    object_type="agent_output",
+                    action_type=proposal.action_type,
+                    connector=proposal.connector,
+                ),
                 provider_name="local-worker",
             )
             self.audit_service.emit(
@@ -90,7 +102,10 @@ class ExecutionWorker:
             self.agent_service.complete_run(
                 executor_run.id,
                 status="blocked",
-                output_payload={"error": str(exc), "job_id": job.id},
+                output_payload=self.data_governance_service.sanitize_for_history(
+                    {"error": str(exc), "job_id": job.id},
+                    object_type="agent_output",
+                ),
                 provider_name="local-worker",
             )
             self.audit_service.emit(
@@ -110,7 +125,10 @@ class ExecutionWorker:
             self.agent_service.complete_run(
                 executor_run.id,
                 status="failed",
-                output_payload={"error": str(exc), "job_id": job.id},
+                output_payload=self.data_governance_service.sanitize_for_history(
+                    {"error": str(exc), "job_id": job.id},
+                    object_type="agent_output",
+                ),
                 provider_name="local-worker",
             )
             self.audit_service.emit(

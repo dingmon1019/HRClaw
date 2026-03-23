@@ -69,10 +69,15 @@ class RuntimePlanner:
             role=AgentRole.SUPERVISOR,
             node_type="objective",
             title=request.objective,
-            details={
-                "request": self.data_governance_service.sanitize_for_history(request.model_dump(mode="json")),
-                "memory_namespace": supervisor.memory_namespace,
-            },
+            details=self._sanitize_task_node_details(
+                {
+                    "request": request.model_dump(mode="json"),
+                    "memory_namespace": supervisor.memory_namespace,
+                    "input_source": "operator-objective",
+                    "capabilities": supervisor.capabilities,
+                    "allowed_connectors": supervisor.allowed_connectors,
+                }
+            ),
             status="running",
             parent_task_node_id=None,
             agent=supervisor,
@@ -84,7 +89,10 @@ class RuntimePlanner:
         supervisor_run = self.agent_service.start_run(
             run_id,
             supervisor,
-            input_payload={"objective": request.objective, "request": request.model_dump(mode="json")},
+            input_payload=self._sanitize_agent_payload(
+                {"objective": request.objective, "request": request.model_dump(mode="json")},
+                object_type="agent_input",
+            ),
             provider_profile=self._provider_profile_for_role(AgentRole.SUPERVISOR, effective_settings),
             correlation_id=correlation_id,
         )
@@ -94,16 +102,21 @@ class RuntimePlanner:
         self.agent_service.complete_run(
             supervisor_run.id,
             status="completed",
-            output_payload={"intent_summary": intent_summary, "subtasks": subtasks},
+            output_payload=self._sanitize_agent_payload(
+                {"intent_summary": intent_summary, "subtasks": subtasks},
+                object_type="agent_output",
+            ),
         )
         self.agent_service.complete_task_node(
             objective_node.id,
             status="completed",
-            details={
-                "intent_summary": intent_summary,
-                "subtask_count": len(subtasks),
-                "subtask_node_ids": [node.id for node in subtask_nodes],
-            },
+            details=self._sanitize_task_node_details(
+                {
+                    "intent_summary": intent_summary,
+                    "subtask_count": len(subtasks),
+                    "subtask_node_ids": [node.id for node in subtask_nodes],
+                }
+            ),
             agent_run_id=supervisor_run.id,
         )
 
@@ -112,13 +125,16 @@ class RuntimePlanner:
             from_agent_run_id=supervisor_run.id,
             to_agent=planner,
             title="Objective decomposed for planning",
-            payload={"intent_summary": intent_summary, "subtasks": subtasks},
+            payload=self._sanitize_handoff_payload({"intent_summary": intent_summary, "subtasks": subtasks}),
             correlation_id=correlation_id,
         )
         planner_run = self.agent_service.start_run(
             run_id,
             planner,
-            input_payload={"subtasks": subtasks, "objective": request.objective},
+            input_payload=self._sanitize_agent_payload(
+                {"subtasks": subtasks, "objective": request.objective},
+                object_type="agent_input",
+            ),
             parent_agent_run_id=supervisor_run.id,
             provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
             correlation_id=correlation_id,
@@ -135,7 +151,7 @@ class RuntimePlanner:
         summary = self.summary_service.create(
             run_id=run_id,
             objective=request.objective,
-            collected=self.data_governance_service.sanitize_for_history(collected),
+            collected=self.data_governance_service.sanitize_for_history(collected, object_type="summary_payload"),
             summary_text=summary_text,
             provider_name=summary_provider_name,
         )
@@ -156,12 +172,15 @@ class RuntimePlanner:
             planner_run.id,
             status="completed",
             provider_name=summary_provider_name,
-            output_payload={
-                "summary_id": summary.id,
-                "collected_keys": list(collected),
-                "proposal_titles": [proposal.title for proposal in raw_proposals],
-                "proposal_count": len(raw_proposals),
-            },
+            output_payload=self._sanitize_agent_payload(
+                {
+                    "summary_id": summary.id,
+                    "collected_keys": list(collected),
+                    "proposal_titles": [proposal.title for proposal in raw_proposals],
+                    "proposal_count": len(raw_proposals),
+                },
+                object_type="agent_output",
+            ),
         )
         self._complete_role_nodes(
             subtask_nodes,
@@ -181,13 +200,18 @@ class RuntimePlanner:
             from_agent_run_id=planner_run.id,
             to_agent=reviewer,
             title="Candidate actions ready for policy and egress review",
-            payload={"proposal_count": len(raw_proposals), "summary_id": summary.id},
+            payload=self._sanitize_handoff_payload(
+                {"proposal_count": len(raw_proposals), "summary_id": summary.id}
+            ),
             correlation_id=correlation_id,
         )
         reviewer_run = self.agent_service.start_run(
             run_id,
             reviewer,
-            input_payload={"summary_id": summary.id, "proposal_count": len(raw_proposals)},
+            input_payload=self._sanitize_agent_payload(
+                {"summary_id": summary.id, "proposal_count": len(raw_proposals)},
+                object_type="agent_input",
+            ),
             parent_agent_run_id=planner_run.id,
             provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings),
             correlation_id=correlation_id,
@@ -198,11 +222,14 @@ class RuntimePlanner:
         self.agent_service.complete_run(
             reviewer_run.id,
             status="completed",
-            output_payload={
-                "proposal_ids": [proposal.id for proposal in created],
-                "blocked_count": sum(1 for proposal in created if proposal.status.value == "blocked"),
-                "approval_required_count": sum(1 for proposal in created if proposal.requires_approval),
-            },
+            output_payload=self._sanitize_agent_payload(
+                {
+                    "proposal_ids": [proposal.id for proposal in created],
+                    "blocked_count": sum(1 for proposal in created if proposal.status.value == "blocked"),
+                    "approval_required_count": sum(1 for proposal in created if proposal.requires_approval),
+                },
+                object_type="agent_output",
+            ),
         )
         self._complete_role_nodes(
             subtask_nodes,
@@ -223,17 +250,22 @@ class RuntimePlanner:
                 role=AgentRole.PLANNER,
                 node_type="proposal",
                 title=proposal.title,
-                details={
-                    "proposal_id": proposal.id,
-                    "connector": proposal.connector,
-                    "action_type": proposal.action_type,
-                    "risk_level": proposal.risk_level.value,
-                    "status": proposal.status.value,
-                    "requires_approval": proposal.requires_approval,
-                    "created_by": proposal.created_by_agent_role,
-                    "reviewed_by": proposal.reviewed_by_agent_role,
-                },
-                status=proposal.status.value,
+                details=self._sanitize_task_node_details(
+                    {
+                        "proposal_id": proposal.id,
+                        "connector": proposal.connector,
+                        "action_type": proposal.action_type,
+                        "risk_level": proposal.risk_level.value,
+                        "status": proposal.status.value,
+                        "requires_approval": proposal.requires_approval,
+                        "created_by": proposal.created_by_agent_role,
+                        "reviewed_by": proposal.reviewed_by_agent_role,
+                        "approval_wait": proposal.requires_approval and proposal.status.value in {"pending", "stale"},
+                        "capabilities": planner.capabilities,
+                        "allowed_connectors": planner.allowed_connectors,
+                    }
+                ),
+                status="waiting_approval" if proposal.requires_approval and proposal.status.value in {"pending", "stale"} else proposal.status.value,
                 parent_task_node_id=proposal_parent,
                 agent=planner,
                 agent_run_id=planner_run.id,
@@ -248,13 +280,16 @@ class RuntimePlanner:
             from_agent_run_id=reviewer_run.id,
             to_agent=reporter,
             title="Reviewed plan ready for operator summary",
-            payload={"proposal_ids": [proposal.id for proposal in created]},
+            payload=self._sanitize_handoff_payload({"proposal_ids": [proposal.id for proposal in created]}),
             correlation_id=correlation_id,
         )
         reporter_run = self.agent_service.start_run(
             run_id,
             reporter,
-            input_payload={"summary_id": summary.id, "proposal_count": len(created)},
+            input_payload=self._sanitize_agent_payload(
+                {"summary_id": summary.id, "proposal_count": len(created)},
+                object_type="agent_input",
+            ),
             parent_agent_run_id=reviewer_run.id,
             provider_profile=self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
             correlation_id=correlation_id,
@@ -272,10 +307,13 @@ class RuntimePlanner:
             reporter_run.id,
             status="completed",
             provider_name=reporter_provider,
-            output_payload={
-                "operator_summary": operator_summary,
-                "proposal_ids": [proposal.id for proposal in created],
-            },
+            output_payload=self._sanitize_agent_payload(
+                {
+                    "operator_summary": operator_summary,
+                    "proposal_ids": [proposal.id for proposal in created],
+                },
+                object_type="agent_output",
+            ),
         )
         self._complete_role_nodes(
             subtask_nodes,
@@ -318,11 +356,11 @@ class RuntimePlanner:
             connector="task",
             operation="collect",
             status="success",
-            payload=self.data_governance_service.sanitize_for_history({"limit": 5}),
+            payload=self.data_governance_service.sanitize_for_history({"limit": 5}, object_type="connector_input"),
             agent_id=supervisor_agent.id,
             agent_role=supervisor_agent.role.value,
             correlation_id=correlation_id,
-            output=self.data_governance_service.sanitize_for_history(task_snapshot),
+            output=self.data_governance_service.sanitize_for_history(task_snapshot, object_type="connector_output"),
         )
         if request.filesystem_path:
             collected["filesystem"] = self._safe_collect(
@@ -366,11 +404,11 @@ class RuntimePlanner:
                 connector=connector_name,
                 operation="collect",
                 status="success",
-                payload=self.data_governance_service.sanitize_for_history(payload),
+                payload=self.data_governance_service.sanitize_for_history(payload, object_type="connector_input"),
                 agent_id=agent.id,
                 agent_role=agent.role.value,
                 correlation_id=correlation_id,
-                output=self.data_governance_service.sanitize_for_history(output),
+                output=self.data_governance_service.sanitize_for_history(output, object_type="connector_output"),
             )
             return output
         except Exception as exc:
@@ -379,7 +417,7 @@ class RuntimePlanner:
                 connector=connector_name,
                 operation="collect",
                 status="failed",
-                payload=self.data_governance_service.sanitize_for_history(payload),
+                payload=self.data_governance_service.sanitize_for_history(payload, object_type="connector_input"),
                 agent_id=agent.id,
                 agent_role=agent.role.value,
                 correlation_id=correlation_id,
@@ -854,12 +892,17 @@ class RuntimePlanner:
                     role=role,
                     node_type=subtask.get("node_type", "subtask"),
                     title=subtask["title"],
-                    details={
-                        "sequence": sequence,
-                        "phase": "planner",
-                        "memory_namespace": agent.memory_namespace,
-                        "planned_provider_profile": self._provider_profile_for_role(role, settings),
-                    },
+                    details=self._sanitize_task_node_details(
+                        {
+                            "sequence": sequence,
+                            "phase": "planner",
+                            "memory_namespace": agent.memory_namespace,
+                            "planned_provider_profile": self._provider_profile_for_role(role, settings),
+                            "capabilities": agent.capabilities,
+                            "allowed_connectors": agent.allowed_connectors,
+                            "input_source": "supervisor-decomposition",
+                        }
+                    ),
                     status="ready",
                     parent_task_node_id=parent_node_id,
                     agent=agent,
@@ -882,12 +925,16 @@ class RuntimePlanner:
                 role=role,
                 node_type=subtask.get("node_type", "subtask"),
                 title=subtask["title"],
-                details={
-                    "sequence": sequence,
-                    "phase": "review",
-                    "memory_namespace": agent.memory_namespace,
-                    "planned_provider_profile": self._provider_profile_for_role(role, settings),
-                },
+                details=self._sanitize_task_node_details(
+                    {
+                        "sequence": sequence,
+                        "phase": "review",
+                        "memory_namespace": agent.memory_namespace,
+                        "planned_provider_profile": self._provider_profile_for_role(role, settings),
+                        "capabilities": agent.capabilities,
+                        "allowed_connectors": agent.allowed_connectors,
+                    }
+                ),
                 status="blocked",
                 parent_task_node_id=parent_node_id,
                 agent=agent,
@@ -910,12 +957,16 @@ class RuntimePlanner:
                 role=role,
                 node_type=subtask.get("node_type", "subtask"),
                 title=subtask["title"],
-                details={
-                    "sequence": sequence,
-                    "phase": "report",
-                    "memory_namespace": agent.memory_namespace,
-                    "planned_provider_profile": self._provider_profile_for_role(role, settings),
-                },
+                details=self._sanitize_task_node_details(
+                    {
+                        "sequence": sequence,
+                        "phase": "report",
+                        "memory_namespace": agent.memory_namespace,
+                        "planned_provider_profile": self._provider_profile_for_role(role, settings),
+                        "capabilities": agent.capabilities,
+                        "allowed_connectors": agent.allowed_connectors,
+                    }
+                ),
                 status="blocked",
                 parent_task_node_id=parent_node_id,
                 agent=agent,
@@ -943,7 +994,7 @@ class RuntimePlanner:
             self.agent_service.complete_task_node(
                 node.id,
                 status="completed",
-                details=details,
+                details=self._sanitize_task_node_details(details),
                 provider_name=provider_name,
                 agent_run_id=agent_run_id,
                 handoff_id=handoff_id,
@@ -965,3 +1016,12 @@ class RuntimePlanner:
             if node.role == AgentRole.PLANNER:
                 return node.id
         return fallback_id
+
+    def _sanitize_agent_payload(self, payload: dict, *, object_type: str) -> dict:
+        return self.data_governance_service.sanitize_for_history(payload, object_type=object_type)
+
+    def _sanitize_handoff_payload(self, payload: dict) -> dict:
+        return self.data_governance_service.sanitize_for_history(payload, object_type="handoff_payload")
+
+    def _sanitize_task_node_details(self, details: dict) -> dict:
+        return self.data_governance_service.sanitize_for_history(details, object_type="task_node_details")

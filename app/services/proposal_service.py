@@ -36,6 +36,7 @@ class ProposalService:
             purpose=f"proposal:{proposal.action_type}",
             action_type=proposal.action_type,
             connector=proposal.connector,
+            object_type="proposal_payload",
         )
         proposal = proposal.model_copy(update={"payload": protected_payload})
         proposal_id = new_id("proposal")

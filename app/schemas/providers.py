@@ -45,6 +45,9 @@ class ProviderStatus(BaseModel):
     api_key_env: str | None = None
     default_model: str | None = None
     auth_source: str = "env"
+    privacy_posture: str = "external-egress"
+    egress_posture: str = "inherits global allowlist"
+    destination_summary: str = ""
 
 
 class ProviderConfigRecord(BaseModel):

@@ -23,6 +23,13 @@
         <strong>Snapshot drift detected.</strong>
         <div>{{ snapshot_context.stale_reason }}</div>
         <div class="small">Changed fields: {{ snapshot_context.changed_fields | join(", ") }}</div>
+        {% if snapshot_context.drift_messages %}
+        <ul class="flat-list mt-16">
+            {% for item in snapshot_context.drift_messages %}
+            <li>{{ item }}</li>
+            {% endfor %}
+        </ul>
+        {% endif %}
     </section>
     {% endif %}
 
@@ -66,6 +73,15 @@
             {% if snapshot_context.live_snapshot %}
             <h3>Execution Manifest</h3>
             <pre>{{ snapshot_context.live_snapshot.manifest | tojson(indent=2) }}</pre>
+            {% endif %}
+
+            {% if snapshot_context.changed_fields %}
+            <h3>Why Re-Approval Is Required</h3>
+            <ul class="flat-list">
+                {% for item in snapshot_context.drift_messages %}
+                <li>{{ item }}</li>
+                {% endfor %}
+            </ul>
             {% endif %}
 
             <h3>Execution Preview</h3>

@@ -92,14 +92,22 @@ Optional startup task for the localhost console:
 .\scripts\remove-console-startup-task.ps1
 ```
 
+Optional Explorer/runtime helpers:
+
+```powershell
+.\scripts\open-runtime-folders.ps1
+.\scripts\show-runtime-posture.ps1
+```
+
 ## Windows Notes
 
 - the UI is loopback-bound by default
 - worker CLI actions use a Python-side secure password prompt or a protected short-lived token file
+- protected token-file mode is only available when strong local protection is active, or when an explicit insecure development override is enabled
 - if `python` is not on PATH, use `py -3.13`
 - `pywin32` is optional; the Outlook connector fails gracefully when unavailable
 - when `pywin32` is installed, DPAPI-backed local secret protection is used automatically
-- without DPAPI, sensitive blob storage fails closed unless `allow_insecure_local_storage` is explicitly enabled
+- without DPAPI, generated session secrets, token-file mode, and sensitive blob storage fail closed unless `allow_insecure_local_storage` is explicitly enabled
 - provider-specific catalog records let you keep local-model URLs and remote API settings separate inside the UI
 
 ## Troubleshooting
@@ -123,6 +131,21 @@ If `run-worker.ps1` reports an authentication issue, run:
 ```
 
 The script asks for the operator username in PowerShell and the Python CLI prompts for the password securely, so the password does not travel on the command line or stay in a long-lived PowerShell variable.
+
+### Release packaging fails on local repo artifacts
+
+That is expected in the default release path. Clean the ignored repo-local artifacts first:
+
+```powershell
+.\scripts\clean-local-artifacts.ps1
+.\scripts\package-release.ps1 -Version <tag> -Clean
+```
+
+If you are intentionally building a development smoke archive from a dirty tree, use:
+
+```powershell
+.\scripts\package-release.ps1 -Version smoke -AllowDirtyWorkingTree -Clean
+```
 
 ### Outlook connector unavailable
 

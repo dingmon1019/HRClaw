@@ -109,6 +109,7 @@ class AppContainer:
             dispatcher=self.executor,
             audit_service=self.audit_service,
             agent_service=self.agent_service,
+            data_governance_service=self.data_governance_service,
         )
         self.runtime_service = AgentRuntimeService(
             planner=self.planner,

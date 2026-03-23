@@ -85,7 +85,7 @@ class ProviderService:
                                 "to_provider": provider_name,
                                 "correlation_id": request.correlation_id,
                             },
-                    )
+                        )
                     chosen_candidate = provider_name
                     self._record_success(provider_name)
                     return response
@@ -119,6 +119,9 @@ class ProviderService:
                     "api_key_env": provider_config.api_key_env,
                     "default_model": provider_config.default_model,
                     "auth_source": provider_config.auth_source,
+                    "privacy_posture": self._privacy_posture(provider.name, status.supports_remote),
+                    "egress_posture": self._egress_posture(provider_config, settings, status.supports_remote),
+                    "destination_summary": self._destination_summary(provider_config, settings),
                 }
             )
             statuses.append(normalized)
@@ -357,3 +360,32 @@ class ProviderService:
                 "provider_allowed_hosts": allowed_hosts,
             }
         )
+
+    @staticmethod
+    def _privacy_posture(provider_name: str, supports_remote: bool) -> str:
+        if provider_name == "mock" or not supports_remote:
+            return "local-only"
+        return "external-egress"
+
+    @staticmethod
+    def _destination_summary(config: ProviderConfigRecord, settings: EffectiveSettings) -> str:
+        destinations = config.allowed_hosts or settings.provider_allowed_hosts
+        if destinations:
+            return ", ".join(destinations)
+        return "no outbound host configured"
+
+    def _egress_posture(
+        self,
+        config: ProviderConfigRecord,
+        settings: EffectiveSettings,
+        supports_remote: bool,
+    ) -> str:
+        if not config.enabled:
+            return "disabled"
+        if not supports_remote:
+            return "no external egress"
+        if config.allowed_hosts:
+            return "restricted allowlist"
+        if settings.provider_allowed_hosts:
+            return "inherits global allowlist"
+        return "no outbound host configured"

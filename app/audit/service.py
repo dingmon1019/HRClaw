@@ -26,7 +26,7 @@ class AuditService:
         settings = self.settings_service.get_effective_settings()
         timestamp = utcnow_iso()
         safe_payload = (
-            self.data_governance_service.sanitize_for_audit(payload)
+            self.data_governance_service.sanitize_for_audit(payload, object_type="audit_payload")
             if self.data_governance_service is not None
             else payload
         )

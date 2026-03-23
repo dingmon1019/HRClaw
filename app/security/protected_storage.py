@@ -15,23 +15,31 @@ except Exception:  # pragma: no cover
 class ProtectedStorageService:
     STRONG_STORAGE_MODE = "dpapi"
     FALLBACK_STORAGE_MODE = "unprotected-local"
+    PROTECTED_POSTURE = "protected"
+    UNPROTECTED_POSTURE = "unprotected-local"
+    REFUSED_POSTURE = "refused"
     FAIL_CLOSED_CLASSES = {"sensitive-local", "privileged-sensitive"}
+    SECRET_TEXT_CLASS = "privileged-sensitive"
 
     def __init__(self, base_settings: AppSettings):
         self.base_settings = base_settings
 
-    def write_secret_text(self, path: Path, value: str) -> None:
+    def write_secret_text(self, path: Path, value: str, *, purpose: str = "secret-text") -> None:
+        self._ensure_secret_storage_allowed(purpose)
         ensure_parent_dir(path)
         path.write_bytes(self._protect(value.encode("utf-8")))
 
-    def read_secret_text(self, path: Path) -> str:
-        return self._unprotect(path.read_bytes()).decode("utf-8")
+    def read_secret_text(self, path: Path, *, purpose: str = "secret-text") -> str:
+        payload = path.read_bytes()
+        storage_mode = self._payload_storage_mode(payload)
+        self._ensure_secret_payload_allowed(storage_mode, purpose)
+        return self._unprotect(payload).decode("utf-8")
 
-    def ensure_secret_text(self, path: Path, *, length: int = 32) -> str:
+    def ensure_secret_text(self, path: Path, *, length: int = 32, purpose: str = "secret-text") -> str:
         if path.exists():
-            return self.read_secret_text(path).strip()
+            return self.read_secret_text(path, purpose=purpose).strip()
         secret = random_token(length)
-        self.write_secret_text(path, secret)
+        self.write_secret_text(path, secret, purpose=purpose)
         return secret
 
     def store_text_blob(self, text: str, *, classification: str, purpose: str) -> dict[str, str]:
@@ -69,8 +77,37 @@ class ProtectedStorageService:
     @property
     def posture_label(self) -> str:
         if self.is_strongly_protected:
-            return "protected"
-        return "unprotected-local"
+            return self.PROTECTED_POSTURE
+        if self.base_settings.allow_insecure_local_storage:
+            return self.UNPROTECTED_POSTURE
+        return self.REFUSED_POSTURE
+
+    @property
+    def can_persist_secrets(self) -> bool:
+        return self.is_strongly_protected or self.base_settings.allow_insecure_local_storage
+
+    def feature_posture(self) -> dict[str, object]:
+        strong_only = self.is_strongly_protected
+        posture = self.posture_label
+        return {
+            "posture": posture,
+            "storage_mode": self.storage_mode,
+            "strong_protection": strong_only,
+            "allows_insecure_override": self.base_settings.allow_insecure_local_storage,
+            "secret_persistence_available": self.can_persist_secrets,
+            "disabled_features": [] if self.can_persist_secrets else [
+                "Generated session secret file",
+                "Protected CLI token-file mode",
+                "Local secret text persistence",
+            ],
+            "sensitive_blob_storage": (
+                "dpapi-protected"
+                if strong_only
+                else "insecure-dev-override"
+                if self.base_settings.allow_insecure_local_storage
+                else "refused"
+            ),
+        }
 
     def _ensure_storage_allowed(self, classification: str, purpose: str) -> None:
         if classification not in self.FAIL_CLOSED_CLASSES:
@@ -82,6 +119,24 @@ class ProtectedStorageService:
         raise ValueError(
             "Strong local protection is required to store "
             f"{classification} data for {purpose}. Enable DPAPI or explicitly opt into insecure local storage."
+        )
+
+    def _ensure_secret_storage_allowed(self, purpose: str) -> None:
+        if self.can_persist_secrets:
+            return
+        raise ValueError(
+            "Strong local protection is required to store "
+            f"{purpose}. Provide a runtime secret through the environment, enable DPAPI, "
+            "or explicitly opt into insecure local storage for development-only use."
+        )
+
+    def _ensure_secret_payload_allowed(self, storage_mode: str, purpose: str) -> None:
+        if storage_mode == self.STRONG_STORAGE_MODE:
+            return
+        if self.base_settings.allow_insecure_local_storage:
+            return
+        raise ValueError(
+            f"{purpose} is stored with unprotected local fallback. Enable DPAPI or explicitly allow insecure local storage before using it."
         )
 
     def _protect(self, raw: bytes) -> bytes:
@@ -97,6 +152,12 @@ class ProtectedStorageService:
             result = win32crypt.CryptUnprotectData(payload, None, None, None, 0)
             return self._coerce_crypt_result(result, "unprotect")
         return payload
+
+    @classmethod
+    def _payload_storage_mode(cls, payload: bytes) -> str:
+        if payload.startswith(b"plain:"):
+            return cls.FALLBACK_STORAGE_MODE
+        return cls.STRONG_STORAGE_MODE
 
     @staticmethod
     def _coerce_crypt_result(result, operation: str) -> bytes:

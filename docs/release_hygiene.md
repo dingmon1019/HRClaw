@@ -28,12 +28,19 @@ Before publishing:
 5. Confirm provider credentials are referenced only by environment-variable names.
 6. Confirm worker startup instructions do not recreate repo-local state.
 
-The release packager uses an allowlist and verifies the output archive. It does not zip the working tree blindly. A clean archive also includes `release_manifest.json` with:
+The release packager uses an allowlist and verifies the output archive. It does not zip the working tree blindly. Packaging now defaults to a working-tree preflight and fails unless you explicitly opt into `-AllowDirtyWorkingTree` for a smoke build.
+
+A clean archive also includes `release_manifest.json` with:
 
 - build time (UTC)
+- version label
 - included relative paths
+- include policy
 - excluded path policy
 - git revision when available
+- statement that runtime state belongs outside the repository
+
+The packager also emits a `.sha256` sidecar for the produced archive.
 
 CI-oriented packaging is supported:
 
@@ -51,6 +58,12 @@ If your local repo still contains ignored caches or legacy repo-scoped runtime f
 
 ```powershell
 .\scripts\clean-local-artifacts.ps1
+```
+
+For a development-only smoke archive from a contaminated tree:
+
+```powershell
+.\scripts\package-release.ps1 -Version smoke -AllowDirtyWorkingTree -Clean
 ```
 
 Forbidden content for release archives includes:

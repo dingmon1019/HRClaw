@@ -62,6 +62,7 @@ class ExecutionDispatcher:
                 proposal.payload,
                 action_type=proposal.action_type,
                 connector=proposal.connector,
+                object_type="history_payload",
             ),
             provider_name=proposal.provider_name,
             manifest_hash=approval.manifest_hash,
@@ -78,6 +79,7 @@ class ExecutionDispatcher:
                 result,
                 action_type=proposal.action_type,
                 connector=proposal.connector,
+                object_type="history_payload",
             )
             self.history_service.log_action_end(history_id, "executed", output=safe_result)
             self.proposal_service.set_execution_status(proposal.id, ProposalStatus.EXECUTED)

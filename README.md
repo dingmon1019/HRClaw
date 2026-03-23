@@ -142,7 +142,7 @@ Implemented controls:
 - HTTP connector policy on scheme, host, port, redirects, timeout, and response size
 - provider egress policy on host allowlists and restricted-data handling
 - protected local blob storage for sensitive payload fields with DPAPI when available
-- fail-closed blob storage for sensitive payloads unless strong protection exists or an explicit insecure override is enabled
+- fail-closed blob and secret-text storage unless strong protection exists or an explicit insecure override is enabled
 - hash-chained audit trail with verification
 
 Important limit:
@@ -334,7 +334,7 @@ python -m app.cli issue-cli-token --username <user> --purpose worker --token-fil
 python -m app.cli run-worker --once --token-file worker.token
 ```
 
-`.\scripts\run-worker.ps1` asks only for the operator username in PowerShell and lets the Python CLI prompt for the password securely, so the password does not live in PowerShell argv or a long-lived shell variable. Protected token-file mode remains an advanced path only.
+`.\scripts\run-worker.ps1` asks only for the operator username in PowerShell and lets the Python CLI prompt for the password securely, so the password does not live in PowerShell argv or a long-lived shell variable. Protected token-file mode remains an advanced path only and now fails closed when strong local protection is unavailable unless an explicit insecure development override is enabled.
 
 ## Testing
 
@@ -378,18 +378,26 @@ Build and verify a clean archive:
 .\scripts\package-release.ps1 -Version vnext -VerifyWorkingTree -Clean
 ```
 
+The clean packager is the only supported release path. Zipping the working tree directly is unsupported.
+
 CI-oriented verification mode:
 
 ```powershell
 .\scripts\package-release.ps1 -Version vnext -CI
 ```
 
-Every clean archive now contains `release_manifest.json` with build time, included paths, excluded path policy, and the git revision when available.
+Every clean archive now contains `release_manifest.json` with build time, include/exclude policy, git revision, and the explicit statement that runtime state belongs outside the repository. The packager also emits a `.sha256` sidecar for the archive.
 
 Clean ignored repo-local caches and legacy runtime folders when needed:
 
 ```powershell
 .\scripts\clean-local-artifacts.ps1
+```
+
+If you intentionally need a development smoke archive from a contaminated working tree, you must opt in explicitly:
+
+```powershell
+.\scripts\package-release.ps1 -Version smoke -AllowDirtyWorkingTree -Clean
 ```
 
 Before publishing a release, verify:

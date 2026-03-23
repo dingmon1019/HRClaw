@@ -1,5 +1,6 @@
 param(
-    [switch]$IncludeVenv
+    [switch]$IncludeVenv,
+    [switch]$IncludeDist
 )
 
 $targets = @(
@@ -19,6 +20,10 @@ if ($IncludeVenv) {
     $targets += ".venv"
 }
 
+if ($IncludeDist) {
+    $targets += "dist"
+}
+
 foreach ($target in $targets) {
     if (Test-Path $target) {
         Remove-Item -Recurse -Force $target
@@ -27,3 +32,4 @@ foreach ($target in $targets) {
 }
 
 Write-Host "Local repo-scoped artifacts cleaned. Live runtime state under LocalAppData is untouched."
+Write-Host "Recommended next step: .\\scripts\\package-release.ps1 -Version <tag> -Clean"

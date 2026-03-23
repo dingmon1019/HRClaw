@@ -80,9 +80,35 @@ def test_run_page_uses_assistant_first_copy(authenticated_client):
     assert "What You Will See Next" in response.text
 
 
+def test_dashboard_exposes_assistant_first_entry(authenticated_client):
+    response = authenticated_client.get("/", headers={"accept": "text/html"})
+
+    assert response.status_code == 200
+    assert "Ask The Agent" in response.text
+    assert "Interpret and Prepare" in response.text
+
+
 def test_settings_page_shows_provider_catalog_and_windows_ops(authenticated_client):
     response = authenticated_client.get("/settings", headers={"accept": "text/html"})
 
     assert response.status_code == 200
     assert "Provider Catalog" in response.text
     assert "Windows Operations" in response.text
+    assert "Privacy Posture" in response.text
+    assert "Storage posture" in response.text
+
+
+def test_run_detail_renders_task_graph_summary(authenticated_client, auth_headers):
+    create_response = authenticated_client.post(
+        "/api/runs",
+        json={"objective": "Create a task through the API", "task_title": "API task"},
+        headers=auth_headers,
+    )
+    run_id = create_response.json()["run_id"]
+
+    response = authenticated_client.get(f"/runs/{run_id}", headers={"accept": "text/html"})
+
+    assert response.status_code == 200
+    assert "Task Graph" in response.text
+    assert "Stored node details" in response.text
+    assert "approval required" in response.text
