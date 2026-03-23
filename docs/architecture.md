@@ -2,167 +2,113 @@
 
 ## Identity
 
-Win Agent Runtime is a Windows-first local agent runtime inspired by NemoClaw-style approval safety and multi-provider ideas similar to OpenClaw.
+Win Agent Runtime is a Windows-first localhost multi-agent runtime.
+
+It is inspired by NemoClaw-style approval safety and OpenClaw-style provider flexibility.
 
 It is not an official implementation of either project.
-It is not an OS sandbox.
+It is not OpenShell-level sandboxing.
 
-## Core Runtime Loop
+## Main Surfaces
 
-The runtime follows a bounded planning and execution loop:
+The product has two integrated experiences:
 
-1. collect local context
-2. summarize with a selected provider profile
-3. build structured action proposals
-4. evaluate proposals through policy
-5. persist proposals in SQLite
-6. wait for operator approval
-7. enqueue approved proposals
-8. execute queued work in the worker
-9. audit every state transition
+1. Assistant Workbench
+   Natural language goal entry, task decomposition, agent collaboration view, proposals, risks, and progress.
+2. Operator Control Console
+   Dashboard, approvals inbox, proposal detail, history, audit verification, connectors, and settings.
 
-## Major Components
+## Runtime Flow
 
-### Web/UI Process
+The current runtime uses an explicit role handoff sequence:
 
-Responsibilities:
+1. Supervisor Agent
+   Interprets the objective and decomposes it into subtasks.
+2. Planner Agent
+   Collects bounded context and creates typed candidate actions.
+3. Reviewer Agent
+   Applies policy, risk, workspace, and provider egress review.
+4. Operator
+   Approves or rejects specific proposals.
+5. Executor Agent
+   Runs approved snapshots only through the worker.
+6. Reporter Agent
+   Summarizes the plan and later surfaces outcome context.
 
-- session auth
-- CSRF protection
-- login / logout / setup
-- operator dashboard
-- proposal review
-- settings management
-- proposal approval or rejection
-- queue creation
+## Core Modules
 
-Non-responsibilities:
+- `app/agents`
+  Agent registry, agent runs, and handoff persistence.
+- `app/runtime`
+  Planning, runtime service, execution dispatch, and worker.
+- `app/policy`
+  Filesystem guard, HTTP/provider egress validation, and risk policy.
+- `app/providers`
+  Provider adapters and provider HTTP client.
+- `app/connectors`
+  Bounded local connectors.
+- `app/audit`
+  Append-oriented tamper-evident audit trail.
+- `app/services`
+  Proposal snapshots, settings versioning, queue management, history, auth, and provider orchestration.
 
-- direct execution of dangerous connector actions
+## Persistence
 
-### Worker Process
+SQLite tables now support both control-plane state and multi-agent visibility:
 
-Responsibilities:
+- `agents`
+- `agent_runs`
+- `handoffs`
+- `proposals`
+- `proposal_snapshots`
+- `approvals`
+- `summaries`
+- `execution_jobs`
+- `execution_attempts`
+- `action_history`
+- `connector_runs`
+- `audit_entries`
+- `provider_health`
+- `connector_health`
+- `settings`
+- `settings_versions`
+- `users`
+- `tasks`
 
-- poll `execution_jobs`
-- mark jobs running
-- dispatch approved work through connectors
-- record result, failure, or policy block
-- emit worker audit events
+## Execution Boundary
 
-### Policy Layer
+The web process does not execute dangerous actions directly.
 
-The policy engine evaluates proposals before they are shown and again before execution.
+Instead:
 
-Current enforcement includes:
+1. approved proposals are queued in `execution_jobs`
+2. the worker claims a job with a lease
+3. the executor re-verifies the approved snapshot
+4. the bounded connector action runs
+5. history, attempts, and audit are updated
 
-- safe vs relaxed mode behavior
-- filesystem workspace allowlist
-- protected path blocking
-- bounded system action validation
-- HTTP scheme / host / port restrictions
-- private-network HTTP blocking by default
-- connector enable / disable checks
+This is safer than direct in-request execution, but it is still not a host isolation boundary.
 
-## Authentication Model
+## Provider Boundary
 
-Local auth is session-based:
+Provider traffic is part of the security model.
 
-- initial operator account is bootstrapped through `/setup`
-- password hashes use PBKDF2-SHA256
-- plaintext passwords are never stored
-- sessions are cookie-backed
-- recent-auth timestamps support sensitive re-auth flows
+Provider adapters share:
 
-Sensitive actions requiring recent auth:
-
-- high-risk approvals
-- settings changes
-- settings import / reset
-
-## CSRF Model
-
-All dangerous POST routes require a CSRF token:
-
-- HTML forms use hidden form fields
-- API POST calls use `x-csrf-token`
-
-## Filesystem Model
-
-The runtime is workspace-first:
-
-- default workspace root is `workspace/`
-- relative paths resolve inside the workspace
-- repository source and runtime state are protected from writes
-- symlink traversal is rejected
-
-## HTTP Model
-
-HTTP connector policy is intentionally strict:
-
-- scheme allowlist
-- host allowlist
-- port allowlist
-- redirect blocking by default
-- request timeout enforcement
-- response size limit
-- localhost/private-network blocking unless explicitly enabled
-
-## Provider Orchestration
-
-Providers are registered adapters with common metadata:
-
-- configuration status
-- local/remote capability
+- host allowlists
+- scheme and port restrictions
+- private-network controls
+- restricted-data refusal by default
 - routing profiles
-- retry behavior
-- circuit breaker state
+- retries and circuit breaking
 
-Routing profiles:
+## Windows Focus
 
-- `fast`
-- `cheap`
-- `strong`
-- `local-only`
+The repository stays Windows-friendly by design:
 
-## Audit Model
-
-Audit events are written to both:
-
-- SQLite `audit_entries`
-- optional JSONL audit log
-
-Each audit entry stores:
-
-- event type
-- payload
-- previous hash
-- current entry hash
-- timestamp
-
-This supports post-run audit integrity verification.
-
-## Data Stores
-
-SQLite stores:
-
-- proposals
-- approvals
-- action history
-- summaries
-- connector runs
-- settings
-- users
-- execution jobs
-- audit entries
-- tasks
-
-## Current Limits
-
-The current architecture improves local operator control, but it still has important limits:
-
-- worker isolation is process-level, not kernel-level
-- Windows Credential Manager integration is not implemented
-- rollback is advisory, not automatic
-- worker supervision is manual
-- RBAC is planned, not shipped
+- FastAPI + Jinja2 UI
+- SQLite
+- PowerShell bootstrap/run scripts
+- optional Outlook connector through `pywin32`
+- no Docker requirement
+- no WSL requirement

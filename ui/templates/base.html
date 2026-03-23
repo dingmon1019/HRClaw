@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ title or "Win Agent Runtime" }}</title>
     <link rel="stylesheet" href="/static/styles.css">
-    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <script src="/static/app.js" defer></script>
 </head>
 <body>
     <header class="shell-header">
@@ -35,7 +35,7 @@
         </div>
         <nav class="shell-nav">
             <a href="/">Dashboard</a>
-            <a href="/run">Run Agent</a>
+            <a href="/run">Workbench</a>
             <a href="/proposals">Proposals</a>
             <a href="/approvals">Approval UI</a>
             <a href="/history">History</a>

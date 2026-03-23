@@ -3,7 +3,7 @@
 <section class="grid cards four">
     <article class="card stat-card">
         <span>Pending</span>
-        <strong>{{ counts["pending"] + counts["approved"] + counts["queued"] + counts["running"] }}</strong>
+        <strong>{{ counts["pending"] + counts["approved"] + counts["queued"] + counts["running"] + counts["stale"] }}</strong>
     </article>
     <article class="card stat-card">
         <span>Blocked</span>
@@ -79,6 +79,44 @@
 <section class="grid two">
     <article class="card">
         <div class="card-header">
+            <h2>Active Runs</h2>
+            <a href="/run">New workbench run</a>
+        </div>
+        <div class="stack">
+            {% for run in active_runs %}
+            <div class="list-item">
+                <strong><a href="/runs/{{ run.run_id }}">{{ run.run_id }}</a></strong>
+                <p>{{ run.step_count }} recorded agent steps</p>
+                <small>started {{ run.started_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No active multi-agent runs right now.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h2>Recent Runs</h2>
+            <a href="/history">Open history</a>
+        </div>
+        <div class="stack">
+            {% for run in recent_runs %}
+            <div class="list-item">
+                <strong><a href="/runs/{{ run.run_id }}">{{ run.run_id }}</a></strong>
+                <p>{{ run.step_count }} recorded agent steps</p>
+                <small>{{ run.started_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No multi-agent runs recorded yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+
+<section class="grid two">
+    <article class="card">
+        <div class="card-header">
             <h2>Recent High-Risk Proposals</h2>
             <a href="/approvals">Review queue</a>
         </div>
@@ -141,7 +179,7 @@
         <div class="stack">
             {% for summary in recent_summaries %}
             <div class="list-item">
-                <strong>{{ summary.objective }}</strong>
+                <strong><a href="/runs/{{ summary.run_id }}">{{ summary.objective }}</a></strong>
                 <p>{{ summary.summary_text }}</p>
                 <small>{{ summary.created_at }} via {{ summary.provider_name }}</small>
             </div>

@@ -25,6 +25,18 @@ class PathGuard:
         ".env",
         ".env.example",
     }
+    PROTECTED_SUFFIXES = {
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".jsonl",
+        ".log",
+        ".toml",
+        ".ini",
+        ".yaml",
+        ".yml",
+        ".env",
+    }
 
     def __init__(self, base_settings: AppSettings, settings_service: SettingsService):
         self.base_settings = base_settings
@@ -43,9 +55,10 @@ class PathGuard:
 
     def resolve_for_probe(self, raw_path: str | None) -> Path:
         candidate = self._resolve_candidate(raw_path)
-        self._assert_allowed_root(candidate)
         self._assert_no_symlink_chain(candidate)
-        return candidate
+        normalized = candidate.resolve(strict=False)
+        self._assert_allowed_root(normalized)
+        return normalized
 
     def check_payload(self, payload: dict, write: bool) -> str | None:
         keys = ("path", "source_path", "destination_path")
@@ -79,9 +92,9 @@ class PathGuard:
             raise ConnectorError("Filesystem actions require a path.")
         candidate = Path(raw_path)
         if not candidate.is_absolute():
-            candidate = (self.base_settings.resolved_workspace_root / candidate).resolve()
+            candidate = (self.base_settings.resolved_workspace_root / candidate).absolute()
         else:
-            candidate = candidate.resolve()
+            candidate = candidate.absolute()
         return candidate
 
     def _assert_allowed_root(self, candidate: Path) -> None:
@@ -94,9 +107,14 @@ class PathGuard:
         protected_paths.append(self.base_settings.resolved_database_path)
         protected_paths.append(self.base_settings.resolved_audit_log_path)
         protected_paths.append(self.base_settings.resolved_session_secret_path)
+        protected_paths.append(self.base_settings.resolved_admin_token_path)
         for protected in protected_paths:
             if candidate == protected or self._is_relative_to(candidate, protected):
                 raise ConnectorError(f"Writes to protected path {protected} are not allowed.")
+        if candidate.name.lower().startswith(".env"):
+            raise ConnectorError("Writes to environment or secret files are not allowed.")
+        if candidate.suffix.lower() in self.PROTECTED_SUFFIXES:
+            raise ConnectorError(f"Writes to protected file type {candidate.suffix} are not allowed.")
 
     def _assert_no_symlink_chain(self, candidate: Path) -> None:
         current = candidate if candidate.exists() else candidate.parent

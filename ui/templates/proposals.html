@@ -16,7 +16,7 @@
             Status
             <select name="status_filter">
                 <option value="">All</option>
-                {% for value in ["pending","approved","queued","running","executed","failed","blocked","rejected"] %}
+                {% for value in ["pending","approved","queued","running","stale","executed","failed","blocked","rejected"] %}
                 <option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>{{ value }}</option>
                 {% endfor %}
             </select>
@@ -39,6 +39,9 @@
                 {% endfor %}
             </select>
         </label>
+        {% if request.query_params.get("run_id") %}
+        <input type="hidden" name="run_id" value="{{ request.query_params.get('run_id') }}">
+        {% endif %}
         <div class="actions align-end">
             <button type="submit" class="button ghost">Filter</button>
             <a class="button ghost" href="/proposals">Reset</a>

@@ -11,17 +11,16 @@ from app.schemas.actions import (
     ProposalRecord,
     ProposalStatus,
 )
+from app.services.proposal_snapshot_service import ProposalSnapshotService
 
 
 class ProposalService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, snapshot_service: ProposalSnapshotService):
         self.database = database
+        self.snapshot_service = snapshot_service
 
     def create_many(self, proposals: Iterable[ActionProposal]) -> list[ProposalRecord]:
-        created: list[ProposalRecord] = []
-        for proposal in proposals:
-            created.append(self.create(proposal))
-        return created
+        return [self.create(proposal) for proposal in proposals]
 
     def create(self, proposal: ActionProposal) -> ProposalRecord:
         proposal_id = new_id("proposal")
@@ -31,9 +30,11 @@ class ProposalService:
             INSERT INTO proposals(
                 id, run_id, objective, connector, action_type, title, description,
                 payload_json, rationale, policy_notes_json, risk_level, side_effecting,
-                requires_approval, status, provider_name, summary_id, created_at, updated_at
+                requires_approval, status, provider_name, summary_id, created_by_agent_id,
+                created_by_agent_role, reviewed_by_agent_id, reviewed_by_agent_role,
+                correlation_id, data_classification, snapshot_hash, stale_reason, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 proposal_id,
@@ -52,9 +53,23 @@ class ProposalService:
                 proposal.status.value,
                 proposal.provider_name,
                 proposal.summary_id,
+                proposal.created_by_agent_id,
+                proposal.created_by_agent_role,
+                proposal.reviewed_by_agent_id,
+                proposal.reviewed_by_agent_role,
+                proposal.correlation_id,
+                proposal.data_classification.value,
+                proposal.snapshot_hash,
+                proposal.stale_reason,
                 now,
                 now,
             ),
+        )
+        created = self.get(proposal_id)
+        snapshot = self.snapshot_service.capture(created, status="created")
+        self.database.execute(
+            "UPDATE proposals SET snapshot_hash = ?, updated_at = ? WHERE id = ?",
+            (snapshot.snapshot_hash, utcnow_iso(), proposal_id),
         )
         return self.get(proposal_id)
 
@@ -74,32 +89,46 @@ class ProposalService:
             raise NotFoundError(f"Proposal {proposal_id} was not found.")
         return self._row_to_record(row)
 
-    def approve(self, proposal_id: str, actor: str, reason: str | None = None) -> ApprovalRecord:
+    def approve(
+        self,
+        proposal_id: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> ApprovalRecord:
         proposal = self.get(proposal_id)
-        if proposal.status != ProposalStatus.PENDING:
+        if proposal.status not in {ProposalStatus.PENDING, ProposalStatus.STALE}:
             raise InvalidStateError(f"Cannot approve proposal in state {proposal.status.value}.")
-        self._record_approval(proposal_id, "approved", actor, reason)
+        snapshot = self.snapshot_service.capture(proposal, status="approved")
+        self._record_approval(proposal_id, "approved", actor, reason, snapshot)
         self._update_status(proposal_id, ProposalStatus.APPROVED)
+        self.database.execute(
+            "UPDATE proposals SET snapshot_hash = ?, stale_reason = NULL, updated_at = ? WHERE id = ?",
+            (snapshot.snapshot_hash, utcnow_iso(), proposal_id),
+        )
         return self.list_approvals(proposal_id)[-1]
 
     def reject(self, proposal_id: str, actor: str, reason: str | None = None) -> ApprovalRecord:
         proposal = self.get(proposal_id)
-        if proposal.status != ProposalStatus.PENDING:
+        if proposal.status not in {ProposalStatus.PENDING, ProposalStatus.STALE}:
             raise InvalidStateError(f"Cannot reject proposal in state {proposal.status.value}.")
-        self._record_approval(proposal_id, "rejected", actor, reason)
+        self._record_approval(proposal_id, "rejected", actor, reason, None)
         self._update_status(proposal_id, ProposalStatus.REJECTED)
         return self.list_approvals(proposal_id)[-1]
 
-    def set_execution_status(self, proposal_id: str, status: ProposalStatus) -> None:
+    def set_execution_status(self, proposal_id: str, status: ProposalStatus, reason: str | None = None) -> None:
         if status not in {
             ProposalStatus.QUEUED,
             ProposalStatus.RUNNING,
             ProposalStatus.EXECUTED,
             ProposalStatus.FAILED,
             ProposalStatus.BLOCKED,
+            ProposalStatus.STALE,
         }:
             raise InvalidStateError(f"Unsupported execution status transition: {status.value}.")
-        self._update_status(proposal_id, status)
+        self.database.execute(
+            "UPDATE proposals SET status = ?, stale_reason = ?, updated_at = ? WHERE id = ?",
+            (status.value, reason, utcnow_iso(), proposal_id),
+        )
 
     def list_approvals(self, proposal_id: str) -> list[ApprovalRecord]:
         rows = self.database.fetch_all(
@@ -114,9 +143,19 @@ class ProposalService:
                 actor=row["actor"],
                 reason=row["reason"],
                 created_at=row["created_at"],
+                snapshot_hash=row["snapshot_hash"],
+                action_hash=row["action_hash"],
+                policy_hash=row["policy_hash"],
+                settings_hash=row["settings_hash"],
+                resource_hash=row["resource_hash"],
+                correlation_id=row["correlation_id"],
             )
             for row in rows
         ]
+
+    def latest_approval(self, proposal_id: str) -> ApprovalRecord | None:
+        approvals = self.list_approvals(proposal_id)
+        return approvals[-1] if approvals else None
 
     def _record_approval(
         self,
@@ -124,13 +163,30 @@ class ProposalService:
         decision: str,
         actor: str,
         reason: str | None,
+        snapshot,
     ) -> None:
         self.database.execute(
             """
-            INSERT INTO approvals(id, proposal_id, decision, actor, reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO approvals(
+                id, proposal_id, decision, actor, reason, snapshot_hash, action_hash,
+                policy_hash, settings_hash, resource_hash, correlation_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (new_id("approval"), proposal_id, decision, actor, reason, utcnow_iso()),
+            (
+                new_id("approval"),
+                proposal_id,
+                decision,
+                actor,
+                reason,
+                snapshot.snapshot_hash if snapshot else None,
+                snapshot.action_hash if snapshot else None,
+                snapshot.policy_hash if snapshot else None,
+                snapshot.settings_hash if snapshot else None,
+                snapshot.resource_hash if snapshot else None,
+                self.get(proposal_id).correlation_id,
+                utcnow_iso(),
+            ),
         )
 
     def _update_status(self, proposal_id: str, status: ProposalStatus) -> None:
@@ -158,6 +214,14 @@ class ProposalService:
             status=row["status"],
             provider_name=row["provider_name"],
             summary_id=row["summary_id"],
+            created_by_agent_id=row["created_by_agent_id"],
+            created_by_agent_role=row["created_by_agent_role"],
+            reviewed_by_agent_id=row["reviewed_by_agent_id"],
+            reviewed_by_agent_role=row["reviewed_by_agent_role"],
+            correlation_id=row["correlation_id"],
+            data_classification=row["data_classification"],
+            snapshot_hash=row["snapshot_hash"],
+            stale_reason=row["stale_reason"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

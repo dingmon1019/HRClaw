@@ -23,10 +23,11 @@ class AppSettings(BaseSettings):
     database_path: Path = Path("data/win_agent_runtime.db")
     audit_log_path: Path = Path("data/audit/audit.jsonl")
     json_audit_enabled: bool = True
-    workspace_root: Path = Path("workspace")
+    workspace_root: Path = Path("runtime_workspace")
+    admin_token_path: Path = Path("data/admin_token.txt")
 
     runtime_mode: str = "safe"
-    allowed_filesystem_roots: str = "workspace"
+    allowed_filesystem_roots: str = "runtime_workspace"
     allowed_http_hosts: str = "127.0.0.1,localhost"
     allowed_http_schemes: str = "http,https"
     allowed_http_ports: str = "80,443,8000,8080,11434"
@@ -34,6 +35,7 @@ class AppSettings(BaseSettings):
     http_follow_redirects: bool = False
     http_timeout_seconds: float = Field(default=10.0, ge=1.0, le=120.0)
     http_max_response_bytes: int = Field(default=1_048_576, ge=1024, le=10_485_760)
+    filesystem_max_read_bytes: int = Field(default=262_144, ge=4096, le=5_242_880)
     enable_outlook_connector: bool = False
     enable_system_connector: bool = True
 
@@ -53,6 +55,12 @@ class AppSettings(BaseSettings):
     cheap_provider: str | None = None
     strong_provider: str | None = None
     local_provider: str | None = "mock"
+    privacy_provider: str | None = "mock"
+    provider_allowed_hosts: str = (
+        "api.openai.com,api.anthropic.com,generativelanguage.googleapis.com,localhost,127.0.0.1"
+    )
+    allow_provider_private_network: bool = False
+    allow_restricted_provider_egress: bool = False
 
     anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
     gemini_api_key_env: str = "GEMINI_API_KEY"
@@ -60,6 +68,7 @@ class AppSettings(BaseSettings):
     session_secret_path: Path = Path("data/session_secret.txt")
     session_cookie_name: str = "win_agent_session"
     session_max_age_seconds: int = Field(default=3600, ge=300, le=86400)
+    session_idle_timeout_seconds: int = Field(default=900, ge=60, le=86400)
     recent_auth_window_seconds: int = Field(default=300, ge=30, le=3600)
     secure_cookies: bool = False
     max_request_size_bytes: int = Field(default=1_048_576, ge=4096, le=10_485_760)
@@ -69,6 +78,8 @@ class AppSettings(BaseSettings):
     approval_rate_limit_attempts: int = Field(default=20, ge=1, le=200)
     approval_rate_limit_window_seconds: int = Field(default=60, ge=10, le=3600)
     worker_poll_interval_seconds: float = Field(default=2.0, ge=0.1, le=60.0)
+    worker_lease_seconds: int = Field(default=45, ge=5, le=3600)
+    worker_max_attempts: int = Field(default=3, ge=1, le=20)
 
     @property
     def project_root(self) -> Path:
@@ -89,6 +100,10 @@ class AppSettings(BaseSettings):
     @property
     def resolved_session_secret_path(self) -> Path:
         return (self.project_root / self.session_secret_path).resolve()
+
+    @property
+    def resolved_admin_token_path(self) -> Path:
+        return (self.project_root / self.admin_token_path).resolve()
 
 
 @lru_cache(maxsize=1)

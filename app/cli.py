@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from time import sleep
 
 from app.core.container import AppContainer
@@ -35,16 +36,19 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("proposal_id")
     approve.add_argument("--actor", default="cli-operator")
     approve.add_argument("--reason", required=True)
+    approve.add_argument("--admin-token")
 
     reject = subparsers.add_parser("reject-proposal", help="Reject a proposal.")
     reject.add_argument("proposal_id")
     reject.add_argument("--actor", default="cli-operator")
     reject.add_argument("--reason", required=True)
+    reject.add_argument("--admin-token")
 
     worker = subparsers.add_parser("run-worker", help="Run the isolated execution worker.")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--limit", type=int, default=1)
     worker.add_argument("--interval", type=float, default=2.0)
+    worker.add_argument("--admin-token")
 
     jobs = subparsers.add_parser("list-jobs", help="List recent execution jobs.")
     jobs.add_argument("--limit", type=int, default=20)
@@ -67,6 +71,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     container = AppContainer()
+
+    def require_admin_token() -> None:
+        provided = getattr(args, "admin_token", None) or os.getenv("WIN_AGENT_ADMIN_TOKEN")
+        container.admin_token_service.verify(provided)
 
     if args.command == "run-agent":
         result = container.runtime_service.run_agent(
@@ -103,6 +111,7 @@ def main() -> None:
         return
 
     if args.command == "approve-proposal":
+        require_admin_token()
         result = container.runtime_service.approve_and_queue(
             args.proposal_id,
             ApprovalDecisionRequest(actor=args.actor, reason=args.reason),
@@ -111,6 +120,7 @@ def main() -> None:
         return
 
     if args.command == "reject-proposal":
+        require_admin_token()
         result = container.runtime_service.reject(
             args.proposal_id,
             ApprovalDecisionRequest(actor=args.actor, reason=args.reason),
@@ -119,6 +129,7 @@ def main() -> None:
         return
 
     if args.command == "run-worker":
+        require_admin_token()
         if args.once:
             result = container.worker.run_once()
             print(json.dumps(result, indent=2, default=str) if result is not None else "No queued jobs.")

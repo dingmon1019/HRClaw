@@ -3,6 +3,7 @@
         <strong>{{ proposal.title }}</strong>
         <div class="muted small">{{ proposal.action_type }}</div>
         <div class="small">{{ proposal.description }}</div>
+        <div class="small muted">by {{ proposal.created_by_agent_role or "planner" }} / {{ proposal.data_classification.value }}</div>
     </td>
     <td>{{ proposal.connector }}</td>
     <td><span class="badge {{ proposal.risk_level.value }}">{{ proposal.risk_level.value }}</span></td>
@@ -14,26 +15,12 @@
             {% if proposal.status.value == "pending" and proposal.risk_level.value in ["high", "critical"] %}
             <span class="muted small">High-risk: review detail and re-auth there.</span>
             {% elif proposal.status.value == "pending" %}
-            <form
-                method="post"
-                action="/approvals/{{ proposal.id }}/approve"
-                hx-post="/approvals/{{ proposal.id }}/approve"
-                hx-target="#proposal-row-{{ proposal.id }}"
-                hx-swap="outerHTML"
-                class="stack tight"
-            >
+            <form method="post" action="/approvals/{{ proposal.id }}/approve" class="stack tight">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="text" name="reason" value="Queued from approval inbox" required>
                 <button class="button mini primary" type="submit">Queue Approval</button>
             </form>
-            <form
-                method="post"
-                action="/approvals/{{ proposal.id }}/reject"
-                hx-post="/approvals/{{ proposal.id }}/reject"
-                hx-target="#proposal-row-{{ proposal.id }}"
-                hx-swap="outerHTML"
-                class="stack tight"
-            >
+            <form method="post" action="/approvals/{{ proposal.id }}/reject" class="stack tight">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="text" name="reason" value="Rejected from approval inbox" required>
                 <button class="button mini danger" type="submit">Reject</button>

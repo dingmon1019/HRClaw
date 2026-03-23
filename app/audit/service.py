@@ -17,8 +17,6 @@ class AuditService:
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
         settings = self.settings_service.get_effective_settings()
-        if not settings.json_audit_enabled:
-            return
         timestamp = utcnow_iso()
         payload_json = json_dumps(payload)
         prev_row = self.database.fetch_one(
@@ -40,9 +38,10 @@ class AuditService:
             "prev_hash": prev_hash or None,
             "entry_hash": entry_hash,
         }
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json_dumps(record))
-            handle.write("\n")
+        if settings.json_audit_enabled:
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json_dumps(record))
+                handle.write("\n")
 
     def verify_integrity(self) -> dict[str, Any]:
         rows = self.database.fetch_all(

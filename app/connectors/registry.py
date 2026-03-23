@@ -9,11 +9,13 @@ from app.connectors.system import SystemConnector
 from app.connectors.task import TaskConnector
 from app.core.database import Database
 from app.core.errors import ConnectorError
+from app.core.utils import json_dumps, utcnow_iso
 from app.services.settings_service import SettingsService
 
 
 class ConnectorRegistry:
     def __init__(self, base_settings: AppSettings, database: Database, settings_service: SettingsService):
+        self.database = database
         self._connectors: dict[str, BaseConnector] = {
             "filesystem": FilesystemConnector(base_settings, settings_service),
             "http": HttpConnector(settings_service),
@@ -29,4 +31,23 @@ class ConnectorRegistry:
         return connector
 
     def list_health(self) -> list[dict]:
-        return [connector.healthcheck() for connector in self._connectors.values()]
+        checked_at = utcnow_iso()
+        health = [connector.healthcheck() for connector in self._connectors.values()]
+        for item in health:
+            self.database.execute(
+                """
+                INSERT INTO connector_health(connector_name, available, metadata_json, checked_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(connector_name) DO UPDATE SET
+                    available = excluded.available,
+                    metadata_json = excluded.metadata_json,
+                    checked_at = excluded.checked_at
+                """,
+                (
+                    item["name"],
+                    int(bool(item.get("available", False))),
+                    json_dumps(item),
+                    checked_at,
+                ),
+            )
+        return health

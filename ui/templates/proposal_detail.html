@@ -5,6 +5,7 @@
         <div>
             <h2>{{ proposal.title }}</h2>
             <p class="muted">{{ proposal.description }}</p>
+            <p class="small muted">Run <a href="/runs/{{ proposal.run_id }}">{{ proposal.run_id }}</a> / proposed by {{ proposal.created_by_agent_role or "planner" }} / reviewed by {{ proposal.reviewed_by_agent_role or "reviewer" }}</p>
         </div>
         <div class="stack tight align-end">
             <span class="badge {{ proposal.risk_level.value }}">{{ proposal.risk_level.value }}</span>
@@ -14,8 +15,16 @@
 
     <section class="risk-banner {{ proposal.risk_level.value }}">
         <strong>Risk:</strong> {{ proposal.risk_level.value|upper }}
-        <span>Approval reason is mandatory, and high-risk approvals require recent re-authentication.</span>
+        <span>Approval is bound to a snapshot hash, policy hash, settings hash, and resource preconditions.</span>
     </section>
+
+    {% if snapshot_context.stale %}
+    <section class="notice danger">
+        <strong>Snapshot drift detected.</strong>
+        <div>{{ snapshot_context.stale_reason }}</div>
+        <div class="small">Changed fields: {{ snapshot_context.changed_fields | join(", ") }}</div>
+    </section>
+    {% endif %}
 
     <div class="grid two">
         <article class="panel">
@@ -43,6 +52,15 @@
         </article>
 
         <article class="panel">
+            <h3>Snapshot Binding</h3>
+            <div class="stack tight">
+                <div class="metric-row"><span>Proposal Snapshot</span><strong>{{ proposal.snapshot_hash or "-" }}</strong></div>
+                <div class="metric-row"><span>Created Snapshot</span><strong>{{ snapshot_context.created_snapshot.snapshot_hash if snapshot_context.created_snapshot else "-" }}</strong></div>
+                <div class="metric-row"><span>Approved Snapshot</span><strong>{{ snapshot_context.approved_snapshot.snapshot_hash if snapshot_context.approved_snapshot else "-" }}</strong></div>
+                <div class="metric-row"><span>Live Snapshot</span><strong>{{ snapshot_context.live_snapshot.snapshot_hash if snapshot_context.live_snapshot else "-" }}</strong></div>
+                <div class="metric-row"><span>Data Classification</span><strong>{{ proposal.data_classification.value }}</strong></div>
+            </div>
+
             <h3>Execution Preview</h3>
             <pre>{{ preview.execution_preview | tojson(indent=2) }}</pre>
 
@@ -89,13 +107,13 @@
             <span class="badge {{ 'warn' if require_reauth_for_approval else 'ok' }}">{{ "Re-auth required" if require_reauth_for_approval else "Ready" }}</span>
         </div>
 
-        {% if proposal.status.value == "pending" %}
+        {% if proposal.status.value in ["pending", "stale"] %}
         <div class="stack">
             <form method="post" action="/proposals/{{ proposal.id }}/approve" class="stack form-grid">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label>
                     Approval Reason
-                    <textarea name="reason" rows="3" minlength="5" placeholder="Explain why this action is acceptable." required></textarea>
+                    <textarea name="reason" rows="3" minlength="5" placeholder="Explain why this exact snapshot is acceptable." required></textarea>
                 </label>
                 {% if require_reauth_for_approval %}
                 <label>
@@ -106,7 +124,7 @@
                 <button class="button primary" type="submit">Approve and Queue</button>
             </form>
 
-            <form method="post" action="/proposals/{{ proposal.id }}/reject" class="stack form-grid">
+            <form method="post" action="/proposals/{{ proposal.id }}/reject" class="stack form-grid" data-confirm="Reject this proposal?">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label>
                     Rejection Reason
@@ -116,7 +134,7 @@
             </form>
         </div>
         {% else %}
-        <p class="muted">This proposal is no longer pending. Review the logs below for the final state.</p>
+        <p class="muted">This proposal is no longer awaiting approval. Review the logs below for the final state.</p>
         {% endif %}
     </article>
 
@@ -128,6 +146,13 @@
                 <strong>{{ approval.decision }}</strong>
                 <p>{{ approval.actor }}{% if approval.reason %}: {{ approval.reason }}{% endif %}</p>
                 <small>{{ approval.created_at }}</small>
+                <pre>{{ {
+                    "snapshot_hash": approval.snapshot_hash,
+                    "action_hash": approval.action_hash,
+                    "policy_hash": approval.policy_hash,
+                    "settings_hash": approval.settings_hash,
+                    "resource_hash": approval.resource_hash
+                } | tojson(indent=2) }}</pre>
             </div>
             {% else %}
             <p class="muted">No approval records yet.</p>
@@ -141,9 +166,47 @@
                 <strong>{{ job.status.value }}</strong>
                 <p>Job {{ job.id }} queued by {{ job.queued_by }}</p>
                 <small>{{ job.queued_at }}</small>
+                <pre>{{ {
+                    "approval_id": job.approval_id,
+                    "correlation_id": job.correlation_id,
+                    "attempt_count": job.attempt_count,
+                    "lease_expires_at": job.lease_expires_at
+                } | tojson(indent=2) }}</pre>
             </div>
             {% else %}
             <p class="muted">No worker job has been created for this proposal yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+
+<section class="grid two">
+    <article class="card">
+        <h3>Agent Provenance</h3>
+        <div class="stack">
+            {% for step in agent_runs %}
+            <div class="list-item">
+                <strong>{{ step.agent_name }}</strong>
+                <p>{{ step.role.value }} / {{ step.status }}</p>
+                <small>{{ step.started_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No agent run records available.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <h3>Handoff Trail</h3>
+        <div class="stack">
+            {% for handoff in handoffs %}
+            <div class="list-item">
+                <strong>{{ handoff.title }}</strong>
+                <p>to {{ handoff.to_agent_role.value }}</p>
+                <small>{{ handoff.created_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No handoff trail available.</p>
             {% endfor %}
         </div>
     </article>

@@ -3,10 +3,13 @@
 <section class="card wide">
     <div class="card-header">
         <div>
-            <h2>Run Agent</h2>
-            <p class="muted">This step only collects, summarizes, and proposes. Execution stays behind approval and the isolated worker queue.</p>
+            <h2>Assistant Workbench</h2>
+            <p class="muted">Describe the goal in natural language. The supervisor decomposes it, the planner proposes typed actions, the reviewer checks risk and egress, and only approved steps reach the executor worker.</p>
         </div>
-        <span class="badge ok">No Direct Execution</span>
+        <div class="stack tight align-end">
+            <span class="badge ok">Approval Bound</span>
+            <span class="badge ok">Worker Isolated</span>
+        </div>
     </div>
 
     {% if unsafe_warnings %}
@@ -17,16 +20,40 @@
     </section>
     {% endif %}
 
-    <form method="post" action="/run" class="stack form-grid">
+    <div class="grid two">
+        <article class="panel">
+            <h3>How This Flow Works</h3>
+            <div class="stack tight">
+                <div class="metric-row"><span>1. Supervisor</span><strong>interprets the objective</strong></div>
+                <div class="metric-row"><span>2. Planner</span><strong>creates typed candidate actions</strong></div>
+                <div class="metric-row"><span>3. Reviewer</span><strong>checks policy, risk, and egress</strong></div>
+                <div class="metric-row"><span>4. Operator</span><strong>approves or rejects explicit steps</strong></div>
+                <div class="metric-row"><span>5. Executor</span><strong>runs only approved snapshots</strong></div>
+            </div>
+        </article>
+
+        <article class="panel">
+            <h3>Safety Defaults</h3>
+            <div class="stack tight">
+                <div class="metric-row"><span>Workspace</span><strong>{{ settings.workspace_root }}</strong></div>
+                <div class="metric-row"><span>Default Provider</span><strong>{{ settings.provider }}</strong></div>
+                <div class="metric-row"><span>Planning Profile</span><strong>{{ settings.planning_profile }}</strong></div>
+                <div class="metric-row"><span>Reporter Profile</span><strong>{{ settings.summary_profile }}</strong></div>
+                <div class="metric-row"><span>System Connector</span><strong>{{ "enabled" if settings.enable_system_connector else "disabled" }}</strong></div>
+            </div>
+        </article>
+    </div>
+
+    <form method="post" action="/run" class="stack form-grid mt-16">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label>
-            Objective
-            <textarea name="objective" rows="4" placeholder="Describe the operator task you want the runtime to analyze." required></textarea>
+            Ask The Agent
+            <textarea name="objective" rows="5" placeholder="Example: Review the files in notes\\, summarize the work, then propose a safe update to workspace\\report.txt and show me what would change before anything runs." required></textarea>
         </label>
 
         <div class="grid two">
             <label>
-                Filesystem Path
+                Filesystem Target
                 <input type="text" name="filesystem_path" placeholder="Relative paths resolve inside {{ settings.workspace_root }}">
             </label>
             <label>
@@ -40,71 +67,76 @@
             </label>
         </div>
 
-        <label>
-            File Content
-            <textarea name="file_content" rows="4" placeholder="If set, the planner will propose a bounded write or append action inside the safe workspace."></textarea>
-        </label>
+        <details class="panel">
+            <summary><strong>Expert Inputs</strong> <span class="muted small">Optional structured hints for the planner</span></summary>
+            <div class="stack form-grid mt-16">
+                <label>
+                    File Content
+                    <textarea name="file_content" rows="4" placeholder="If set, the planner will propose a bounded file write or append action."></textarea>
+                </label>
 
-        <div class="grid three">
-            <label>
-                HTTP URL
-                <input type="text" name="http_url" placeholder="https://example.com/api">
-            </label>
-            <label>
-                HTTP Method
-                <select name="http_method">
-                    <option>GET</option>
-                    <option>POST</option>
-                    <option>PUT</option>
-                    <option>PATCH</option>
-                    <option>DELETE</option>
-                </select>
-            </label>
-            <label>
-                Model Override
-                <input type="text" name="model_name" placeholder="{{ settings.model }}">
-            </label>
-        </div>
+                <div class="grid three">
+                    <label>
+                        HTTP URL
+                        <input type="text" name="http_url" placeholder="https://example.com/api">
+                    </label>
+                    <label>
+                        HTTP Method
+                        <select name="http_method">
+                            <option>GET</option>
+                            <option>POST</option>
+                            <option>PUT</option>
+                            <option>PATCH</option>
+                            <option>DELETE</option>
+                        </select>
+                    </label>
+                    <label>
+                        Model Override
+                        <input type="text" name="model_name" placeholder="{{ settings.model }}">
+                    </label>
+                </div>
 
-        <label>
-            HTTP Headers
-            <textarea name="http_headers_text" rows="3" placeholder='{"Content-Type":"application/json"} or Header: value'></textarea>
-        </label>
+                <label>
+                    HTTP Headers
+                    <textarea name="http_headers_text" rows="3" placeholder='{"Content-Type":"application/json"} or Header: value'></textarea>
+                </label>
 
-        <label>
-            HTTP Body
-            <textarea name="http_body" rows="4" placeholder="Optional request body for non-GET actions."></textarea>
-        </label>
+                <label>
+                    HTTP Body
+                    <textarea name="http_body" rows="4" placeholder="Optional request body for non-GET actions."></textarea>
+                </label>
 
-        <div class="grid two">
-            <label>
-                Task Title
-                <input type="text" name="task_title" placeholder="Optional local task title">
-            </label>
-            <label>
-                Bounded System Action
-                <select name="system_action">
-                    <option value="">None</option>
-                    {% for action in system_actions %}
-                    <option value="{{ action }}">{{ action }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-        </div>
+                <div class="grid two">
+                    <label>
+                        Task Title
+                        <input type="text" name="task_title" placeholder="Optional local task title">
+                    </label>
+                    <label>
+                        Bounded System Action
+                        <select name="system_action">
+                            <option value="">None</option>
+                            {% for action in system_actions %}
+                            <option value="{{ action }}">{{ action }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
 
-        <div class="grid two">
-            <label>
-                Task Details
-                <textarea name="task_details" rows="3" placeholder="Optional task details for the local task connector."></textarea>
-            </label>
-            <label>
-                System Path
-                <input type="text" name="system_path" placeholder="Path used by system.list_directory, system.read_text_file, or system.test_path">
-            </label>
-        </div>
+                <div class="grid two">
+                    <label>
+                        Task Details
+                        <textarea name="task_details" rows="3" placeholder="Optional task details for the local task connector."></textarea>
+                    </label>
+                    <label>
+                        System Path
+                        <input type="text" name="system_path" placeholder="Path used by bounded system actions">
+                    </label>
+                </div>
+            </div>
+        </details>
 
         <div class="actions">
-            <button type="submit" class="button primary">Collect, Summarize, Propose</button>
+            <button type="submit" class="button primary">Decompose, Review, Prepare</button>
             <a href="/proposals" class="button ghost">Open Proposals Inbox</a>
         </div>
     </form>

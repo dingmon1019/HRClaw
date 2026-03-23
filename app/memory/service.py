@@ -54,3 +54,19 @@ class SummaryService:
             for row in rows
         ]
 
+    def get_by_run_id(self, run_id: str) -> SummaryRecord | None:
+        row = self.database.fetch_one(
+            "SELECT * FROM summaries WHERE run_id = ? ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        )
+        if row is None:
+            return None
+        return SummaryRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            objective=row["objective"],
+            collected=json_loads(row["collected_json"], {}),
+            summary_text=row["summary_text"],
+            provider_name=row["provider_name"],
+            created_at=row["created_at"],
+        )

@@ -56,5 +56,6 @@ class SystemConnector(BaseConnector):
             if not path.is_file():
                 raise ConnectorError(f"Path {path} is not a file.")
             content = path.read_text(encoding="utf-8", errors="ignore")
-            return {"path": str(path), "preview": content[:4000], "size_bytes": len(content.encode("utf-8"))}
+            limit = self.settings_service.get_effective_settings().filesystem_max_read_bytes
+            return {"path": str(path), "preview": content[:limit], "size_bytes": len(content.encode("utf-8"))}
         raise ConnectorError(f"Unsupported system action: {action_type}")

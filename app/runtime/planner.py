@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import json
 
-from app.audit.service import AuditService
+from app.agents.service import AgentService
 from app.config.settings import AppSettings
 from app.connectors.registry import ConnectorRegistry
 from app.core.utils import json_dumps, new_id
 from app.memory.service import SummaryService
 from app.policy.engine import PolicyEngine
-from app.schemas.actions import ActionProposal, AgentRunRequest, AgentRunResult
+from app.schemas.actions import (
+    ActionProposal,
+    AgentRunRequest,
+    AgentRunResult,
+    DataClassification,
+)
+from app.schemas.agents import AgentRole
 from app.schemas.providers import ProviderRequest
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.provider_service import ProviderService
+from app.audit.service import AuditService
 
 
 class RuntimePlanner:
@@ -26,6 +33,7 @@ class RuntimePlanner:
         history_service: HistoryService,
         policy_engine: PolicyEngine,
         audit_service: AuditService,
+        agent_service: AgentService,
     ):
         self.base_settings = base_settings
         self.connector_registry = connector_registry
@@ -35,12 +43,58 @@ class RuntimePlanner:
         self.history_service = history_service
         self.policy_engine = policy_engine
         self.audit_service = audit_service
+        self.agent_service = agent_service
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         run_id = new_id("run")
-        collected = self._collect(run_id, request)
+        correlation_id = new_id("corr")
         effective_settings = self.provider_service.settings_service.get_effective_settings()
-        summary_text, summary_provider_name = self._summarize(request, collected, effective_settings.summary_profile)
+
+        supervisor = self.agent_service.get_by_role(AgentRole.SUPERVISOR)
+        planner = self.agent_service.get_by_role(AgentRole.PLANNER)
+        reviewer = self.agent_service.get_by_role(AgentRole.REVIEWER)
+        reporter = self.agent_service.get_by_role(AgentRole.REPORTER)
+
+        supervisor_run = self.agent_service.start_run(
+            run_id,
+            supervisor,
+            input_payload={"objective": request.objective, "request": request.model_dump(mode="json")},
+            provider_profile=self._provider_profile_for_role(AgentRole.SUPERVISOR, effective_settings),
+            correlation_id=correlation_id,
+        )
+        collected = self._collect(run_id, request)
+        subtasks = self._decompose(request)
+        intent_summary = self._intent_summary(request, subtasks)
+        self.agent_service.complete_run(
+            supervisor_run.id,
+            status="completed",
+            output_payload={"intent_summary": intent_summary, "subtasks": subtasks, "collected_keys": list(collected)},
+        )
+
+        planner_handoff = self.agent_service.create_handoff(
+            run_id,
+            from_agent_run_id=supervisor_run.id,
+            to_agent=planner,
+            title="Objective decomposed for planning",
+            payload={"intent_summary": intent_summary, "subtasks": subtasks},
+            correlation_id=correlation_id,
+        )
+        planner_run = self.agent_service.start_run(
+            run_id,
+            planner,
+            input_payload={"collected": collected, "subtasks": subtasks, "objective": request.objective},
+            parent_agent_run_id=supervisor_run.id,
+            provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
+            correlation_id=correlation_id,
+        )
+        planning_classification = self._planning_classification(request, collected)
+        summary_text, summary_provider_name = self._summarize(
+            request,
+            collected,
+            self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
+            correlation_id,
+            planning_classification,
+        )
         summary = self.summary_service.create(
             run_id=run_id,
             objective=request.objective,
@@ -48,19 +102,99 @@ class RuntimePlanner:
             summary_text=summary_text,
             provider_name=summary_provider_name,
         )
-        proposals = self._build_proposals(
-            run_id,
-            request,
-            summary.id,
-            collected,
-            summary.summary_text,
-            effective_settings.planning_profile,
+        raw_proposals = self._build_proposals(
+            run_id=run_id,
+            request=request,
+            summary_id=summary.id,
+            collected=collected,
+            summary_text=summary.summary_text,
+            planning_provider=request.provider_name or self.provider_service.resolve_profile_provider(
+                self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+            ),
+            planner_agent_id=planner.id,
+            correlation_id=correlation_id,
         )
-        created = self.proposal_service.create_many(proposals)
+        self.agent_service.complete_handoff(planner_handoff.id)
+        self.agent_service.complete_run(
+            planner_run.id,
+            status="completed",
+            provider_name=summary_provider_name,
+            output_payload={
+                "summary_id": summary.id,
+                "proposal_titles": [proposal.title for proposal in raw_proposals],
+                "proposal_count": len(raw_proposals),
+            },
+        )
+
+        reviewer_handoff = self.agent_service.create_handoff(
+            run_id,
+            from_agent_run_id=planner_run.id,
+            to_agent=reviewer,
+            title="Candidate actions ready for policy and egress review",
+            payload={"proposal_count": len(raw_proposals), "summary_id": summary.id},
+            correlation_id=correlation_id,
+        )
+        reviewer_run = self.agent_service.start_run(
+            run_id,
+            reviewer,
+            input_payload={"summary_id": summary.id, "proposal_count": len(raw_proposals)},
+            parent_agent_run_id=planner_run.id,
+            provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings),
+            correlation_id=correlation_id,
+        )
+        reviewed = [self._review_proposal(proposal, reviewer.id) for proposal in raw_proposals]
+        created = self.proposal_service.create_many(reviewed)
+        self.agent_service.complete_handoff(reviewer_handoff.id)
+        self.agent_service.complete_run(
+            reviewer_run.id,
+            status="completed",
+            output_payload={
+                "proposal_ids": [proposal.id for proposal in created],
+                "blocked_count": sum(1 for proposal in created if proposal.status.value == "blocked"),
+                "approval_required_count": sum(1 for proposal in created if proposal.requires_approval),
+            },
+        )
+
+        reporter_handoff = self.agent_service.create_handoff(
+            run_id,
+            from_agent_run_id=reviewer_run.id,
+            to_agent=reporter,
+            title="Reviewed plan ready for operator summary",
+            payload={"proposal_ids": [proposal.id for proposal in created]},
+            correlation_id=correlation_id,
+        )
+        reporter_run = self.agent_service.start_run(
+            run_id,
+            reporter,
+            input_payload={"summary_id": summary.id, "proposal_count": len(created)},
+            parent_agent_run_id=reviewer_run.id,
+            provider_profile=self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
+            correlation_id=correlation_id,
+        )
+        operator_summary, reporter_provider = self._report_plan(
+            request,
+            created,
+            summary.summary_text,
+            self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
+            correlation_id,
+            planning_classification,
+        )
+        self.agent_service.complete_handoff(reporter_handoff.id)
+        self.agent_service.complete_run(
+            reporter_run.id,
+            status="completed",
+            provider_name=reporter_provider,
+            output_payload={
+                "operator_summary": operator_summary,
+                "proposal_ids": [proposal.id for proposal in created],
+            },
+        )
+
         self.audit_service.emit(
             "planning.completed",
             {
                 "run_id": run_id,
+                "correlation_id": correlation_id,
                 "objective": request.objective,
                 "proposal_ids": [proposal.id for proposal in created],
                 "summary_id": summary.id,
@@ -84,6 +218,12 @@ class RuntimePlanner:
             collected["filesystem"] = self._safe_collect(run_id, "filesystem", {"path": request.filesystem_path})
         if request.http_url and request.http_method.upper() in {"GET", "HEAD"}:
             collected["http"] = self._safe_collect(run_id, "http", {"url": request.http_url})
+        if request.system_action and request.system_path:
+            collected["system"] = self._safe_collect(
+                run_id,
+                "system",
+                {"path": request.system_path, "action": request.system_action},
+            )
         return collected
 
     def _safe_collect(self, run_id: str, connector_name: str, payload: dict) -> dict:
@@ -109,10 +249,17 @@ class RuntimePlanner:
             )
             return {"error": str(exc), "input": payload}
 
-    def _summarize(self, request: AgentRunRequest, collected: dict, profile: str) -> tuple[str, str]:
+    def _summarize(
+        self,
+        request: AgentRunRequest,
+        collected: dict,
+        profile: str,
+        correlation_id: str,
+        classification: DataClassification,
+    ) -> tuple[str, str]:
         prompt = (
             "Summarize the collected local-agent context for a Windows operator. "
-            "Highlight risks, likely side effects, and the next approval-ready actions.\n\n"
+            "Highlight risks, side effects, egress implications, and approval-ready actions.\n\n"
             f"Objective:\n{request.objective}\n\nCollected:\n{json_dumps(collected)}"
         )
         provider_name = request.provider_name or self.provider_service.resolve_profile_provider(profile)
@@ -123,7 +270,10 @@ class RuntimePlanner:
                     model_name=request.model_name,
                     profile=profile,
                     prompt=prompt,
-                    system_prompt="Produce a concise operator summary for a local-first agent runtime.",
+                    system_prompt="Produce a concise operator summary for a local-first multi-agent runtime.",
+                    data_classification=classification.value,
+                    task_type="planning-summary",
+                    correlation_id=correlation_id,
                 )
             )
             return response.content, response.provider_name
@@ -133,6 +283,8 @@ class RuntimePlanner:
                 fragments.append("Filesystem context captured.")
             if "http" in collected:
                 fragments.append("HTTP context captured.")
+            if "system" in collected:
+                fragments.append("Bounded system context captured.")
             if collected.get("tasks"):
                 fragments.append("Task snapshot captured.")
             fragments.append("All actions remain approval-gated before execution.")
@@ -145,14 +297,34 @@ class RuntimePlanner:
         summary_id: str,
         collected: dict,
         summary_text: str,
-        planning_profile: str,
+        planning_provider: str | None,
+        planner_agent_id: str,
+        correlation_id: str,
     ) -> list[ActionProposal]:
         proposals: list[ActionProposal] = []
-        planning_provider = request.provider_name or self.provider_service.resolve_profile_provider(planning_profile)
         if request.filesystem_path:
-            proposals.extend(self._filesystem_proposals(run_id, request, summary_id, collected, planning_provider))
+            proposals.extend(
+                self._filesystem_proposals(
+                    run_id,
+                    request,
+                    summary_id,
+                    collected,
+                    planning_provider,
+                    planner_agent_id,
+                    correlation_id,
+                )
+            )
         if request.http_url:
-            proposals.append(self._http_proposal(run_id, request, summary_id, planning_provider))
+            proposals.append(
+                self._http_proposal(
+                    run_id,
+                    request,
+                    summary_id,
+                    planning_provider,
+                    planner_agent_id,
+                    correlation_id,
+                )
+            )
         if request.task_title:
             proposals.append(
                 ActionProposal(
@@ -163,9 +335,13 @@ class RuntimePlanner:
                     title=f"Create local task: {request.task_title}",
                     description="Create a tracked local task in the runtime database.",
                     payload={"title": request.task_title, "details": request.task_details or summary_text},
-                    rationale="A local task is an explicit, auditable follow-up artifact.",
+                    rationale="The operator asked for a concrete follow-up item.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         elif "list task" in request.objective.lower():
@@ -181,6 +357,10 @@ class RuntimePlanner:
                     rationale="The objective explicitly asks for task visibility.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         if request.system_action:
@@ -196,6 +376,10 @@ class RuntimePlanner:
                     rationale="The operator selected a bounded system action.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         if not proposals:
@@ -212,9 +396,13 @@ class RuntimePlanner:
                     rationale="No direct connector action was inferred, so the runtime stores the objective as a task.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
-        return [self.policy_engine.evaluate(proposal) for proposal in proposals]
+        return proposals
 
     def _filesystem_proposals(
         self,
@@ -223,11 +411,14 @@ class RuntimePlanner:
         summary_id: str,
         collected: dict,
         planning_provider: str | None,
+        planner_agent_id: str,
+        correlation_id: str,
     ) -> list[ActionProposal]:
         path = request.filesystem_path or ""
         lower_objective = request.objective.lower()
         observed_kind = (collected.get("filesystem") or {}).get("kind")
         proposals: list[ActionProposal] = []
+        classification = DataClassification.RESTRICTED if request.file_content is not None else DataClassification.LOCAL_ONLY
 
         if request.file_content is not None:
             action_type = "filesystem.append_text" if "append" in lower_objective else "filesystem.write_text"
@@ -243,6 +434,10 @@ class RuntimePlanner:
                     rationale="The request includes explicit file content.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=classification,
                 )
             )
             return proposals
@@ -260,6 +455,10 @@ class RuntimePlanner:
                     rationale="The objective explicitly requests deletion.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         elif "create folder" in lower_objective or "create directory" in lower_objective or "mkdir" in lower_objective:
@@ -275,6 +474,10 @@ class RuntimePlanner:
                     rationale="The objective explicitly requests a directory.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         elif observed_kind == "directory" or path.endswith(("\\", "/")) or "list" in lower_objective:
@@ -290,6 +493,10 @@ class RuntimePlanner:
                     rationale="The objective or collected context points to a directory listing operation.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         else:
@@ -305,6 +512,10 @@ class RuntimePlanner:
                     rationale="The objective points to a read-oriented filesystem action.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
+                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         return proposals
@@ -315,9 +526,12 @@ class RuntimePlanner:
         request: AgentRunRequest,
         summary_id: str,
         planning_provider: str | None,
+        planner_agent_id: str,
+        correlation_id: str,
     ) -> ActionProposal:
         method = request.http_method.upper()
         headers = self._parse_headers(request.http_headers_text)
+        classification = DataClassification.RESTRICTED if request.http_body else DataClassification.EXTERNAL_OK
         return ActionProposal(
             run_id=run_id,
             objective=request.objective,
@@ -329,7 +543,62 @@ class RuntimePlanner:
             rationale="The operator provided an explicit target URL.",
             provider_name=planning_provider,
             summary_id=summary_id,
+            created_by_agent_id=planner_agent_id,
+            created_by_agent_role=AgentRole.PLANNER.value,
+            correlation_id=correlation_id,
+            data_classification=classification,
         )
+
+    def _review_proposal(self, proposal: ActionProposal, reviewer_agent_id: str) -> ActionProposal:
+        policy_notes = list(proposal.policy_notes)
+        if proposal.data_classification == DataClassification.RESTRICTED:
+            policy_notes.append("Data classification is restricted. Remote provider egress is blocked by default.")
+        elif proposal.data_classification == DataClassification.LOCAL_ONLY:
+            policy_notes.append("Data classification is local-only. Keep planning and review on local-capable providers.")
+        reviewed = proposal.model_copy(
+            update={
+                "policy_notes": policy_notes,
+                "reviewed_by_agent_id": reviewer_agent_id,
+                "reviewed_by_agent_role": AgentRole.REVIEWER.value,
+            }
+        )
+        return self.policy_engine.evaluate(reviewed)
+
+    def _report_plan(
+        self,
+        request: AgentRunRequest,
+        proposals,
+        summary_text: str,
+        profile: str,
+        correlation_id: str,
+        classification: DataClassification,
+    ) -> tuple[str, str]:
+        prompt = (
+            "Summarize this local multi-agent plan for the operator. "
+            "Explain why each action is proposed, what requires approval, and the most important risks.\n\n"
+            f"Objective:\n{request.objective}\n\nSummary:\n{summary_text}\n\n"
+            f"Reviewed proposals:\n{json_dumps([proposal.model_dump(mode='json') for proposal in proposals])}"
+        )
+        provider_name = request.provider_name or self.provider_service.resolve_profile_provider(profile)
+        try:
+            response = self.provider_service.complete(
+                ProviderRequest(
+                    provider_name=request.provider_name,
+                    model_name=request.model_name,
+                    profile=profile,
+                    prompt=prompt,
+                    system_prompt="You are the reporter agent in a Windows-first local control console.",
+                    data_classification=classification.value,
+                    task_type="report-plan",
+                    correlation_id=correlation_id,
+                )
+            )
+            return response.content, response.provider_name
+        except Exception:
+            return (
+                "Plan ready. Review the proposed steps, inspect high-risk actions, and approve only the bounded actions you want executed.",
+                provider_name or "offline-fallback",
+            )
 
     @staticmethod
     def _parse_headers(raw_headers: str | None) -> dict:
@@ -346,3 +615,45 @@ class RuntimePlanner:
                     key, value = line.split(":", 1)
                     headers[key.strip()] = value.strip()
             return headers
+
+    @staticmethod
+    def _decompose(request: AgentRunRequest) -> list[dict[str, str]]:
+        subtasks: list[dict[str, str]] = [{"role": AgentRole.SUPERVISOR.value, "title": "Interpret objective"}]
+        if request.filesystem_path:
+            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Inspect filesystem target {request.filesystem_path}"})
+        if request.http_url:
+            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Prepare HTTP action for {request.http_url}"})
+        if request.system_action:
+            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Prepare bounded system action {request.system_action}"})
+        if request.task_title:
+            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Create local task {request.task_title}"})
+        subtasks.append({"role": AgentRole.REVIEWER.value, "title": "Evaluate risk, policy, and egress"})
+        subtasks.append({"role": AgentRole.REPORTER.value, "title": "Prepare operator-facing plan summary"})
+        return subtasks
+
+    @staticmethod
+    def _intent_summary(request: AgentRunRequest, subtasks: list[dict[str, str]]) -> str:
+        return (
+            f"Objective interpreted as {len(subtasks)} explicit steps. "
+            f"The runtime will keep execution behind approval and bounded worker execution for: {request.objective}"
+        )
+
+    @staticmethod
+    def _planning_classification(request: AgentRunRequest, collected: dict) -> DataClassification:
+        if request.file_content or request.http_body:
+            return DataClassification.RESTRICTED
+        if request.filesystem_path or request.system_action or "filesystem" in collected:
+            return DataClassification.LOCAL_ONLY
+        return DataClassification.EXTERNAL_OK
+
+    @staticmethod
+    def _provider_profile_for_role(role: AgentRole, settings) -> str:
+        if role == AgentRole.PLANNER:
+            return settings.planning_profile
+        if role == AgentRole.REPORTER:
+            return settings.summary_profile
+        if role == AgentRole.REVIEWER:
+            return "privacy-preferred"
+        if role == AgentRole.EXECUTOR:
+            return "local-only"
+        return "strong"

@@ -3,8 +3,12 @@ from __future__ import annotations
 from time import time
 from typing import Iterable
 
+from app.audit.service import AuditService
+from app.core.database import Database
 from app.core.errors import ProviderError
+from app.core.utils import json_dumps, utcnow_iso
 from app.providers.registry import ProviderRegistry
+from app.schemas.actions import DataClassification
 from app.schemas.providers import ProviderRequest, ProviderStatus, ProviderTestRequest, ProviderTestResult
 from app.schemas.settings import EffectiveSettings
 from app.services.settings_service import SettingsService
@@ -16,11 +20,20 @@ class ProviderService:
         "cheap": "cheap_provider",
         "strong": "strong_provider",
         "local-only": "local_provider",
+        "privacy-preferred": "privacy_provider",
     }
 
-    def __init__(self, registry: ProviderRegistry, settings_service: SettingsService):
+    def __init__(
+        self,
+        registry: ProviderRegistry,
+        settings_service: SettingsService,
+        database: Database,
+        audit_service: AuditService,
+    ):
         self.registry = registry
         self.settings_service = settings_service
+        self.database = database
+        self.audit_service = audit_service
         self._provider_state: dict[str, dict[str, object]] = {}
 
     def complete(self, request: ProviderRequest, settings_override: EffectiveSettings | None = None):
@@ -30,12 +43,20 @@ class ProviderService:
         if not candidates:
             raise ProviderError("No provider candidates are configured for this request.")
 
+        chosen_candidate: str | None = None
         for provider_name in candidates:
+            provider = self.registry.get(provider_name)
+            try:
+                self._validate_provider_usage(provider_name, provider.supports_remote, request, settings)
+            except ProviderError as exc:
+                last_error = exc
+                self._record_failure(provider_name, settings, exc)
+                continue
+
             if self._is_circuit_open(provider_name):
                 last_error = ProviderError(f"Circuit open for provider {provider_name}.")
                 continue
 
-            provider = self.registry.get(provider_name)
             attempts = settings.provider_max_retries + 1
             for _ in range(attempts):
                 try:
@@ -43,27 +64,62 @@ class ProviderService:
                         request.model_copy(update={"provider_name": provider_name}),
                         settings,
                     )
+                    if chosen_candidate and chosen_candidate != provider_name:
+                        self.audit_service.emit(
+                            "provider.fallback",
+                            {
+                                "from_provider": chosen_candidate,
+                                "to_provider": provider_name,
+                                "correlation_id": request.correlation_id,
+                            },
+                        )
+                    chosen_candidate = provider_name
                     self._record_success(provider_name)
                     return response
                 except Exception as exc:
                     last_error = exc
+                    if chosen_candidate is None:
+                        chosen_candidate = provider_name
                     self._record_failure(provider_name, settings, exc)
         raise ProviderError(f"Provider request failed after fallback attempts: {last_error}")
 
     def list_statuses(self, settings_override: EffectiveSettings | None = None) -> list[ProviderStatus]:
         settings = settings_override or self.settings_service.get_effective_settings()
         statuses: list[ProviderStatus] = []
+        checked_at = utcnow_iso()
         for provider in self.registry.list_all():
             status = provider.status(settings)
             state = self._provider_state.get(provider.name, {})
-            statuses.append(
-                status.model_copy(
-                    update={
-                        "available": status.available and not self._is_circuit_open(provider.name),
-                        "circuit_open": self._is_circuit_open(provider.name),
-                        "last_error": state.get("last_error"),
-                    }
-                )
+            normalized = status.model_copy(
+                update={
+                    "available": status.available and not self._is_circuit_open(provider.name),
+                    "circuit_open": self._is_circuit_open(provider.name),
+                    "last_error": state.get("last_error"),
+                    "healthy": status.configured and not self._is_circuit_open(provider.name),
+                    "allowed_hosts": settings.provider_allowed_hosts,
+                    "last_checked_at": checked_at,
+                }
+            )
+            statuses.append(normalized)
+            self.database.execute(
+                """
+                INSERT INTO provider_health(provider_name, healthy, circuit_open, last_error, metadata_json, checked_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider_name) DO UPDATE SET
+                    healthy = excluded.healthy,
+                    circuit_open = excluded.circuit_open,
+                    last_error = excluded.last_error,
+                    metadata_json = excluded.metadata_json,
+                    checked_at = excluded.checked_at
+                """,
+                (
+                    normalized.name,
+                    int(normalized.healthy),
+                    int(normalized.circuit_open),
+                    normalized.last_error,
+                    json_dumps(normalized.model_dump(mode="json")),
+                    checked_at,
+                ),
             )
         return statuses
 
@@ -82,6 +138,8 @@ class ProviderService:
                     model_name=model_name,
                     prompt=request.prompt,
                     system_prompt="Return a brief readiness response for a local agent runtime operator.",
+                    data_classification=request.data_classification,
+                    task_type="provider-test",
                 ),
                 settings_override=settings,
             )
@@ -109,6 +167,11 @@ class ProviderService:
         settings = settings_override or self.settings_service.get_effective_settings()
         request = ProviderRequest(prompt="profile-resolution", profile=profile)
         for candidate in self._provider_candidates(request, settings):
+            provider = self.registry.get(candidate)
+            try:
+                self._validate_provider_usage(candidate, provider.supports_remote, request, settings)
+            except ProviderError:
+                continue
             return candidate
         return None
 
@@ -133,15 +196,34 @@ class ProviderService:
                 emitted = emit(candidate)
                 if emitted:
                     yield emitted
-            if requested_profile == "local-only":
+            if requested_profile in {"local-only", "privacy-preferred"}:
                 emitted = emit("mock")
                 if emitted:
                     yield emitted
 
-        for candidate in [settings.provider, settings.fallback_provider]:
+        for candidate in [settings.provider, settings.fallback_provider, settings.privacy_provider]:
             emitted = emit(candidate)
             if emitted:
                 yield emitted
+
+    def _validate_provider_usage(
+        self,
+        provider_name: str,
+        supports_remote: bool,
+        request: ProviderRequest,
+        settings: EffectiveSettings,
+    ) -> None:
+        classification = DataClassification(request.data_classification)
+        if classification == DataClassification.LOCAL_ONLY and supports_remote:
+            raise ProviderError(f"Provider {provider_name} is remote-only and cannot handle local-only data.")
+        if (
+            classification == DataClassification.RESTRICTED
+            and supports_remote
+            and not settings.allow_restricted_provider_egress
+        ):
+            raise ProviderError(
+                f"Restricted data cannot be sent to remote provider {provider_name} without override."
+            )
 
     def _is_circuit_open(self, provider_name: str) -> bool:
         state = self._provider_state.get(provider_name) or {}

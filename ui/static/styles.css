@@ -59,6 +59,10 @@ textarea, input, select, button {
     font: inherit;
 }
 
+summary {
+    cursor: pointer;
+}
+
 input, textarea, select {
     width: 100%;
     border: 1px solid #b7c0c5;
@@ -180,6 +184,10 @@ label {
 
 .panel {
     padding: 1rem;
+}
+
+details.panel > summary {
+    font-weight: 700;
 }
 
 .wide {

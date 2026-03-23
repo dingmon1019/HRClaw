@@ -33,11 +33,13 @@ from app.schemas.providers import ProviderTestRequest
 from app.schemas.settings import SanitizedSettingsExport, SettingsUpdate
 from app.security.auth import (
     SESSION_AUTHENTICATED_AT,
+    SESSION_LAST_ACTIVITY_AT,
     SESSION_RECENT_AUTH_AT,
     login_session,
     logout_session,
     mark_recent_auth,
     read_session_user,
+    touch_session_activity,
 )
 from app.security.csrf import ensure_csrf_token, validate_csrf
 
@@ -67,8 +69,13 @@ def _session_user(request: Request, container: AppContainer):
     if not authenticated_at or now - authenticated_at > settings.session_max_age_seconds:
         logout_session(request)
         return None
+    last_activity_at = int(request.session.get(SESSION_LAST_ACTIVITY_AT, 0) or 0)
+    if last_activity_at and now - last_activity_at > settings.session_idle_timeout_seconds:
+        logout_session(request)
+        return None
     recent_auth_at = int(request.session.get(SESSION_RECENT_AUTH_AT, 0) or 0)
     recent_auth = bool(recent_auth_at and now - recent_auth_at <= settings.recent_auth_window_seconds)
+    touch_session_activity(request, now)
     return read_session_user(request, recent_auth)
 
 
@@ -106,6 +113,7 @@ def _require_recent_auth(
         raise AuthorizationError(f"Recent re-authentication is required to {purpose}.")
     container.auth_service.verify_current_password(user.id, current_password)
     mark_recent_auth(request, container.auth_service.now_epoch())
+    container.audit_service.emit("auth.reauth", {"username": user.username, "purpose": purpose})
 
 
 def _render(
@@ -245,6 +253,42 @@ def _proposal_preview(container: AppContainer, proposal: ProposalRecord) -> dict
     return preview
 
 
+def _proposal_snapshot_context(container: AppContainer, proposal: ProposalRecord) -> dict[str, Any]:
+    created_snapshot = container.proposal_snapshot_service.latest(proposal.id, status="created")
+    approved_snapshot = container.proposal_snapshot_service.latest(proposal.id, status="approved")
+    live_against_approval = container.proposal_snapshot_service.compare_live_to_latest(
+        proposal,
+        status="approved",
+    )
+    preview = _proposal_preview(container, proposal)
+    if live_against_approval["live"]:
+        preview.update(live_against_approval["live"].preview)
+    return {
+        "created_snapshot": created_snapshot,
+        "approved_snapshot": approved_snapshot,
+        "live_snapshot": live_against_approval["live"],
+        "stale": live_against_approval["stale"],
+        "stale_reason": proposal.stale_reason or live_against_approval["reason"],
+        "changed_fields": live_against_approval["changed_fields"],
+        "preview": preview,
+    }
+
+
+def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
+    summary = container.summary_service.get_by_run_id(run_id)
+    proposals = [proposal for proposal in container.proposal_service.list() if proposal.run_id == run_id]
+    agent_runs = container.agent_service.list_run_history(run_id)
+    handoffs = container.agent_service.list_handoffs(run_id)
+    connector_runs = [entry for entry in container.history_service.list_connector_runs(limit=200) if entry.run_id == run_id]
+    return {
+        "summary": summary,
+        "proposals": proposals,
+        "agent_runs": agent_runs,
+        "handoffs": handoffs,
+        "connector_runs": connector_runs,
+    }
+
+
 def _unsafe_warnings(container: AppContainer) -> list[str]:
     settings = container.settings_service.get_effective_settings()
     warnings: list[str] = []
@@ -258,6 +302,12 @@ def _unsafe_warnings(container: AppContainer) -> list[str]:
         warnings.append("Outlook connector is enabled. Email side effects can leave the local workstation.")
     if not settings.json_audit_enabled:
         warnings.append("JSON audit logging is disabled. Tamper-evident audit visibility is reduced.")
+    if settings.allow_provider_private_network:
+        warnings.append("Provider private-network egress is enabled. Local LLM endpoints can receive prompts.")
+    if settings.allow_restricted_provider_egress:
+        warnings.append("Restricted data egress to remote providers is enabled. Review provider trust carefully.")
+    if not settings.admin_token_configured:
+        warnings.append("CLI admin token has not been initialized yet. Sensitive CLI paths are harder to operate safely.")
     return warnings
 
 
@@ -286,6 +336,22 @@ def _temporary_settings(
     if provider_timeout_seconds is not None:
         data["provider_timeout_seconds"] = provider_timeout_seconds
     return type(settings)(**data)
+
+
+def _settings_page_context(container: AppContainer, *, result=None) -> dict[str, Any]:
+    settings = container.settings_service.get_effective_settings()
+    return {
+        "title": "Settings",
+        "settings": settings,
+        "providers": container.provider_service.list_statuses(),
+        "unsafe_warnings": _unsafe_warnings(container),
+        "audit_status": container.audit_service.verify_integrity(),
+        "export_json": json.dumps(
+            container.settings_service.export_sanitized().model_dump(mode="json"),
+            indent=2,
+        ),
+        "result": result,
+    }
 
 
 @router.get("/setup")
@@ -394,6 +460,12 @@ def dashboard(
     recent_high_risk = [proposal for proposal in proposals if proposal.risk_level in HIGH_RISK_LEVELS][:8]
     failed_executions = [entry for entry in recent_history if entry.status in {"failed", "blocked"}][:8]
     audit_status = container.audit_service.verify_integrity()
+    recent_runs = container.agent_service.recent_runs(limit=6)
+    active_runs = [
+        run
+        for run in recent_runs
+        if any(step.status == "running" for step in container.agent_service.list_run_history(run["run_id"]))
+    ]
     context = {
         "title": "Dashboard",
         "counts": counts,
@@ -409,6 +481,8 @@ def dashboard(
         "unsafe_warnings": _unsafe_warnings(container),
         "blocked_count": counts["blocked"],
         "failed_count": counts["failed"],
+        "recent_runs": recent_runs,
+        "active_runs": active_runs,
     }
     return _render(templates, request, "templates/dashboard.html", container, **context)
 
@@ -476,7 +550,38 @@ async def run_agent_submit(
         model_name=model_name or None,
     )
     result = container.runtime_service.run_agent(run_request)
-    return _redirect(f"/proposals?run_id={result.run_id}", message="Collected context and created approval-ready proposals.")
+    return _redirect(
+        f"/runs/{result.run_id}",
+        message="Objective decomposed, reviewed, and prepared for approval.",
+    )
+
+
+@router.get("/runs/{run_id}")
+def run_detail_page(
+    run_id: str,
+    request: Request,
+    container: AppContainer = Depends(get_container),
+    templates: Jinja2Templates = Depends(get_templates),
+):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+    context = _run_context(container, run_id)
+    if context["summary"] is None:
+        raise NotFoundError(f"Run {run_id} was not found.")
+    context.update(
+        {
+            "title": "Assistant Workbench",
+            "run_id": run_id,
+            "high_risk_count": sum(1 for proposal in context["proposals"] if proposal.risk_level in HIGH_RISK_LEVELS),
+            "pending_count": sum(
+                1
+                for proposal in context["proposals"]
+                if proposal.status in {ProposalStatus.PENDING, ProposalStatus.APPROVED, ProposalStatus.QUEUED, ProposalStatus.RUNNING}
+            ),
+        }
+    )
+    return _render(templates, request, "templates/run_detail.html", container, **context)
 
 
 @router.get("/proposals")
@@ -553,14 +658,18 @@ def proposal_detail_page(
     approvals = container.proposal_service.list_approvals(proposal_id)
     history = [entry for entry in container.history_service.list_action_history(limit=200) if entry.proposal_id == proposal_id]
     jobs = [job for job in container.execution_queue_service.list_recent(limit=200) if job.proposal_id == proposal_id]
-    preview = _proposal_preview(container, proposal)
+    snapshot_context = _proposal_snapshot_context(container, proposal)
+    run_context = _run_context(container, proposal.run_id)
     context = {
         "title": "Proposal Detail",
         "proposal": proposal,
         "approvals": approvals,
         "history": history,
         "jobs": jobs,
-        "preview": preview,
+        "preview": snapshot_context["preview"],
+        "snapshot_context": snapshot_context,
+        "agent_runs": run_context["agent_runs"],
+        "handoffs": run_context["handoffs"],
         "require_reauth_for_approval": proposal.risk_level in HIGH_RISK_LEVELS and not user.recent_auth,
     }
     return _render(templates, request, "templates/proposal_detail.html", container, **context)
@@ -629,31 +738,26 @@ async def approve_proposal_row(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
-    await validate_csrf(request)
-    user = _page_user_or_redirect(request, container)
-    if isinstance(user, RedirectResponse):
-        raise HTTPException(status_code=401, detail="Authentication required.")
-    proposal = container.proposal_service.get(proposal_id)
-    if proposal.risk_level in HIGH_RISK_LEVELS:
-        raise HTTPException(status_code=409, detail="High-risk approvals require the detail page re-auth flow.")
-    container.rate_limiter.check(
-        f"approval:{_client_key(request)}",
-        container.base_settings.approval_rate_limit_attempts,
-        container.base_settings.approval_rate_limit_window_seconds,
-    )
-    container.runtime_service.approve_and_queue(
-        proposal_id,
-        ApprovalDecisionRequest(actor=user.username, reason=reason, current_password=current_password),
-    )
-    proposal = container.proposal_service.get(proposal_id)
-    return _render(
-        templates,
-        request,
-        "partials/proposal_row.html",
-        container,
-        proposal=proposal,
-        compact=True,
-    )
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        proposal = container.proposal_service.get(proposal_id)
+        if proposal.risk_level in HIGH_RISK_LEVELS:
+            return _redirect(f"/proposals/{proposal_id}", error="High-risk approvals require the detail page re-auth flow.")
+        container.rate_limiter.check(
+            f"approval:{_client_key(request)}",
+            container.base_settings.approval_rate_limit_attempts,
+            container.base_settings.approval_rate_limit_window_seconds,
+        )
+        container.runtime_service.approve_and_queue(
+            proposal_id,
+            ApprovalDecisionRequest(actor=user.username, reason=reason, current_password=current_password),
+        )
+        return _redirect("/approvals", message="Proposal approved and queued.")
+    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError, RateLimitError) as exc:
+        return _redirect("/approvals", error=str(exc))
 
 
 @router.post("/approvals/{proposal_id}/reject")
@@ -664,40 +768,69 @@ async def reject_proposal_row(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
-    await validate_csrf(request)
-    user = _page_user_or_redirect(request, container)
-    if isinstance(user, RedirectResponse):
-        raise HTTPException(status_code=401, detail="Authentication required.")
-    container.runtime_service.reject(
-        proposal_id,
-        ApprovalDecisionRequest(actor=user.username, reason=reason),
-    )
-    proposal = container.proposal_service.get(proposal_id)
-    return _render(
-        templates,
-        request,
-        "partials/proposal_row.html",
-        container,
-        proposal=proposal,
-        compact=True,
-    )
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        container.runtime_service.reject(
+            proposal_id,
+            ApprovalDecisionRequest(actor=user.username, reason=reason),
+        )
+        return _redirect("/approvals", message="Proposal rejected.")
+    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError) as exc:
+        return _redirect("/approvals", error=str(exc))
 
 
 @router.get("/history")
 def history_page(
     request: Request,
+    agent_filter: str | None = None,
+    actor_filter: str | None = None,
+    connector_filter: str | None = None,
+    risk_filter: str | None = None,
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
     user = _page_user_or_redirect(request, container)
     if isinstance(user, RedirectResponse):
         return user
+    all_history = container.history_service.list_action_history(limit=150)
+    proposals = {proposal.id: proposal for proposal in container.proposal_service.list()}
+    history = all_history
+    if connector_filter:
+        history = [entry for entry in history if entry.connector == connector_filter]
+    if risk_filter:
+        history = [entry for entry in history if proposals.get(entry.proposal_id) and proposals[entry.proposal_id].risk_level.value == risk_filter]
+    audit_rows = container.database.fetch_all(
+        "SELECT * FROM audit_entries ORDER BY created_at DESC LIMIT 150"
+    )
+    if actor_filter:
+        audit_rows = [row for row in audit_rows if actor_filter in row["payload_json"]]
+    agent_runs = [
+        run
+        for recent in container.agent_service.recent_runs(limit=20)
+        for run in container.agent_service.list_run_history(recent["run_id"])
+    ]
+    if agent_filter:
+        agent_runs = [run for run in agent_runs if run.agent_id == agent_filter or run.role.value == agent_filter]
+    connector_runs = container.history_service.list_connector_runs(limit=50)
+    if connector_filter:
+        connector_runs = [run for run in connector_runs if run.connector == connector_filter]
     context = {
         "title": "Action History",
-        "history": container.history_service.list_action_history(limit=100),
-        "connector_runs": container.history_service.list_connector_runs(limit=50),
+        "history": history,
+        "connector_runs": connector_runs,
         "jobs": container.execution_queue_service.list_recent(limit=50),
         "audit_status": container.audit_service.verify_integrity(),
+        "audit_entries": audit_rows,
+        "agent_runs": agent_runs,
+        "agent_filter": agent_filter,
+        "actor_filter": actor_filter,
+        "connector_filter": connector_filter,
+        "risk_filter": risk_filter,
+        "agent_options": container.agent_service.list_agents(),
+        "connector_options": sorted({proposal.connector for proposal in proposals.values()}),
     }
     return _render(templates, request, "templates/history.html", container, **context)
 
@@ -731,20 +864,8 @@ def settings_page(
     user = _page_user_or_redirect(request, container)
     if isinstance(user, RedirectResponse):
         return user
-    settings = container.settings_service.get_effective_settings()
-    context = {
-        "title": "Settings",
-        "settings": settings,
-        "providers": container.provider_service.list_statuses(),
-        "unsafe_warnings": _unsafe_warnings(container),
-        "audit_status": container.audit_service.verify_integrity(),
-        "export_json": json.dumps(
-            container.settings_service.export_sanitized().model_dump(mode="json"),
-            indent=2,
-        ),
-        "requires_recent_auth": not user.recent_auth,
-        "result": None,
-    }
+    context = _settings_page_context(container, result=None)
+    context["requires_recent_auth"] = not user.recent_auth
     return _render(templates, request, "templates/settings.html", container, **context)
 
 
@@ -768,8 +889,13 @@ async def settings_submit(
     cheap_provider: str | None = Form(None),
     strong_provider: str | None = Form(None),
     local_provider: str | None = Form(None),
+    privacy_provider: str | None = Form(None),
+    provider_allowed_hosts: str = Form(...),
+    allow_provider_private_network: bool = Form(False),
+    allow_restricted_provider_egress: bool = Form(False),
     json_audit_enabled: bool = Form(False),
     session_max_age_seconds: int = Form(...),
+    session_idle_timeout_seconds: int = Form(...),
     recent_auth_window_seconds: int = Form(...),
     max_request_size_bytes: int = Form(...),
     allowed_http_schemes: str = Form(...),
@@ -778,10 +904,13 @@ async def settings_submit(
     http_follow_redirects: bool = Form(False),
     http_timeout_seconds: float = Form(...),
     http_max_response_bytes: int = Form(...),
+    filesystem_max_read_bytes: int = Form(...),
     allowed_filesystem_roots: str = Form(...),
     allowed_http_hosts: str = Form(...),
     enable_system_connector: bool = Form(False),
     enable_outlook_connector: bool = Form(False),
+    worker_lease_seconds: int = Form(...),
+    worker_max_attempts: int = Form(...),
     current_password: str | None = Form(None),
     container: AppContainer = Depends(get_container),
 ):
@@ -810,8 +939,13 @@ async def settings_submit(
                 cheap_provider=cheap_provider or None,
                 strong_provider=strong_provider or None,
                 local_provider=local_provider or None,
+                privacy_provider=privacy_provider or None,
+                provider_allowed_hosts=provider_allowed_hosts,
+                allow_provider_private_network=allow_provider_private_network,
+                allow_restricted_provider_egress=allow_restricted_provider_egress,
                 json_audit_enabled=json_audit_enabled,
                 session_max_age_seconds=session_max_age_seconds,
+                session_idle_timeout_seconds=session_idle_timeout_seconds,
                 recent_auth_window_seconds=recent_auth_window_seconds,
                 max_request_size_bytes=max_request_size_bytes,
                 allowed_http_schemes=allowed_http_schemes,
@@ -820,11 +954,16 @@ async def settings_submit(
                 http_follow_redirects=http_follow_redirects,
                 http_timeout_seconds=http_timeout_seconds,
                 http_max_response_bytes=http_max_response_bytes,
+                filesystem_max_read_bytes=filesystem_max_read_bytes,
                 allowed_filesystem_roots=allowed_filesystem_roots,
                 allowed_http_hosts=allowed_http_hosts,
                 enable_system_connector=enable_system_connector,
                 enable_outlook_connector=enable_outlook_connector,
-            )
+                worker_lease_seconds=worker_lease_seconds,
+                worker_max_attempts=worker_max_attempts,
+            ),
+            actor=user.username,
+            reason="settings-update",
         )
         container.audit_service.emit(
             "settings.updated",
@@ -834,6 +973,8 @@ async def settings_submit(
                 "provider": provider,
                 "enable_system_connector": enable_system_connector,
                 "enable_outlook_connector": enable_outlook_connector,
+                "allow_provider_private_network": allow_provider_private_network,
+                "allow_restricted_provider_egress": allow_restricted_provider_egress,
             },
         )
         return _redirect("/settings", message="Settings saved.")
@@ -853,7 +994,7 @@ async def settings_reset(
         if isinstance(user, RedirectResponse):
             return user
         _require_recent_auth(request, container, user, current_password, "reset runtime settings")
-        container.settings_service.reset_to_safe_defaults()
+        container.settings_service.reset_to_safe_defaults(actor=user.username, reason="reset-safe-defaults")
         container.audit_service.emit("settings.reset_to_safe_defaults", {"actor": user.username})
         return _redirect("/settings", message="Safe defaults restored.")
     except (AuthenticationError, AuthorizationError, CsrfError) as exc:
@@ -886,7 +1027,7 @@ async def settings_import(
             return user
         _require_recent_auth(request, container, user, current_password, "import runtime settings")
         exported = SanitizedSettingsExport(**json.loads(settings_json))
-        container.settings_service.import_sanitized(exported)
+        container.settings_service.import_sanitized(exported, actor=user.username, reason="import-sanitized-settings")
         container.audit_service.emit("settings.imported", {"actor": user.username})
         return _redirect("/settings", message="Sanitized settings imported.")
     except (AuthenticationError, AuthorizationError, CsrfError, ValueError, json.JSONDecodeError) as exc:
@@ -899,6 +1040,7 @@ async def test_provider_partial(
     provider_name: str = Form(...),
     model_name: str = Form(...),
     prompt: str = Form("Return a one-line readiness confirmation."),
+    data_classification: str = Form("external-ok"),
     base_url: str | None = Form(None),
     api_key_env: str | None = Form(None),
     generic_http_endpoint: str | None = Form(None),
@@ -920,16 +1062,17 @@ async def test_provider_partial(
         provider_timeout_seconds=provider_timeout_seconds,
     )
     result = container.provider_service.test_provider(
-        ProviderTestRequest(provider_name=provider_name, model_name=model_name, prompt=prompt),
+        ProviderTestRequest(
+            provider_name=provider_name,
+            model_name=model_name,
+            prompt=prompt,
+            data_classification=data_classification,
+        ),
         settings_override=settings_override,
     )
-    return _render(
-        templates,
-        request,
-        "partials/provider_test_result.html",
-        container,
-        result=result,
-    )
+    context = _settings_page_context(container, result=result)
+    context["requires_recent_auth"] = not user.recent_auth
+    return _render(templates, request, "templates/settings.html", container, **context)
 
 
 @router.get("/api/proposals")
@@ -964,6 +1107,19 @@ async def api_run_agent(
     _api_user_or_401(request, container)
     await validate_csrf(request)
     return container.runtime_service.run_agent(payload)
+
+
+@router.get("/api/runs/{run_id}")
+def api_get_run(
+    run_id: str,
+    request: Request,
+    container: AppContainer = Depends(get_container),
+):
+    _api_user_or_401(request, container)
+    context = _run_context(container, run_id)
+    if context["summary"] is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} was not found.")
+    return context
 
 
 @router.post("/api/proposals/{proposal_id}/approve")
@@ -1019,6 +1175,11 @@ def api_history(request: Request, container: AppContainer = Depends(get_containe
         "actions": container.history_service.list_action_history(limit=100),
         "connector_runs": container.history_service.list_connector_runs(limit=100),
         "jobs": container.execution_queue_service.list_recent(limit=100),
+        "agent_runs": [
+            run
+            for recent in container.agent_service.recent_runs(limit=20)
+            for run in container.agent_service.list_run_history(recent["run_id"])
+        ],
     }
 
 
@@ -1026,6 +1187,12 @@ def api_history(request: Request, container: AppContainer = Depends(get_containe
 def api_providers(request: Request, container: AppContainer = Depends(get_container)):
     _api_user_or_401(request, container)
     return container.provider_service.list_statuses()
+
+
+@router.get("/api/agents")
+def api_agents(request: Request, container: AppContainer = Depends(get_container)):
+    _api_user_or_401(request, container)
+    return container.agent_service.list_agents()
 
 
 @router.get("/api/connectors")

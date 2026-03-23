@@ -20,6 +20,7 @@ class ProposalStatus(str, Enum):
     EXECUTED = "executed"
     FAILED = "failed"
     BLOCKED = "blocked"
+    STALE = "stale"
 
 
 class RiskLevel(str, Enum):
@@ -27,6 +28,12 @@ class RiskLevel(str, Enum):
     MEDIUM = "medium"
     HIGH = "high"
     CRITICAL = "critical"
+
+
+class DataClassification(str, Enum):
+    LOCAL_ONLY = "local-only"
+    EXTERNAL_OK = "external-ok"
+    RESTRICTED = "restricted"
 
 
 class AgentRunRequest(BaseModel):
@@ -61,6 +68,14 @@ class ActionProposal(BaseModel):
     status: ProposalStatus = ProposalStatus.PENDING
     provider_name: str | None = None
     summary_id: str | None = None
+    created_by_agent_id: str | None = None
+    created_by_agent_role: str | None = None
+    reviewed_by_agent_id: str | None = None
+    reviewed_by_agent_role: str | None = None
+    correlation_id: str | None = None
+    data_classification: DataClassification = DataClassification.EXTERNAL_OK
+    snapshot_hash: str | None = None
+    stale_reason: str | None = None
 
 
 class ProposalRecord(ActionProposal):
@@ -82,6 +97,28 @@ class ApprovalRecord(BaseModel):
     actor: str
     reason: str | None = None
     created_at: str
+    snapshot_hash: str | None = None
+    action_hash: str | None = None
+    policy_hash: str | None = None
+    settings_hash: str | None = None
+    resource_hash: str | None = None
+    correlation_id: str | None = None
+
+
+class ProposalSnapshotRecord(BaseModel):
+    id: str
+    proposal_id: str
+    snapshot_hash: str
+    action_hash: str
+    policy_hash: str
+    settings_hash: str
+    resource_hash: str
+    before_state: dict[str, Any] = Field(default_factory=dict)
+    preview: dict[str, Any] = Field(default_factory=dict)
+    comparison_json: dict[str, Any] = Field(default_factory=dict)
+    stale_reason: str | None = None
+    status: str
+    created_at: str
 
 
 class ActionHistoryRecord(BaseModel):
@@ -96,6 +133,7 @@ class ActionHistoryRecord(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] | None = None
     error_text: str | None = None
+    correlation_id: str | None = None
 
 
 class ConnectorRunRecord(BaseModel):
@@ -132,6 +170,7 @@ class ExecutionJobStatus(str, Enum):
     EXECUTED = "executed"
     FAILED = "failed"
     BLOCKED = "blocked"
+    DEAD_LETTER = "dead_letter"
 
 
 class ExecutionJobRecord(BaseModel):
@@ -146,3 +185,23 @@ class ExecutionJobRecord(BaseModel):
     worker_id: str | None = None
     result: dict[str, Any] | None = None
     error_text: str | None = None
+    lease_expires_at: str | None = None
+    last_heartbeat_at: str | None = None
+    attempt_count: int = 0
+    correlation_id: str | None = None
+    approval_id: str | None = None
+
+
+class ExecutionAttemptRecord(BaseModel):
+    id: str
+    job_id: str
+    attempt_number: int
+    status: str
+    worker_id: str
+    started_at: str
+    finished_at: str | None = None
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
+    result: dict[str, Any] | None = None
+    error_text: str | None = None
+    correlation_id: str | None = None

@@ -31,11 +31,24 @@ if (-not (Test-Path ".env") -and (Test-Path ".env.example")) {
     Copy-Item ".env.example" ".env"
 }
 
-if (-not (Test-Path "workspace")) {
-    New-Item -ItemType Directory -Path "workspace" | Out-Null
+if (-not (Test-Path "runtime_workspace")) {
+    New-Item -ItemType Directory -Path "runtime_workspace" | Out-Null
+}
+
+if (-not (Test-Path "data")) {
+    New-Item -ItemType Directory -Path "data" | Out-Null
+}
+
+$adminTokenPath = "data\admin_token.txt"
+if (-not (Test-Path $adminTokenPath)) {
+    $bytes = New-Object byte[] 24
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $token = [Convert]::ToBase64String($bytes)
+    Set-Content -Path $adminTokenPath -Value $token -NoNewline
 }
 
 Write-Host "Environment ready."
 Write-Host "Activate with $VenvPath\\Scripts\\Activate.ps1"
 Write-Host "Run app with .\\scripts\\run-local.ps1"
 Write-Host "Run worker with .\\scripts\\run-worker.ps1"
+Write-Host "CLI admin token stored at $adminTokenPath"

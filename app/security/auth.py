@@ -9,6 +9,7 @@ SESSION_USER_ID = "user_id"
 SESSION_USERNAME = "username"
 SESSION_RECENT_AUTH_AT = "recent_auth_at"
 SESSION_AUTHENTICATED_AT = "authenticated_at"
+SESSION_LAST_ACTIVITY_AT = "last_activity_at"
 
 
 def login_session(request: Request, user: UserRecord, authenticated_at: int) -> None:
@@ -16,6 +17,7 @@ def login_session(request: Request, user: UserRecord, authenticated_at: int) -> 
     request.session[SESSION_USERNAME] = user.username
     request.session[SESSION_AUTHENTICATED_AT] = authenticated_at
     request.session[SESSION_RECENT_AUTH_AT] = authenticated_at
+    request.session[SESSION_LAST_ACTIVITY_AT] = authenticated_at
 
 
 def logout_session(request: Request) -> None:
@@ -32,3 +34,7 @@ def read_session_user(request: Request, recent_auth: bool) -> SessionUser | None
 
 def mark_recent_auth(request: Request, timestamp: int) -> None:
     request.session[SESSION_RECENT_AUTH_AT] = timestamp
+
+
+def touch_session_activity(request: Request, timestamp: int) -> None:
+    request.session[SESSION_LAST_ACTIVITY_AT] = timestamp

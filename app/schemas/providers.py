@@ -12,6 +12,10 @@ class ProviderRequest(BaseModel):
     prompt: str
     system_prompt: str | None = None
     response_format: str = "text"
+    data_classification: str = "external-ok"
+    task_type: str | None = None
+    correlation_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProviderResponse(BaseModel):
@@ -31,12 +35,17 @@ class ProviderStatus(BaseModel):
     supports_remote: bool = True
     circuit_open: bool = False
     last_error: str | None = None
+    healthy: bool = True
+    capabilities: list[str] = Field(default_factory=list)
+    allowed_hosts: list[str] = Field(default_factory=list)
+    last_checked_at: str | None = None
 
 
 class ProviderTestRequest(BaseModel):
     provider_name: str | None = None
     model_name: str | None = None
     prompt: str = "Return a one-line readiness confirmation."
+    data_classification: str = "external-ok"
 
 
 class ProviderTestResult(BaseModel):

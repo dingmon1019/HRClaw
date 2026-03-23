@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import httpx
-
 from app.core.errors import ProviderError
 from app.providers.base import BaseProvider
+from app.providers.http_client import post_json
 from app.schemas.providers import ProviderRequest, ProviderResponse
 from app.schemas.settings import EffectiveSettings
 
@@ -14,6 +13,7 @@ class OpenAIProvider(BaseProvider):
     profiles = ["strong"]
     supports_local = False
     supports_remote = True
+    capabilities = ["text", "planning", "review"]
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         try:
@@ -54,10 +54,7 @@ class OpenAIProvider(BaseProvider):
             "temperature": 0.1,
         }
         merged_headers = {"Content-Type": "application/json", **headers}
-        with httpx.Client(timeout=settings.provider_timeout_seconds) as client:
-            response = client.post(url, headers=merged_headers, json=payload)
-            response.raise_for_status()
-            return response.json()
+        return post_json(url=url, headers=merged_headers, payload=payload, settings=settings)
 
     @staticmethod
     def _extract_openai_text(response: dict) -> str:
@@ -80,6 +77,7 @@ class OpenAICompatibleProvider(OpenAIProvider):
     profiles = ["fast", "strong", "local-only"]
     supports_local = True
     supports_remote = True
+    capabilities = ["text", "planning", "review"]
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         return bool(settings.base_url)
@@ -113,6 +111,7 @@ class GenericHTTPProvider(BaseProvider):
     profiles = ["fast", "cheap", "local-only"]
     supports_local = True
     supports_remote = True
+    capabilities = ["text", "planning"]
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         return bool(settings.generic_http_endpoint or settings.base_url)
@@ -132,10 +131,7 @@ class GenericHTTPProvider(BaseProvider):
             headers["Authorization"] = f"Bearer {self.env_value(settings.api_key_env)}"
         except ProviderError:
             pass
-        with httpx.Client(timeout=settings.provider_timeout_seconds) as client:
-            response = client.post(endpoint, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        data = post_json(url=endpoint, headers=headers, payload=payload, settings=settings)
         content = (
             data.get("output_text")
             or data.get("text")
@@ -165,6 +161,7 @@ class AnthropicProvider(BaseProvider):
     profiles = ["strong"]
     supports_local = False
     supports_remote = True
+    capabilities = ["text", "planning", "review"]
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         try:
@@ -186,10 +183,12 @@ class AnthropicProvider(BaseProvider):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        with httpx.Client(timeout=settings.provider_timeout_seconds) as client:
-            response = client.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        data = post_json(
+            url="https://api.anthropic.com/v1/messages",
+            headers=headers,
+            payload=payload,
+            settings=settings,
+        )
         blocks = data.get("content") or []
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict)).strip()
         if not text:
@@ -208,6 +207,7 @@ class GeminiProvider(BaseProvider):
     profiles = ["strong"]
     supports_local = False
     supports_remote = True
+    capabilities = ["text", "planning", "review"]
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         try:
@@ -228,10 +228,7 @@ class GeminiProvider(BaseProvider):
         endpoint = (
             f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         )
-        with httpx.Client(timeout=settings.provider_timeout_seconds) as client:
-            response = client.post(endpoint, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        data = post_json(url=endpoint, headers={"content-type": "application/json"}, payload=payload, settings=settings)
         candidates = data.get("candidates") or []
         if not candidates:
             raise ProviderError("Gemini response did not include candidates.")

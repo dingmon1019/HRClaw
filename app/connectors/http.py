@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import ipaddress
-import socket
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 
 from app.connectors.base import BaseConnector
 from app.core.errors import ConnectorError
+from app.policy.network_guard import enforce_response_constraints, validate_url
 from app.services.settings_service import SettingsService
 
 
@@ -56,40 +54,17 @@ class HttpConnector(BaseConnector):
         }
 
     def _assert_request_allowed(self, url: str | None, method: str) -> None:
-        if not url:
-            raise ConnectorError("HTTP connector requires a URL.")
         settings = self.settings_service.get_effective_settings()
-        parsed = urlparse(url)
-        host = parsed.hostname
-        if not host:
-            raise ConnectorError("Invalid URL.")
-        if parsed.scheme not in settings.allowed_http_schemes:
-            raise ConnectorError(f"Scheme {parsed.scheme or '(empty)'} is not allowed.")
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        if settings.allowed_http_ports and port not in settings.allowed_http_ports:
-            raise ConnectorError(f"Port {port} is not allowed.")
+        validate_url(
+            url,
+            allowed_schemes=settings.allowed_http_schemes,
+            allowed_ports=settings.allowed_http_ports,
+            allowed_hosts=settings.allowed_http_hosts,
+            allow_private_network=settings.allow_http_private_network,
+            purpose="http connector",
+        )
         if method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"}:
             raise ConnectorError(f"HTTP method {method} is not allowed.")
-        allowed_hosts = settings.allowed_http_hosts
-        if allowed_hosts and host not in allowed_hosts:
-            raise ConnectorError(f"Host {host} is outside the configured allowlist.")
-        if not settings.allow_http_private_network and self._is_private_target(host):
-            raise ConnectorError(f"Private or localhost target {host} is blocked by policy.")
-
-    @staticmethod
-    def _is_private_target(host: str) -> bool:
-        if host in {"localhost"}:
-            return True
-        try:
-            return ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            infos = socket.getaddrinfo(host, None)
-            for info in infos:
-                address = info[4][0]
-                ip = ipaddress.ip_address(address)
-                if ip.is_private or ip.is_loopback:
-                    return True
-        return False
 
     @staticmethod
     def _preview_body(response: httpx.Response, max_bytes: int) -> str:
@@ -106,6 +81,5 @@ class HttpConnector(BaseConnector):
         with httpx.Client(timeout=timeout, follow_redirects=settings.http_follow_redirects) as client:
             response = client.request(method, url, headers=headers, content=body)
             response.raise_for_status()
-            if len(response.content) > settings.http_max_response_bytes:
-                raise ConnectorError("HTTP response exceeded the configured size limit.")
+            enforce_response_constraints(response, max_response_bytes=settings.http_max_response_bytes)
             return response

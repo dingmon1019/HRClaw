@@ -1,0 +1,135 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card wide">
+    <div class="card-header">
+        <div>
+            <h2>Assistant Workbench</h2>
+            <p class="muted">{{ summary.objective }}</p>
+        </div>
+        <div class="stack tight align-end">
+            <span class="badge high">{{ high_risk_count }} high-risk</span>
+            <span class="badge {{ 'pending' if pending_count else 'ok' }}">{{ pending_count }} awaiting action</span>
+        </div>
+    </div>
+
+    <div class="grid two">
+        <article class="panel">
+            <h3>Intent Summary</h3>
+            <p>{{ summary.summary_text }}</p>
+            <div class="metric-row">
+                <span>Summary Provider</span>
+                <strong>{{ summary.provider_name }}</strong>
+            </div>
+            <div class="metric-row">
+                <span>Run ID</span>
+                <strong>{{ run_id }}</strong>
+            </div>
+        </article>
+
+        <article class="panel">
+            <h3>Plan Status</h3>
+            <div class="metric-row"><span>Proposals</span><strong>{{ proposals|length }}</strong></div>
+            <div class="metric-row"><span>Agent Steps</span><strong>{{ agent_runs|length }}</strong></div>
+            <div class="metric-row"><span>Handoffs</span><strong>{{ handoffs|length }}</strong></div>
+            <div class="metric-row"><span>Connector Collects</span><strong>{{ connector_runs|length }}</strong></div>
+        </article>
+    </div>
+</section>
+
+<section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h3>Agent Collaboration</h3>
+            <span class="badge ok">Explicit handoffs</span>
+        </div>
+        <div class="stack">
+            {% for step in agent_runs %}
+            <div class="list-item">
+                <strong>{{ step.agent_name }}</strong>
+                <p>{{ step.role.value }} / {{ step.status }}</p>
+                <small>{{ step.started_at }}{% if step.completed_at %} -> {{ step.completed_at }}{% endif %}</small>
+                {% if step.output %}
+                <pre>{{ step.output | tojson(indent=2) }}</pre>
+                {% endif %}
+            </div>
+            {% else %}
+            <p class="muted">No agent run history was stored for this run.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h3>Handoff Timeline</h3>
+            <span class="badge ok">{{ handoffs|length }} recorded</span>
+        </div>
+        <div class="stack">
+            {% for handoff in handoffs %}
+            <div class="list-item">
+                <strong>{{ handoff.title }}</strong>
+                <p>to {{ handoff.to_agent_role.value }}</p>
+                <small>{{ handoff.created_at }} / {{ handoff.status }}</small>
+                <pre>{{ handoff.payload | tojson(indent=2) }}</pre>
+            </div>
+            {% else %}
+            <p class="muted">No handoffs were recorded.</p>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h3>Reviewed Proposals</h3>
+        <a href="/proposals?run_id={{ run_id }}">Open inbox view</a>
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Proposal</th>
+                <th>Risk</th>
+                <th>Status</th>
+                <th>Agent</th>
+                <th>Review</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for proposal in proposals %}
+            <tr>
+                <td>
+                    <strong><a href="/proposals/{{ proposal.id }}">{{ proposal.title }}</a></strong>
+                    <div class="muted small">{{ proposal.connector }} / {{ proposal.action_type }}</div>
+                </td>
+                <td><span class="badge {{ proposal.risk_level.value }}">{{ proposal.risk_level.value }}</span></td>
+                <td><span class="badge {{ proposal.status.value }}">{{ proposal.status.value }}</span></td>
+                <td>{{ proposal.created_by_agent_role or "-" }}{% if proposal.reviewed_by_agent_role %} -> {{ proposal.reviewed_by_agent_role }}{% endif %}</td>
+                <td>{{ proposal.rationale or "No rationale stored." }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="muted">No proposals were created.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h3>Connector Collection Trail</h3>
+        <a href="/history">Open full history</a>
+    </div>
+    <div class="stack">
+        {% for entry in connector_runs %}
+        <div class="list-item">
+            <strong>{{ entry.connector }}</strong>
+            <p>{{ entry.operation }} / {{ entry.status }}</p>
+            <small>{{ entry.created_at }}</small>
+            {% if entry.output %}
+            <pre>{{ entry.output | tojson(indent=2) }}</pre>
+            {% endif %}
+        </div>
+        {% else %}
+        <p class="muted">No connector collection records were stored.</p>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}

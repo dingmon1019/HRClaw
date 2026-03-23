@@ -15,6 +15,7 @@ class BaseProvider(ABC):
     profiles: list[str] = []
     supports_local = False
     supports_remote = True
+    capabilities: list[str] = ["text"]
 
     def __init__(self, base_settings: AppSettings):
         self.base_settings = base_settings
@@ -32,6 +33,7 @@ class BaseProvider(ABC):
             profiles=self.profiles,
             supports_local=self.supports_local,
             supports_remote=self.supports_remote,
+            capabilities=self.capabilities,
         )
 
     def is_configured(self, settings: EffectiveSettings) -> bool:

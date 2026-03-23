@@ -5,7 +5,7 @@
         <div class="card-header">
             <div>
                 <h2>Runtime Settings</h2>
-                <p class="muted">Settings are persisted in SQLite and merged with `.env` defaults. Sensitive changes require recent re-authentication.</p>
+                <p class="muted">Settings are persisted in SQLite, versioned, and validated. Sensitive changes require recent re-authentication.</p>
             </div>
             <span class="badge {{ 'warn' if requires_recent_auth else 'ok' }}">{{ "Re-auth needed" if requires_recent_auth else "Recent auth active" }}</span>
         </div>
@@ -62,6 +62,21 @@
                         <input type="number" min="1024" name="http_max_response_bytes" value="{{ settings.http_max_response_bytes }}">
                     </label>
                 </div>
+
+                <div class="grid three">
+                    <label>
+                        Filesystem Max Read Bytes
+                        <input type="number" min="4096" name="filesystem_max_read_bytes" value="{{ settings.filesystem_max_read_bytes }}">
+                    </label>
+                    <label>
+                        Session Max Age Seconds
+                        <input type="number" min="300" name="session_max_age_seconds" value="{{ settings.session_max_age_seconds }}">
+                    </label>
+                    <label>
+                        Session Idle Timeout Seconds
+                        <input type="number" min="60" name="session_idle_timeout_seconds" value="{{ settings.session_idle_timeout_seconds }}">
+                    </label>
+                </div>
             </div>
 
             <div class="settings-group">
@@ -103,7 +118,7 @@
                     </label>
                 </div>
 
-                <div class="grid two">
+                <div class="grid three">
                     <label>
                         Provider Timeout Seconds
                         <input type="number" step="1" min="1" name="provider_timeout_seconds" value="{{ settings.provider_timeout_seconds }}">
@@ -111,6 +126,10 @@
                     <label>
                         Provider Max Retries
                         <input type="number" min="0" name="provider_max_retries" value="{{ settings.provider_max_retries }}">
+                    </label>
+                    <label>
+                        Privacy-Preferred Provider
+                        <input type="text" name="privacy_provider" value="{{ settings.privacy_provider or '' }}">
                     </label>
                 </div>
 
@@ -129,7 +148,7 @@
                     <label>
                         Summary Profile
                         <select name="summary_profile">
-                            {% for value in ["fast","cheap","strong","local-only"] %}
+                            {% for value in ["fast","cheap","strong","local-only","privacy-preferred"] %}
                             <option value="{{ value }}" {% if settings.summary_profile == value %}selected{% endif %}>{{ value }}</option>
                             {% endfor %}
                         </select>
@@ -137,14 +156,14 @@
                     <label>
                         Planning Profile
                         <select name="planning_profile">
-                            {% for value in ["fast","cheap","strong","local-only"] %}
+                            {% for value in ["fast","cheap","strong","local-only","privacy-preferred"] %}
                             <option value="{{ value }}" {% if settings.planning_profile == value %}selected{% endif %}>{{ value }}</option>
                             {% endfor %}
                         </select>
                     </label>
                 </div>
 
-                <div class="grid two">
+                <div class="grid three">
                     <label>
                         Fast Provider
                         <input type="text" name="fast_provider" value="{{ settings.fast_provider or '' }}">
@@ -153,16 +172,20 @@
                         Cheap Provider
                         <input type="text" name="cheap_provider" value="{{ settings.cheap_provider or '' }}">
                     </label>
-                </div>
-
-                <div class="grid two">
                     <label>
                         Strong Provider
                         <input type="text" name="strong_provider" value="{{ settings.strong_provider or '' }}">
                     </label>
+                </div>
+
+                <div class="grid two">
                     <label>
                         Local-only Provider
                         <input type="text" name="local_provider" value="{{ settings.local_provider or '' }}">
+                    </label>
+                    <label>
+                        Provider Allowed Hosts
+                        <input type="text" name="provider_allowed_hosts" value="{{ settings.provider_allowed_hosts | join(',') }}">
                     </label>
                 </div>
             </div>
@@ -182,6 +205,17 @@
 
                 <div class="grid two">
                     <label class="checkbox">
+                        <input type="checkbox" name="allow_provider_private_network" value="true" {% if settings.allow_provider_private_network %}checked{% endif %}>
+                        Allow provider private-network egress
+                    </label>
+                    <label class="checkbox">
+                        <input type="checkbox" name="allow_restricted_provider_egress" value="true" {% if settings.allow_restricted_provider_egress %}checked{% endif %}>
+                        Allow restricted data to remote providers
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label class="checkbox">
                         <input type="checkbox" name="enable_system_connector" value="true" {% if settings.enable_system_connector %}checked{% endif %}>
                         Enable bounded system connector
                     </label>
@@ -191,25 +225,29 @@
                     </label>
                 </div>
 
-                <div class="grid two">
+                <div class="grid three">
                     <label class="checkbox">
                         <input type="checkbox" name="json_audit_enabled" value="true" {% if settings.json_audit_enabled %}checked{% endif %}>
-                        Enable JSON audit log
+                        Enable JSON audit log mirror
                     </label>
                     <label>
                         Max Request Size Bytes
                         <input type="number" min="4096" name="max_request_size_bytes" value="{{ settings.max_request_size_bytes }}">
                     </label>
+                    <label>
+                        Recent Auth Window Seconds
+                        <input type="number" min="30" name="recent_auth_window_seconds" value="{{ settings.recent_auth_window_seconds }}">
+                    </label>
                 </div>
 
                 <div class="grid two">
                     <label>
-                        Session Max Age Seconds
-                        <input type="number" min="300" name="session_max_age_seconds" value="{{ settings.session_max_age_seconds }}">
+                        Worker Lease Seconds
+                        <input type="number" min="5" name="worker_lease_seconds" value="{{ settings.worker_lease_seconds }}">
                     </label>
                     <label>
-                        Recent Auth Window Seconds
-                        <input type="number" min="30" name="recent_auth_window_seconds" value="{{ settings.recent_auth_window_seconds }}">
+                        Worker Max Attempts
+                        <input type="number" min="1" name="worker_max_attempts" value="{{ settings.worker_max_attempts }}">
                     </label>
                 </div>
             </div>
@@ -238,14 +276,10 @@
             <div class="panel">
                 <h3>Configured Secret Envs</h3>
                 <p>{{ settings.configured_secret_envs | join(', ') if settings.configured_secret_envs else "No secret environment variables detected." }}</p>
+                <p class="small muted">CLI admin token: {{ "configured" if settings.admin_token_configured else "not initialized yet" }}</p>
             </div>
 
-            <form
-                class="stack"
-                hx-post="/settings/test-provider"
-                hx-target="#provider-test-result"
-                hx-swap="innerHTML"
-            >
+            <form method="post" action="/settings/test-provider" class="stack form-grid">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label>
                     Provider
@@ -258,6 +292,14 @@
                 <label>
                     Model
                     <input type="text" name="model_name" value="{{ settings.model }}">
+                </label>
+                <label>
+                    Data Classification
+                    <select name="data_classification">
+                        {% for value in ["external-ok", "local-only", "restricted"] %}
+                        <option value="{{ value }}">{{ value }}</option>
+                        {% endfor %}
+                    </select>
                 </label>
                 <label>
                     Base URL
@@ -278,9 +320,7 @@
                 <button type="submit" class="button ghost">Test Provider Config</button>
             </form>
 
-            <div id="provider-test-result">
-                {% include "partials/provider_test_result.html" %}
-            </div>
+            {% include "partials/provider_test_result.html" %}
 
             <div class="panel">
                 <h3>Export Sanitized Config</h3>
@@ -303,7 +343,7 @@
                 <button type="submit" class="button ghost">Import Sanitized Config</button>
             </form>
 
-            <form method="post" action="/settings/reset" class="stack form-grid">
+            <form method="post" action="/settings/reset" class="stack form-grid" data-confirm="Reset the runtime to safe defaults?">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label>
                     Current Password

@@ -90,7 +90,7 @@ class PolicyEngine:
             HttpConnector(self.settings_service)._assert_request_allowed(url, action_type.split(".", 1)[1].upper())
             return None
         except ConnectorError as exc:
-            return str(exc)
+            return f"HTTP action blocked by policy: {exc}"
 
     @staticmethod
     def _validate_system_action(action_type: str, payload: dict, enabled: bool) -> str | None:

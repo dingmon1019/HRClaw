@@ -1,6 +1,6 @@
 {% extends "templates/base.html" %}
 {% block content %}
-<section class="grid three">
+<section class="grid four">
     <article class="card stat-card">
         <span>Audit Integrity</span>
         <strong>{{ "OK" if audit_status.ok else "FAIL" }}</strong>
@@ -13,6 +13,55 @@
         <span>Queue Jobs</span>
         <strong>{{ jobs|length }}</strong>
     </article>
+    <article class="card stat-card">
+        <span>Agent Steps</span>
+        <strong>{{ agent_runs|length }}</strong>
+    </article>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h2>History Filters</h2>
+        <span class="badge ok">Correlation-aware</span>
+    </div>
+    <form method="get" action="/history" class="toolbar">
+        <label>
+            Agent
+            <select name="agent_filter">
+                <option value="">All</option>
+                {% for agent in agent_options %}
+                <option value="{{ agent.id }}" {% if agent_filter == agent.id %}selected{% endif %}>{{ agent.name }}</option>
+                <option value="{{ agent.role.value }}" {% if agent_filter == agent.role.value %}selected{% endif %}>role: {{ agent.role.value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Actor
+            <input type="text" name="actor_filter" value="{{ actor_filter or '' }}" placeholder="operator username">
+        </label>
+        <label>
+            Connector
+            <select name="connector_filter">
+                <option value="">All</option>
+                {% for value in connector_options %}
+                <option value="{{ value }}" {% if connector_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Risk
+            <select name="risk_filter">
+                <option value="">All</option>
+                {% for value in ["low","medium","high","critical"] %}
+                <option value="{{ value }}" {% if risk_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <div class="actions">
+            <button type="submit" class="button ghost">Filter</button>
+            <a href="/history" class="button ghost">Reset</a>
+        </div>
+    </form>
 </section>
 
 <section class="grid two">
@@ -31,12 +80,29 @@
                     <td><a href="/proposals/{{ entry.proposal_id }}">{{ entry.proposal_id }}</a></td>
                 </tr>
                 {% else %}
-                <tr><td colspan="4" class="muted">No action history yet.</td></tr>
+                <tr><td colspan="4" class="muted">No action history matched the current filters.</td></tr>
                 {% endfor %}
             </tbody>
         </table>
     </article>
 
+    <article class="card">
+        <h2>Agent Runs</h2>
+        <div class="stack">
+            {% for run in agent_runs %}
+            <div class="list-item">
+                <strong>{{ run.agent_name }}</strong>
+                <p>{{ run.role.value }} / {{ run.status }}</p>
+                <small>{{ run.started_at }}{% if run.completed_at %} -> {{ run.completed_at }}{% endif %}</small>
+            </div>
+            {% else %}
+            <p class="muted">No agent runs matched the current filters.</p>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+
+<section class="grid two">
     <article class="card">
         <h2>Connector Runs</h2>
         <table>
@@ -52,7 +118,29 @@
                     <td>{{ run.created_at }}</td>
                 </tr>
                 {% else %}
-                <tr><td colspan="4" class="muted">No connector runs yet.</td></tr>
+                <tr><td colspan="4" class="muted">No connector runs matched the current filters.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </article>
+
+    <article class="card">
+        <h2>Execution Jobs</h2>
+        <table>
+            <thead>
+                <tr><th>Job</th><th>Proposal</th><th>Status</th><th>Queued</th><th>Worker</th></tr>
+            </thead>
+            <tbody>
+                {% for job in jobs %}
+                <tr>
+                    <td>{{ job.id }}</td>
+                    <td><a href="/proposals/{{ job.proposal_id }}">{{ job.proposal_id }}</a></td>
+                    <td><span class="badge {{ job.status.value }}">{{ job.status.value }}</span></td>
+                    <td>{{ job.queued_at }}</td>
+                    <td>{{ job.worker_id or "-" }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5" class="muted">No execution jobs yet.</td></tr>
                 {% endfor %}
             </tbody>
         </table>
@@ -60,24 +148,20 @@
 </section>
 
 <section class="card">
-    <h2>Execution Jobs</h2>
-    <table>
-        <thead>
-            <tr><th>Job</th><th>Proposal</th><th>Status</th><th>Queued</th><th>Worker</th></tr>
-        </thead>
-        <tbody>
-            {% for job in jobs %}
-            <tr>
-                <td>{{ job.id }}</td>
-                <td><a href="/proposals/{{ job.proposal_id }}">{{ job.proposal_id }}</a></td>
-                <td><span class="badge {{ job.status.value }}">{{ job.status.value }}</span></td>
-                <td>{{ job.queued_at }}</td>
-                <td>{{ job.worker_id or "-" }}</td>
-            </tr>
-            {% else %}
-            <tr><td colspan="5" class="muted">No execution jobs yet.</td></tr>
-            {% endfor %}
-        </tbody>
-    </table>
+    <div class="card-header">
+        <h2>Audit Events</h2>
+        <span class="badge {{ 'ok' if audit_status.ok else 'danger' }}">{{ "Verified" if audit_status.ok else "Broken" }}</span>
+    </div>
+    <div class="stack">
+        {% for entry in audit_entries %}
+        <div class="list-item">
+            <strong>{{ entry.event_type }}</strong>
+            <small>{{ entry.created_at }}</small>
+            <pre>{{ entry.payload_json }}</pre>
+        </div>
+        {% else %}
+        <p class="muted">No audit entries matched the current filters.</p>
+        {% endfor %}
+    </div>
 </section>
 {% endblock %}

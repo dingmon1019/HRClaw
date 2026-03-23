@@ -35,10 +35,11 @@ class FilesystemConnector(BaseConnector):
             return {"path": str(path), "kind": "directory", "entries": entries[:50], "entry_count": len(entries)}
         if path.is_file():
             content = path.read_text(encoding="utf-8", errors="ignore")
+            limit = self.settings_service.get_effective_settings().filesystem_max_read_bytes
             return {
                 "path": str(path),
                 "kind": "file",
-                "preview": content[:2000],
+                "preview": content[:limit],
                 "size_bytes": path.stat().st_size,
             }
         raise ConnectorError(f"Path {path} does not exist.")
@@ -73,6 +74,8 @@ class FilesystemConnector(BaseConnector):
         if action_type == "filesystem.copy_path":
             source = self.path_guard.resolve_for_read(payload.get("source_path"))
             destination = self.path_guard.resolve_for_write(payload.get("destination_path"))
+            if source.is_file() and source.stat().st_size > self.settings_service.get_effective_settings().filesystem_max_read_bytes:
+                raise ConnectorError("Copy source exceeds the configured filesystem size limit.")
             if source.is_dir():
                 shutil.copytree(source, destination, dirs_exist_ok=True)
             else:
