@@ -64,6 +64,22 @@ class RuntimePlanner:
         self.agent_service.assert_capability(reviewer, "policy-review")
         self.agent_service.assert_capability(reviewer, "approval-gating")
         self.agent_service.assert_capability(reporter, "summarize-plan")
+        objective_node = self.agent_service.create_task_node(
+            run_id,
+            role=AgentRole.SUPERVISOR,
+            node_type="objective",
+            title=request.objective,
+            details={
+                "request": self.data_governance_service.sanitize_for_history(request.model_dump(mode="json")),
+                "memory_namespace": supervisor.memory_namespace,
+            },
+            status="running",
+            parent_task_node_id=None,
+            agent=supervisor,
+            provider_profile=self._provider_profile_for_role(AgentRole.SUPERVISOR, effective_settings),
+            correlation_id=correlation_id,
+            depends_on=[],
+        )
 
         supervisor_run = self.agent_service.start_run(
             run_id,
@@ -74,10 +90,21 @@ class RuntimePlanner:
         )
         subtasks = self._decompose(request)
         intent_summary = self._intent_summary(request, subtasks)
+        subtask_nodes = self._create_subtask_nodes(run_id, subtasks, objective_node.id, correlation_id, effective_settings)
         self.agent_service.complete_run(
             supervisor_run.id,
             status="completed",
             output_payload={"intent_summary": intent_summary, "subtasks": subtasks},
+        )
+        self.agent_service.complete_task_node(
+            objective_node.id,
+            status="completed",
+            details={
+                "intent_summary": intent_summary,
+                "subtask_count": len(subtasks),
+                "subtask_node_ids": [node.id for node in subtask_nodes],
+            },
+            agent_run_id=supervisor_run.id,
         )
 
         planner_handoff = self.agent_service.create_handoff(
@@ -136,6 +163,18 @@ class RuntimePlanner:
                 "proposal_count": len(raw_proposals),
             },
         )
+        self._complete_role_nodes(
+            subtask_nodes,
+            role=AgentRole.PLANNER,
+            agent_run_id=planner_run.id,
+            handoff_id=planner_handoff.id,
+            provider_name=summary_provider_name,
+            details={
+                "summary_id": summary.id,
+                "proposal_titles": [proposal.title for proposal in raw_proposals],
+                "memory_namespace": planner.memory_namespace,
+            },
+        )
 
         reviewer_handoff = self.agent_service.create_handoff(
             run_id,
@@ -165,6 +204,44 @@ class RuntimePlanner:
                 "approval_required_count": sum(1 for proposal in created if proposal.requires_approval),
             },
         )
+        self._complete_role_nodes(
+            subtask_nodes,
+            role=AgentRole.REVIEWER,
+            agent_run_id=reviewer_run.id,
+            handoff_id=reviewer_handoff.id,
+            provider_name=None,
+            details={
+                "proposal_ids": [proposal.id for proposal in created],
+                "memory_namespace": reviewer.memory_namespace,
+            },
+        )
+        reviewer_dependency = [node.id for node in subtask_nodes if node.role == AgentRole.REVIEWER]
+        for proposal in created:
+            proposal_parent = self._proposal_parent_node(proposal.connector, subtask_nodes, objective_node.id)
+            self.agent_service.create_task_node(
+                run_id,
+                role=AgentRole.PLANNER,
+                node_type="proposal",
+                title=proposal.title,
+                details={
+                    "proposal_id": proposal.id,
+                    "connector": proposal.connector,
+                    "action_type": proposal.action_type,
+                    "risk_level": proposal.risk_level.value,
+                    "status": proposal.status.value,
+                    "requires_approval": proposal.requires_approval,
+                    "created_by": proposal.created_by_agent_role,
+                    "reviewed_by": proposal.reviewed_by_agent_role,
+                },
+                status=proposal.status.value,
+                parent_task_node_id=proposal_parent,
+                agent=planner,
+                agent_run_id=planner_run.id,
+                provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
+                provider_name=proposal.provider_name,
+                correlation_id=correlation_id,
+                depends_on=reviewer_dependency,
+            )
 
         reporter_handoff = self.agent_service.create_handoff(
             run_id,
@@ -198,6 +275,17 @@ class RuntimePlanner:
             output_payload={
                 "operator_summary": operator_summary,
                 "proposal_ids": [proposal.id for proposal in created],
+            },
+        )
+        self._complete_role_nodes(
+            subtask_nodes,
+            role=AgentRole.REPORTER,
+            agent_run_id=reporter_run.id,
+            handoff_id=reporter_handoff.id,
+            provider_name=reporter_provider,
+            details={
+                "operator_summary": operator_summary,
+                "memory_namespace": reporter.memory_namespace,
             },
         )
 
@@ -674,17 +762,53 @@ class RuntimePlanner:
 
     @staticmethod
     def _decompose(request: AgentRunRequest) -> list[dict[str, str]]:
-        subtasks: list[dict[str, str]] = [{"role": AgentRole.SUPERVISOR.value, "title": "Interpret objective"}]
+        subtasks: list[dict[str, str]] = []
         if request.filesystem_path:
-            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Inspect filesystem target {request.filesystem_path}"})
+            subtasks.append(
+                {
+                    "role": AgentRole.PLANNER.value,
+                    "title": f"Inspect filesystem target {request.filesystem_path}",
+                    "node_type": "collect",
+                }
+            )
         if request.http_url:
-            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Prepare HTTP action for {request.http_url}"})
+            subtasks.append(
+                {
+                    "role": AgentRole.PLANNER.value,
+                    "title": f"Prepare HTTP action for {request.http_url}",
+                    "node_type": "plan",
+                }
+            )
         if request.system_action:
-            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Prepare bounded system action {request.system_action}"})
+            subtasks.append(
+                {
+                    "role": AgentRole.PLANNER.value,
+                    "title": f"Prepare bounded system action {request.system_action}",
+                    "node_type": "plan",
+                }
+            )
         if request.task_title:
-            subtasks.append({"role": AgentRole.PLANNER.value, "title": f"Create local task {request.task_title}"})
-        subtasks.append({"role": AgentRole.REVIEWER.value, "title": "Evaluate risk, policy, and egress"})
-        subtasks.append({"role": AgentRole.REPORTER.value, "title": "Prepare operator-facing plan summary"})
+            subtasks.append(
+                {
+                    "role": AgentRole.PLANNER.value,
+                    "title": f"Create local task {request.task_title}",
+                    "node_type": "plan",
+                }
+            )
+        subtasks.append(
+            {
+                "role": AgentRole.REVIEWER.value,
+                "title": "Evaluate risk, policy, and egress",
+                "node_type": "review",
+            }
+        )
+        subtasks.append(
+            {
+                "role": AgentRole.REPORTER.value,
+                "title": "Prepare operator-facing plan summary",
+                "node_type": "report",
+            }
+        )
         return subtasks
 
     @staticmethod
@@ -713,3 +837,131 @@ class RuntimePlanner:
         if role == AgentRole.EXECUTOR:
             return "local-only"
         return "strong"
+
+    def _create_subtask_nodes(self, run_id, subtasks, parent_node_id, correlation_id, settings):
+        nodes = []
+        planner_dependencies = [parent_node_id]
+        planner_nodes = []
+        review_nodes = []
+        sequence = 1
+
+        for subtask in subtasks:
+            role = AgentRole(subtask["role"])
+            agent = self.agent_service.get_by_role(role)
+            if role == AgentRole.PLANNER:
+                node = self.agent_service.create_task_node(
+                    run_id,
+                    role=role,
+                    node_type=subtask.get("node_type", "subtask"),
+                    title=subtask["title"],
+                    details={
+                        "sequence": sequence,
+                        "phase": "planner",
+                        "memory_namespace": agent.memory_namespace,
+                        "planned_provider_profile": self._provider_profile_for_role(role, settings),
+                    },
+                    status="ready",
+                    parent_task_node_id=parent_node_id,
+                    agent=agent,
+                    provider_profile=self._provider_profile_for_role(role, settings),
+                    correlation_id=correlation_id,
+                    depends_on=planner_dependencies,
+                )
+                planner_nodes.append(node)
+                nodes.append(node)
+                sequence += 1
+
+        reviewer_dependencies = [node.id for node in planner_nodes] or [parent_node_id]
+        for subtask in subtasks:
+            role = AgentRole(subtask["role"])
+            if role != AgentRole.REVIEWER:
+                continue
+            agent = self.agent_service.get_by_role(role)
+            node = self.agent_service.create_task_node(
+                run_id,
+                role=role,
+                node_type=subtask.get("node_type", "subtask"),
+                title=subtask["title"],
+                details={
+                    "sequence": sequence,
+                    "phase": "review",
+                    "memory_namespace": agent.memory_namespace,
+                    "planned_provider_profile": self._provider_profile_for_role(role, settings),
+                },
+                status="blocked",
+                parent_task_node_id=parent_node_id,
+                agent=agent,
+                provider_profile=self._provider_profile_for_role(role, settings),
+                correlation_id=correlation_id,
+                depends_on=reviewer_dependencies,
+            )
+            review_nodes.append(node)
+            nodes.append(node)
+            sequence += 1
+
+        reporter_dependencies = [node.id for node in review_nodes] or reviewer_dependencies
+        for subtask in subtasks:
+            role = AgentRole(subtask["role"])
+            if role != AgentRole.REPORTER:
+                continue
+            agent = self.agent_service.get_by_role(role)
+            node = self.agent_service.create_task_node(
+                run_id,
+                role=role,
+                node_type=subtask.get("node_type", "subtask"),
+                title=subtask["title"],
+                details={
+                    "sequence": sequence,
+                    "phase": "report",
+                    "memory_namespace": agent.memory_namespace,
+                    "planned_provider_profile": self._provider_profile_for_role(role, settings),
+                },
+                status="blocked",
+                parent_task_node_id=parent_node_id,
+                agent=agent,
+                provider_profile=self._provider_profile_for_role(role, settings),
+                correlation_id=correlation_id,
+                depends_on=reporter_dependencies,
+            )
+            nodes.append(node)
+            sequence += 1
+        return nodes
+
+    def _complete_role_nodes(
+        self,
+        nodes,
+        *,
+        role: AgentRole,
+        agent_run_id: str,
+        handoff_id: str,
+        provider_name: str | None,
+        details: dict,
+    ) -> None:
+        for node in nodes:
+            if node.role != role:
+                continue
+            self.agent_service.complete_task_node(
+                node.id,
+                status="completed",
+                details=details,
+                provider_name=provider_name,
+                agent_run_id=agent_run_id,
+                handoff_id=handoff_id,
+            )
+
+    @staticmethod
+    def _proposal_parent_node(connector: str, nodes, fallback_id: str) -> str:
+        connector_map = {
+            "filesystem": "filesystem target",
+            "http": "HTTP action",
+            "task": "local task",
+            "system": "system action",
+        }
+        needle = connector_map.get(connector, connector).lower()
+        for node in nodes:
+            if node.role == AgentRole.PLANNER and needle in node.title.lower():
+                return node.id
+        for node in nodes:
+            if node.role == AgentRole.PLANNER:
+                return node.id
+        return fallback_id

@@ -54,3 +54,23 @@ class HandoffRecord(BaseModel):
     correlation_id: str | None = None
     created_at: str
     completed_at: str | None = None
+
+
+class TaskNodeRecord(BaseModel):
+    id: str
+    run_id: str
+    parent_task_node_id: str | None = None
+    agent_id: str | None = None
+    agent_run_id: str | None = None
+    handoff_id: str | None = None
+    role: AgentRole
+    node_type: str
+    title: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    status: str
+    provider_profile: str | None = None
+    provider_name: str | None = None
+    correlation_id: str | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    created_at: str
+    completed_at: str | None = None

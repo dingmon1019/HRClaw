@@ -22,6 +22,7 @@ class ExecutionQueueService:
         run_id: str,
         queued_by: str,
         approval_id: str | None = None,
+        manifest_hash: str | None = None,
         correlation_id: str | None = None,
     ) -> ExecutionJobRecord:
         existing = self.database.fetch_one(
@@ -37,11 +38,11 @@ class ExecutionQueueService:
                 UPDATE execution_jobs
                 SET status = ?, queued_by = ?, queued_at = ?, started_at = NULL, finished_at = NULL,
                     worker_id = NULL, result_json = NULL, error_text = NULL, lease_expires_at = NULL,
-                    last_heartbeat_at = NULL, approval_id = ?, correlation_id = ?, dead_letter_reason = NULL,
+                    last_heartbeat_at = NULL, approval_id = ?, manifest_hash = ?, correlation_id = ?, dead_letter_reason = NULL,
                     attempt_count = 0
                 WHERE proposal_id = ?
                 """,
-                ("queued", queued_by, queued_at, approval_id, correlation_id, proposal_id),
+                ("queued", queued_by, queued_at, approval_id, manifest_hash, correlation_id, proposal_id),
             )
             row = self.database.fetch_one("SELECT * FROM execution_jobs WHERE proposal_id = ?", (proposal_id,))
             return self._row_to_record(row)
@@ -52,9 +53,9 @@ class ExecutionQueueService:
             INSERT INTO execution_jobs(
                 id, proposal_id, run_id, status, queued_by, queued_at, started_at, finished_at,
                 worker_id, result_json, error_text, lease_expires_at, last_heartbeat_at,
-                attempt_count, correlation_id, approval_id, dead_letter_reason
+                attempt_count, correlation_id, approval_id, manifest_hash, dead_letter_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -73,6 +74,7 @@ class ExecutionQueueService:
                 0,
                 correlation_id,
                 approval_id,
+                manifest_hash,
                 None,
             ),
         )
@@ -279,6 +281,7 @@ class ExecutionQueueService:
             attempt_count=int(row["attempt_count"] or 0),
             correlation_id=row["correlation_id"],
             approval_id=row["approval_id"],
+            manifest_hash=row["manifest_hash"],
         )
 
     @staticmethod

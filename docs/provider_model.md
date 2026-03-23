@@ -15,9 +15,12 @@ Core rules:
 
 - provider credentials come from environment variables
 - provider base URLs are still subject to outbound policy checks
+- each provider has its own persisted config record
+- each provider can be enabled or disabled independently
+- each provider can carry its own model default, auth env name, base URL, and allowed-host list
 - provider requests can be routed by profile: `fast`, `cheap`, `strong`, `local-only`, `privacy-preferred`
 - provider fallback is allowed only across configured candidates
-- circuit breaker state is tracked and surfaced in the UI
+- circuit breaker state is tracked, persisted in SQLite provider health rows, and surfaced in the UI
 
 Egress controls apply to providers the same way they apply to HTTP connector usage:
 
@@ -28,6 +31,13 @@ Egress controls apply to providers the same way they apply to HTTP connector usa
 - timeout limits
 - response size limits
 - private-network restrictions unless explicitly enabled
+- provider health records expose allowed hosts, profiles, circuit state, and per-provider config status in the operator console
+
+Operator visibility:
+
+- the Settings page exposes a provider catalog instead of a single global provider form
+- the catalog shows enabled state, capabilities, auth env name, configured destinations, and which runtime profiles point at that provider
+- run history and task graph views show which provider each agent role used
 
 Data classes:
 

@@ -27,6 +27,7 @@ def app_settings(tmp_path: Path) -> AppSettings:
         fallback_provider="mock",
         model="mock-model",
         runtime_mode="safe",
+        allow_insecure_local_storage=True,
         session_secret="test-session-secret",
         session_cookie_name="test_session",
     )

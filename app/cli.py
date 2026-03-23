@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+from getpass import getpass
 import json
-import os
+from pathlib import Path
 from time import sleep
 
 from app.core.container import AppContainer
+from app.core.errors import AuthorizationError
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest
 from app.schemas.providers import ProviderTestRequest
 
@@ -34,24 +36,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     approve = subparsers.add_parser("approve-proposal", help="Approve and queue a proposal.")
     approve.add_argument("proposal_id")
-    approve.add_argument("--actor", default="cli-operator")
     approve.add_argument("--reason", required=True)
-    approve.add_argument("--cli-token")
-    approve.add_argument("--admin-token", dest="cli_token")
+    approve.add_argument("--username")
+    approve.add_argument("--token-file")
 
     reject = subparsers.add_parser("reject-proposal", help="Reject a proposal.")
     reject.add_argument("proposal_id")
-    reject.add_argument("--actor", default="cli-operator")
     reject.add_argument("--reason", required=True)
-    reject.add_argument("--cli-token")
-    reject.add_argument("--admin-token", dest="cli_token")
+    reject.add_argument("--username")
+    reject.add_argument("--token-file")
 
     worker = subparsers.add_parser("run-worker", help="Run the isolated execution worker.")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--limit", type=int, default=1)
     worker.add_argument("--interval", type=float, default=2.0)
-    worker.add_argument("--cli-token")
-    worker.add_argument("--admin-token", dest="cli_token")
+    worker.add_argument("--username")
+    worker.add_argument("--token-file")
 
     jobs = subparsers.add_parser("list-jobs", help="List recent execution jobs.")
     jobs.add_argument("--limit", type=int, default=20)
@@ -68,22 +68,70 @@ def build_parser() -> argparse.ArgumentParser:
 
     issue_cli = subparsers.add_parser("issue-cli-token", help="Issue a short-lived CLI auth token.")
     issue_cli.add_argument("--username", required=True)
-    issue_cli.add_argument("--password", required=True)
     issue_cli.add_argument("--purpose", default="worker")
     issue_cli.add_argument("--ttl-seconds", type=int, default=None)
+    issue_cli.add_argument("--token-file")
+    issue_cli.add_argument("--emit-token", action="store_true")
 
     subparsers.add_parser("verify-audit", help="Verify tamper-evident audit chain integrity.")
     return parser
+
+
+def _read_password(args) -> str:
+    password = getpass("Password: ")
+    if not password:
+        raise AuthorizationError("Password input was empty.")
+    return password
+
+
+def _resolve_token_file(container: AppContainer, raw_path: str) -> Path:
+    candidate = Path(raw_path)
+    if candidate.is_absolute():
+        return candidate
+    return (container.base_settings.resolved_secrets_dir / "cli_tokens" / candidate).resolve()
+
+
+def _issue_cli_token(
+    container: AppContainer,
+    *,
+    username: str,
+    password: str,
+    purpose: str,
+    ttl_seconds: int | None = None,
+):
+    return container.admin_token_service.issue(
+        username=username,
+        password=password,
+        purpose=purpose,
+        ttl_seconds=ttl_seconds,
+    )
+
+
+def _resolve_cli_token(container: AppContainer, args, purpose: str):
+    token: str | None = None
+    if getattr(args, "token_file", None):
+        token = container.protected_storage.read_secret_text(
+            _resolve_token_file(container, args.token_file)
+        ).strip()
+    elif getattr(args, "username", None):
+        password = _read_password(args)
+        token, _ = _issue_cli_token(
+            container,
+            username=args.username,
+            password=password,
+            purpose=purpose,
+        )
+    else:
+        raise AuthorizationError(
+            "Sensitive CLI commands require either --token-file or --username with interactive password authentication."
+        )
+    return container.admin_token_service.verify(token, purpose=purpose)
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     container = AppContainer()
-
-    def require_cli_token(purpose: str) -> None:
-        provided = getattr(args, "cli_token", None) or os.getenv("WIN_AGENT_CLI_TOKEN")
-        container.admin_token_service.verify(provided, purpose=purpose)
 
     if args.command == "run-agent":
         result = container.runtime_service.run_agent(
@@ -120,25 +168,25 @@ def main() -> None:
         return
 
     if args.command == "approve-proposal":
-        require_cli_token("approval")
+        token_record = _resolve_cli_token(container, args, "approval")
         result = container.runtime_service.approve_and_queue(
             args.proposal_id,
-            ApprovalDecisionRequest(actor=args.actor, reason=args.reason),
+            ApprovalDecisionRequest(actor=token_record.username, reason=args.reason),
         )
         print(json.dumps(result["job"].model_dump(mode="json"), indent=2))
         return
 
     if args.command == "reject-proposal":
-        require_cli_token("approval")
+        token_record = _resolve_cli_token(container, args, "approval")
         result = container.runtime_service.reject(
             args.proposal_id,
-            ApprovalDecisionRequest(actor=args.actor, reason=args.reason),
+            ApprovalDecisionRequest(actor=token_record.username, reason=args.reason),
         )
         print(f"{result.proposal_id} rejected by {result.actor} at {result.created_at}")
         return
 
     if args.command == "run-worker":
-        require_cli_token("worker")
+        _resolve_cli_token(container, args, "worker")
         if args.once:
             result = container.worker.run_once()
             print(json.dumps(result, indent=2, default=str) if result is not None else "No queued jobs.")
@@ -154,23 +202,29 @@ def main() -> None:
         return
 
     if args.command == "issue-cli-token":
-        token, record = container.admin_token_service.issue(
+        if not args.emit_token and not args.token_file:
+            raise SystemExit("Use --token-file for protected storage or --emit-token for explicit advanced use.")
+        password = _read_password(args)
+        token, record = _issue_cli_token(
+            container,
             username=args.username,
-            password=args.password,
+            password=password,
             purpose=args.purpose,
             ttl_seconds=args.ttl_seconds,
         )
-        print(
-            json.dumps(
-                {
-                    "token": token,
-                    "purpose": record.purpose,
-                    "expires_at": record.expires_at,
-                    "username": record.username,
-                },
-                indent=2,
-            )
-        )
+        response = {
+            "purpose": record.purpose,
+            "expires_at": record.expires_at,
+            "username": record.username,
+        }
+        if args.token_file:
+            token_path = _resolve_token_file(container, args.token_file)
+            container.protected_storage.write_secret_text(token_path, token)
+            response["token_file"] = str(token_path)
+            response["storage_mode"] = container.protected_storage.storage_mode
+        if args.emit_token:
+            response["token"] = token
+        print(json.dumps(response, indent=2))
         return
 
     if args.command == "list-jobs":

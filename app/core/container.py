@@ -47,9 +47,14 @@ class AppContainer:
         self.data_governance_service = DataGovernanceService(self.protected_storage)
         self.cli_token_service = CliTokenService(self.database, self.auth_service, self.base_settings)
         self.rate_limiter = RateLimiter()
-        self.audit_service = AuditService(self.database, self.base_settings.resolved_audit_log_path, self.settings_service)
         self.history_service = HistoryService(self.database)
         self.agent_service = AgentService(self.database)
+        self.audit_service = AuditService(
+            self.database,
+            self.base_settings.resolved_audit_log_path,
+            self.settings_service,
+            self.data_governance_service,
+        )
         self.proposal_snapshot_service = ProposalSnapshotService(
             self.base_settings,
             self.database,

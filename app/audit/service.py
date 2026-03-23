@@ -9,16 +9,28 @@ from app.services.settings_service import SettingsService
 
 
 class AuditService:
-    def __init__(self, database: Database, log_path: Path, settings_service: SettingsService):
+    def __init__(
+        self,
+        database: Database,
+        log_path: Path,
+        settings_service: SettingsService,
+        data_governance_service=None,
+    ):
         self.database = database
         self.log_path = log_path
         self.settings_service = settings_service
+        self.data_governance_service = data_governance_service
         ensure_parent_dir(self.log_path)
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
         settings = self.settings_service.get_effective_settings()
         timestamp = utcnow_iso()
-        payload_json = json_dumps(payload)
+        safe_payload = (
+            self.data_governance_service.sanitize_for_audit(payload)
+            if self.data_governance_service is not None
+            else payload
+        )
+        payload_json = json_dumps(safe_payload)
         prev_row = self.database.fetch_one(
             "SELECT entry_hash FROM audit_entries ORDER BY rowid DESC LIMIT 1"
         )
@@ -34,7 +46,7 @@ class AuditService:
         record = {
             "timestamp": timestamp,
             "event_type": event_type,
-            "payload": payload,
+            "payload": safe_payload,
             "prev_hash": prev_hash or None,
             "entry_hash": entry_hash,
         }

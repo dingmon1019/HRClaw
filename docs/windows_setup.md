@@ -60,6 +60,7 @@ That means the local database, audit mirror, generated session secret, and prote
 - copies `.env.example` to `.env` if missing
 - initializes `%LOCALAPPDATA%\WinAgentRuntime\`
 - creates `data\`, `logs\`, `secrets\`, and `workspace\` under that runtime root
+- prints the resolved Windows runtime paths so operators can verify where live state will land
 
 ## Manual Setup
 
@@ -78,13 +79,28 @@ Then:
 .\scripts\run-worker.ps1
 ```
 
+Optional cleanup for repo-local caches and legacy runtime folders:
+
+```powershell
+.\scripts\clean-local-artifacts.ps1
+```
+
+Optional startup task for the localhost console:
+
+```powershell
+.\scripts\install-console-startup-task.ps1
+.\scripts\remove-console-startup-task.ps1
+```
+
 ## Windows Notes
 
 - the UI is loopback-bound by default
-- worker CLI actions require a short-lived CLI auth token issued after password verification
+- worker CLI actions use a Python-side secure password prompt or a protected short-lived token file
 - if `python` is not on PATH, use `py -3.13`
 - `pywin32` is optional; the Outlook connector fails gracefully when unavailable
 - when `pywin32` is installed, DPAPI-backed local secret protection is used automatically
+- without DPAPI, sensitive blob storage fails closed unless `allow_insecure_local_storage` is explicitly enabled
+- provider-specific catalog records let you keep local-model URLs and remote API settings separate inside the UI
 
 ## Troubleshooting
 
@@ -98,15 +114,15 @@ py -3.13 --version
 
 If that works, either use `py -3.13` directly or add Python to the Windows user PATH.
 
-### Worker token errors
+### Worker authentication errors
 
-If `run-worker.ps1` reports a missing token, run:
+If `run-worker.ps1` reports an authentication issue, run:
 
 ```powershell
 .\scripts\run-worker.ps1
 ```
 
-The script can prompt for local credentials, mint a short-lived token for the `worker` purpose, and keep it only in the current PowerShell process environment.
+The script asks for the operator username in PowerShell and the Python CLI prompts for the password securely, so the password does not travel on the command line or stay in a long-lived PowerShell variable.
 
 ### Outlook connector unavailable
 

@@ -14,7 +14,7 @@ The project is designed to be safer and more usable for Windows localhost operat
 - separate worker execution boundary
 - bounded local connectors only, no raw shell execution
 - multi-provider routing with egress controls
-- SQLite-backed persistence, audit, and task graph history
+- SQLite-backed persistence, audit, task graph history, and clean release packaging
 
 ## Why This Exists
 
@@ -114,6 +114,7 @@ Real multi-agent properties in the codebase:
 - enforced per-agent capability and connector restrictions
 - agent run history in SQLite
 - explicit handoff records in SQLite
+- persisted task nodes with parent/dependency links
 - visible task graph/timeline in the UI
 - proposal provenance linked back to planner/reviewer roles
 
@@ -130,8 +131,9 @@ Implemented controls:
 - CSRF protection on dangerous POST routes
 - CSP, frame denial, no-referrer, and no-sniff headers
 - session secret generated on first run and stored outside the repository when not supplied by env
-- short-lived password-issued CLI authentication tokens for dangerous CLI actions
+- short-lived interactive CLI authentication for dangerous CLI actions
 - approval snapshot binding with stale detection
+- explicit execution manifest hashes across proposal, approval, queue, and history
 - dedicated worker queue and lease-based execution claiming
 - bounded system actions instead of raw PowerShell or raw shell execution
 - workspace-first filesystem allowlist
@@ -140,6 +142,7 @@ Implemented controls:
 - HTTP connector policy on scheme, host, port, redirects, timeout, and response size
 - provider egress policy on host allowlists and restricted-data handling
 - protected local blob storage for sensitive payload fields with DPAPI when available
+- fail-closed blob storage for sensitive payloads unless strong protection exists or an explicit insecure override is enabled
 - hash-chained audit trail with verification
 
 Important limit:
@@ -153,6 +156,7 @@ Approvals are bound to executable snapshots, not just human-readable summaries.
 Every approval is tied to:
 
 - proposal snapshot hash
+- execution manifest hash
 - action payload hash
 - policy evaluation hash
 - settings version hash
@@ -166,6 +170,7 @@ The proposal detail page surfaces:
 - affected resources
 - preview and diff where available
 - snapshot hashes
+- execution manifest hash
 - stale drift warnings
 - rollback indicator
 - approval log with bound hashes
@@ -187,6 +192,7 @@ Default behavior:
 - DB, audit, settings, token, and log file writes are denied
 - symlink traversal is denied
 - sensitive payload bodies are externalized into protected local blob storage instead of being duplicated across runtime tables
+- restricted and privileged-sensitive blobs fail closed unless DPAPI is available or an insecure local override is explicitly enabled
 
 This is designed to let operators work with local files without granting broad write access to the repository itself.
 
@@ -203,6 +209,9 @@ Honest provider support:
 
 Provider orchestration features:
 
+- provider-specific catalog records persisted in SQLite
+- provider-specific enabled / disabled state
+- provider-specific base URL, model default, auth env name, and allowed-host list
 - capability metadata
 - health status
 - retry policy
@@ -276,6 +285,12 @@ Run worker:
 .\scripts\run-worker.ps1
 ```
 
+Optional Windows startup task for the localhost console:
+
+```powershell
+.\scripts\install-console-startup-task.ps1
+```
+
 Open:
 
 - [http://127.0.0.1:8000](http://127.0.0.1:8000)
@@ -304,16 +319,22 @@ python -m app.cli list-providers
 python -m app.cli verify-audit
 ```
 
-Sensitive commands require a short-lived CLI authentication token issued after password verification:
+Sensitive commands require interactive local authentication or a protected short-lived token file. Passwords are not accepted as command-line arguments:
 
 ```powershell
-python -m app.cli issue-cli-token --username <user> --password <password> --purpose approval
-python -m app.cli approve-proposal <proposal_id> --reason "Approved" --cli-token <token>
-python -m app.cli reject-proposal <proposal_id> --reason "Rejected" --cli-token <token>
-python -m app.cli run-worker --once --cli-token <token>
+python -m app.cli approve-proposal <proposal_id> --reason "Approved" --username <user>
+python -m app.cli reject-proposal <proposal_id> --reason "Rejected" --username <user>
+python -m app.cli run-worker --once --username <user>
 ```
 
-`.\scripts\run-worker.ps1` can prompt interactively, mint a short-lived worker token, and keep it only in the current PowerShell process environment.
+Advanced automation can mint a short-lived purpose-scoped token into protected local storage:
+
+```powershell
+python -m app.cli issue-cli-token --username <user> --purpose worker --token-file worker.token
+python -m app.cli run-worker --once --token-file worker.token
+```
+
+`.\scripts\run-worker.ps1` asks only for the operator username in PowerShell and lets the Python CLI prompt for the password securely, so the password does not live in PowerShell argv or a long-lived shell variable. Protected token-file mode remains an advanced path only.
 
 ## Testing
 
@@ -327,17 +348,21 @@ Current automated coverage includes:
 
 - auth bootstrap, logout, and idle timeout
 - CSRF enforcement
+- CLI auth prompt/token-file requirements
 - approval snapshot stale detection
+- execution manifest binding
 - worker execution and stale job reclaim
 - filesystem allowlist and symlink blocking
 - bounded system action policy
 - provider fallback and restricted egress behavior
+- protected storage fail-closed behavior
+- release packaging allowlist verification
 - audit integrity verification
-- multi-agent run and handoff persistence
+- multi-agent run, handoff, and task-node persistence
 
 ## Release Hygiene
 
-The repository is prepared to avoid accidental runtime leakage:
+The repository is prepared to avoid accidental runtime leakage, and release archives should be built from the allowlist packager instead of zipping the working tree:
 
 - `.venv/` ignored
 - `data/` ignored
@@ -346,6 +371,26 @@ The repository is prepared to avoid accidental runtime leakage:
 - `.env` ignored
 - runtime tokens and audit files ignored
 - example config only, no live secrets committed
+
+Build and verify a clean archive:
+
+```powershell
+.\scripts\package-release.ps1 -Version vnext -VerifyWorkingTree -Clean
+```
+
+CI-oriented verification mode:
+
+```powershell
+.\scripts\package-release.ps1 -Version vnext -CI
+```
+
+Every clean archive now contains `release_manifest.json` with build time, included paths, excluded path policy, and the git revision when available.
+
+Clean ignored repo-local caches and legacy runtime folders when needed:
+
+```powershell
+.\scripts\clean-local-artifacts.ps1
+```
 
 Before publishing a release, verify:
 
@@ -359,7 +404,7 @@ Before publishing a release, verify:
 Planned next steps:
 
 - stronger Windows secret storage, including optional Credential Manager support
-- richer Windows notifications and service install scripts
+- richer Windows notifications and true service-mode worker isolation
 - per-user RBAC and approval scopes
 - stronger worker isolation options
 - richer rollback helpers for selected file operations

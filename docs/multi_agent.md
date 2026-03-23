@@ -56,21 +56,21 @@ The following records make the multi-agent model visible:
   One row per agent step in a run.
 - `handoffs`
   Explicit transfers between roles.
+- `task_nodes`
+  Parent/child and dependency-linked orchestration nodes for the run graph.
 - `proposals`
   Proposal provenance back to planner and reviewer roles.
 
 ## Current Orchestration Pattern
 
-Today the orchestration is sequential but explicit:
+Today the orchestration is bounded, explicit, and graph-shaped rather than a flat step log:
 
-1. supervisor run starts
-2. planner handoff is created
-3. planner run completes
-4. reviewer handoff is created
-5. reviewer run completes
-6. reporter handoff is created
-7. reporter run completes
-8. executor runs later inside the worker after approval
+1. supervisor run starts and writes the objective root node
+2. planner subtask nodes are created as child branches under the objective
+3. reviewer nodes depend on planner branches and block until planning completes
+4. reporter nodes depend on reviewer completion
+5. proposal nodes are attached under the relevant planner branch with reviewer dependencies
+6. executor runs later inside the worker after approval
 
 This is a practical local-first orchestration layer. It is not a distributed agent mesh.
 
@@ -78,7 +78,7 @@ This is a practical local-first orchestration layer. It is not a distributed age
 
 - agent memory is namespaced by role, but not yet a full long-term memory subsystem
 - agent prompts are mostly role-specific heuristics, not full autonomous loops
-- there is no parallel agent scheduler yet
+- planner branches can be represented as parallel-ready nodes, but there is no general parallel worker scheduler yet
 - there is no per-user RBAC on agent capabilities yet
 
 ## Why This Still Matters
@@ -88,5 +88,6 @@ Even with a bounded sequential runtime, explicit multi-agent persistence gives o
 - who proposed this action?
 - who reviewed it?
 - what handoff led to this step?
+- what task node dependencies led to this step?
 - which provider profile was used for this role?
 - what changed between planning and execution?

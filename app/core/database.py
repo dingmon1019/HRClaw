@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     policy_hash TEXT,
     settings_hash TEXT,
     resource_hash TEXT,
+    manifest_hash TEXT,
     correlation_id TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY(proposal_id) REFERENCES proposals(id)
@@ -68,6 +69,8 @@ CREATE TABLE IF NOT EXISTS action_history (
     input_json TEXT NOT NULL,
     output_json TEXT,
     error_text TEXT,
+    provider_name TEXT,
+    manifest_hash TEXT,
     correlation_id TEXT,
     FOREIGN KEY(proposal_id) REFERENCES proposals(id)
 );
@@ -164,6 +167,7 @@ CREATE TABLE IF NOT EXISTS execution_jobs (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     correlation_id TEXT,
     approval_id TEXT,
+    manifest_hash TEXT,
     dead_letter_reason TEXT,
     FOREIGN KEY(proposal_id) REFERENCES proposals(id)
 );
@@ -185,6 +189,8 @@ CREATE TABLE IF NOT EXISTS proposal_snapshots (
     policy_hash TEXT NOT NULL,
     settings_hash TEXT NOT NULL,
     resource_hash TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
     before_state_json TEXT NOT NULL,
     preview_json TEXT NOT NULL,
     comparison_json TEXT NOT NULL,
@@ -246,6 +252,26 @@ CREATE TABLE IF NOT EXISTS handoffs (
     completed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_nodes (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    parent_task_node_id TEXT,
+    agent_id TEXT,
+    agent_run_id TEXT,
+    handoff_id TEXT,
+    role TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    provider_profile TEXT,
+    provider_name TEXT,
+    correlation_id TEXT,
+    depends_on_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS execution_attempts (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
@@ -271,6 +297,18 @@ CREATE TABLE IF NOT EXISTS provider_health (
     checked_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS provider_configs (
+    provider_name TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    base_url TEXT,
+    generic_http_endpoint TEXT,
+    api_key_env TEXT,
+    default_model TEXT,
+    allowed_hosts_json TEXT NOT NULL DEFAULT '[]',
+    auth_source TEXT NOT NULL DEFAULT 'env',
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS connector_health (
     connector_name TEXT PRIMARY KEY,
     available INTEGER NOT NULL,
@@ -287,6 +325,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_entries_created_at ON audit_entries(created
 CREATE INDEX IF NOT EXISTS idx_proposal_snapshots_proposal ON proposal_snapshots(proposal_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_run_id ON agent_runs(run_id, started_at ASC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_task_nodes_run_id ON task_nodes(run_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_execution_attempts_job_id ON execution_attempts(job_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id, expires_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cli_tokens_user_id ON cli_tokens(user_id, expires_at DESC);
@@ -349,9 +388,12 @@ class Database:
                 "policy_hash": "TEXT",
                 "settings_hash": "TEXT",
                 "resource_hash": "TEXT",
+                "manifest_hash": "TEXT",
                 "correlation_id": "TEXT",
             },
             "action_history": {
+                "provider_name": "TEXT",
+                "manifest_hash": "TEXT",
                 "correlation_id": "TEXT",
             },
             "connector_runs": {
@@ -365,7 +407,12 @@ class Database:
                 "attempt_count": "INTEGER NOT NULL DEFAULT 0",
                 "correlation_id": "TEXT",
                 "approval_id": "TEXT",
+                "manifest_hash": "TEXT",
                 "dead_letter_reason": "TEXT",
+            },
+            "proposal_snapshots": {
+                "manifest_hash": "TEXT NOT NULL DEFAULT ''",
+                "manifest_json": "TEXT NOT NULL DEFAULT '{}'",
             },
         }
         for table_name, columns in migrations.items():
@@ -376,3 +423,42 @@ class Database:
             for column_name, column_type in columns.items():
                 if column_name not in existing:
                     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_nodes (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                parent_task_node_id TEXT,
+                agent_id TEXT,
+                agent_run_id TEXT,
+                handoff_id TEXT,
+                role TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                provider_profile TEXT,
+                provider_name TEXT,
+                correlation_id TEXT,
+                depends_on_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_nodes_run_id ON task_nodes(run_id, created_at ASC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_configs (
+                provider_name TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                base_url TEXT,
+                generic_http_endpoint TEXT,
+                api_key_env TEXT,
+                default_model TEXT,
+                allowed_hosts_json TEXT NOT NULL DEFAULT '[]',
+                auth_source TEXT NOT NULL DEFAULT 'env',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )

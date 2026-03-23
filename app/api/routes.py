@@ -29,7 +29,7 @@ from app.schemas.actions import (
     RiskLevel,
 )
 from app.schemas.auth import SetupRequest
-from app.schemas.providers import ProviderTestRequest
+from app.schemas.providers import ProviderConfigUpdate, ProviderTestRequest
 from app.schemas.settings import SanitizedSettingsExport, SettingsUpdate
 from app.security.auth import (
     login_session,
@@ -227,7 +227,11 @@ def _proposal_preview(container: AppContainer, proposal: ProposalRecord) -> dict
     runtime_payload = container.data_governance_service.materialize_action_payload(proposal.payload)
     preview: dict[str, Any] = {
         "affected_resources": _proposal_resources(proposal),
-        "execution_preview": container.data_governance_service.sanitize_for_history(runtime_payload),
+        "execution_preview": container.data_governance_service.sanitize_for_history(
+            runtime_payload,
+            action_type=proposal.action_type,
+            connector=proposal.connector,
+        ),
         "rollback": _rollback_indicator(proposal),
     }
     if proposal.connector == "filesystem":
@@ -273,14 +277,63 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
     proposals = [proposal for proposal in container.proposal_service.list() if proposal.run_id == run_id]
     agent_runs = container.agent_service.list_run_history(run_id)
     handoffs = container.agent_service.list_handoffs(run_id)
+    task_nodes = container.agent_service.list_task_nodes(run_id)
     connector_runs = [entry for entry in container.history_service.list_connector_runs(limit=200) if entry.run_id == run_id]
     return {
         "summary": summary,
         "proposals": proposals,
         "agent_runs": agent_runs,
         "handoffs": handoffs,
+        "task_nodes": task_nodes,
+        "task_tree": _build_task_tree(task_nodes),
         "connector_runs": connector_runs,
     }
+
+
+def _build_task_tree(task_nodes) -> list[dict[str, Any]]:
+    nodes = {
+        node.id: {
+            "node": node,
+            "children": [],
+            "dependency_titles": [],
+        }
+        for node in task_nodes
+    }
+    for item in nodes.values():
+        item["dependency_titles"] = [
+            nodes[dependency_id]["node"].title
+            for dependency_id in item["node"].depends_on
+            if dependency_id in nodes
+        ]
+    roots: list[dict[str, Any]] = []
+    for item in nodes.values():
+        parent_id = item["node"].parent_task_node_id
+        if parent_id and parent_id in nodes:
+            nodes[parent_id]["children"].append(item)
+        else:
+            roots.append(item)
+    return roots
+
+
+def _provider_profile_usage(settings, provider_name: str) -> list[str]:
+    usage: list[str] = []
+    if settings.provider == provider_name:
+        usage.append("primary")
+    if settings.fallback_provider == provider_name:
+        usage.append("fallback")
+    profile_map = {
+        "summary_profile": settings.summary_profile,
+        "planning_profile": settings.planning_profile,
+        "fast": settings.fast_provider,
+        "cheap": settings.cheap_provider,
+        "strong": settings.strong_provider,
+        "local-only": settings.local_provider,
+        "privacy-preferred": settings.privacy_provider,
+    }
+    for label, selected in profile_map.items():
+        if selected == provider_name:
+            usage.append(label)
+    return usage
 
 
 def _unsafe_warnings(container: AppContainer) -> list[str]:
@@ -304,8 +357,10 @@ def _unsafe_warnings(container: AppContainer) -> list[str]:
         warnings.append("Provider private-network egress is enabled. Local LLM endpoints can receive prompts.")
     if settings.allow_restricted_provider_egress:
         warnings.append("Restricted data egress to remote providers is enabled. Review provider trust carefully.")
-    if container.protected_storage.storage_mode != "dpapi":
-        warnings.append("Sensitive local storage is using plain-local protection. Install pywin32 or choose a stronger host secret store.")
+    if not container.protected_storage.is_strongly_protected:
+        warnings.append("Sensitive local storage is not strongly protected. Install pywin32 for DPAPI or treat this host as development-only.")
+    if settings.allow_insecure_local_storage:
+        warnings.append("Insecure local storage override is enabled. Restricted payload blobs can be written without strong host protection.")
     return warnings
 
 
@@ -321,34 +376,74 @@ def _temporary_settings(
 ):
     settings = container.settings_service.get_effective_settings()
     data = settings.model_dump()
+    provider_configs = {config["provider_name"]: dict(config) for config in data.get("provider_configs", [])}
     if provider_name:
         data["provider"] = provider_name
+        provider_configs.setdefault(provider_name, {"provider_name": provider_name, "enabled": True})
     if model_name:
         data["model"] = model_name
+        if provider_name:
+            provider_configs[provider_name]["default_model"] = model_name
     if base_url is not None:
         data["base_url"] = base_url or None
+        if provider_name:
+            provider_configs[provider_name]["base_url"] = base_url or None
     if api_key_env:
         data["api_key_env"] = api_key_env
+        if provider_name:
+            provider_configs[provider_name]["api_key_env"] = api_key_env
     if generic_http_endpoint is not None:
         data["generic_http_endpoint"] = generic_http_endpoint or None
+        if provider_name:
+            provider_configs[provider_name]["generic_http_endpoint"] = generic_http_endpoint or None
     if provider_timeout_seconds is not None:
         data["provider_timeout_seconds"] = provider_timeout_seconds
+    data["provider_configs"] = list(provider_configs.values())
     return type(settings)(**data)
 
 
 def _settings_page_context(container: AppContainer, *, result=None) -> dict[str, Any]:
     settings = container.settings_service.get_effective_settings()
+    provider_statuses = container.provider_service.list_statuses()
+    provider_status_map = {status.name: status for status in provider_statuses}
+    provider_catalog = [
+        {
+            "status": provider_status_map.get(config.provider_name),
+            "config": config,
+            "usage": _provider_profile_usage(settings, config.provider_name),
+        }
+        for config in settings.provider_configs
+    ]
     return {
         "title": "Settings",
         "settings": settings,
         "protected_storage_mode": container.protected_storage.storage_mode,
-        "providers": container.provider_service.list_statuses(),
+        "protected_storage_posture": container.protected_storage.posture_label,
+        "providers": provider_statuses,
+        "provider_catalog": provider_catalog,
         "unsafe_warnings": _unsafe_warnings(container),
         "audit_status": container.audit_service.verify_integrity(),
         "export_json": json.dumps(
             container.settings_service.export_sanitized().model_dump(mode="json"),
             indent=2,
         ),
+        "windows_operations": [
+            {
+                "title": "Bootstrap runtime",
+                "command": r".\scripts\bootstrap.ps1",
+                "detail": "Creates the LocalAppData-backed runtime directories and installs dependencies.",
+            },
+            {
+                "title": "Register startup task",
+                "command": r".\scripts\install-console-startup-task.ps1",
+                "detail": "Registers a current-user startup task for the localhost console without bundling runtime data into the repo.",
+            },
+            {
+                "title": "Remove startup task",
+                "command": r".\scripts\remove-console-startup-task.ps1",
+                "detail": "Removes the Windows Scheduled Task created for operator startup mode.",
+            },
+        ],
         "result": result,
     }
 
@@ -458,6 +553,7 @@ def dashboard(
     if isinstance(user, RedirectResponse):
         return user
 
+    settings = container.settings_service.get_effective_settings()
     proposals = container.proposal_service.list()
     counts = Counter(proposal.status.value for proposal in proposals)
     pending_by_risk = Counter(
@@ -486,6 +582,8 @@ def dashboard(
         "recent_high_risk": recent_high_risk,
         "providers": container.provider_service.list_statuses(),
         "connectors": container.connector_registry.list_health(),
+        "settings": settings,
+        "protected_storage_posture": container.protected_storage.posture_label,
         "audit_status": audit_status,
         "unsafe_warnings": _unsafe_warnings(container),
         "blocked_count": counts["blocked"],
@@ -824,7 +922,7 @@ def history_page(
         history = [
             entry
             for entry in history
-            if proposals.get(entry.proposal_id) and proposals[entry.proposal_id].provider_name == provider_filter
+            if (entry.provider_name or (proposals.get(entry.proposal_id).provider_name if proposals.get(entry.proposal_id) else None)) == provider_filter
         ]
     if risk_filter:
         history = [entry for entry in history if proposals.get(entry.proposal_id) and proposals[entry.proposal_id].risk_level.value == risk_filter]
@@ -944,6 +1042,7 @@ async def settings_submit(
     enable_system_connector: bool = Form(False),
     enable_outlook_connector: bool = Form(False),
     local_protection_mode: str = Form(...),
+    allow_insecure_local_storage: bool = Form(False),
     history_retention_days: int = Form(...),
     cli_token_ttl_seconds: int = Form(...),
     worker_lease_seconds: int = Form(...),
@@ -997,6 +1096,7 @@ async def settings_submit(
                 enable_system_connector=enable_system_connector,
                 enable_outlook_connector=enable_outlook_connector,
                 local_protection_mode=local_protection_mode,
+                allow_insecure_local_storage=allow_insecure_local_storage,
                 history_retention_days=history_retention_days,
                 cli_token_ttl_seconds=cli_token_ttl_seconds,
                 worker_lease_seconds=worker_lease_seconds,
@@ -1016,11 +1116,88 @@ async def settings_submit(
                 "allow_provider_private_network": allow_provider_private_network,
                 "allow_restricted_provider_egress": allow_restricted_provider_egress,
                 "local_protection_mode": local_protection_mode,
+                "allow_insecure_local_storage": allow_insecure_local_storage,
                 "cli_token_ttl_seconds": cli_token_ttl_seconds,
             },
         )
         return _redirect("/settings", message="Settings saved.")
     except (AuthenticationError, AuthorizationError, CsrfError) as exc:
+        return _redirect("/settings", error=str(exc))
+
+
+@router.post("/settings/provider-config")
+async def provider_config_submit(
+    request: Request,
+    provider_name: str = Form(...),
+    enabled: bool = Form(False),
+    default_model: str | None = Form(None),
+    base_url: str | None = Form(None),
+    generic_http_endpoint: str | None = Form(None),
+    api_key_env: str | None = Form(None),
+    allowed_hosts: str = Form(""),
+    auth_source: str = Form("env"),
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(request, container, user, current_password, "change provider configuration")
+        record = container.settings_service.save_provider_config(
+            ProviderConfigUpdate(
+                provider_name=provider_name,
+                enabled=enabled,
+                default_model=default_model or None,
+                base_url=base_url or None,
+                generic_http_endpoint=generic_http_endpoint or None,
+                api_key_env=api_key_env or None,
+                allowed_hosts=[host.strip() for host in allowed_hosts.split(",") if host.strip()],
+                auth_source=auth_source,
+            ),
+            actor=user.username,
+            reason=f"provider-config:{provider_name}",
+        )
+        container.audit_service.emit(
+            "settings.provider_config_updated",
+            {
+                "actor": user.username,
+                "provider_name": provider_name,
+                "enabled": record.enabled,
+                "allowed_hosts": record.allowed_hosts,
+                "auth_source": record.auth_source,
+            },
+        )
+        return _redirect("/settings", message=f"Provider catalog entry for {provider_name} saved.")
+    except (AuthenticationError, AuthorizationError, CsrfError, ValueError) as exc:
+        return _redirect("/settings", error=str(exc))
+
+
+@router.post("/settings/provider-config/reset")
+async def provider_config_reset(
+    request: Request,
+    provider_name: str = Form(...),
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(request, container, user, current_password, f"reset provider configuration for {provider_name}")
+        container.settings_service.reset_provider_config(
+            provider_name,
+            actor=user.username,
+            reason=f"provider-config-reset:{provider_name}",
+        )
+        container.audit_service.emit(
+            "settings.provider_config_reset",
+            {"actor": user.username, "provider_name": provider_name},
+        )
+        return _redirect("/settings", message=f"Provider catalog entry for {provider_name} reset to defaults.")
+    except (AuthenticationError, AuthorizationError, CsrfError, ValueError, KeyError) as exc:
         return _redirect("/settings", error=str(exc))
 
 

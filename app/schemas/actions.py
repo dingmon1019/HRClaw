@@ -102,6 +102,7 @@ class ApprovalRecord(BaseModel):
     policy_hash: str | None = None
     settings_hash: str | None = None
     resource_hash: str | None = None
+    manifest_hash: str | None = None
     correlation_id: str | None = None
 
 
@@ -113,6 +114,8 @@ class ProposalSnapshotRecord(BaseModel):
     policy_hash: str
     settings_hash: str
     resource_hash: str
+    manifest_hash: str
+    manifest: dict[str, Any] = Field(default_factory=dict)
     before_state: dict[str, Any] = Field(default_factory=dict)
     preview: dict[str, Any] = Field(default_factory=dict)
     comparison_json: dict[str, Any] = Field(default_factory=dict)
@@ -133,6 +136,8 @@ class ActionHistoryRecord(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] | None = None
     error_text: str | None = None
+    provider_name: str | None = None
+    manifest_hash: str | None = None
     correlation_id: str | None = None
 
 
@@ -193,6 +198,7 @@ class ExecutionJobRecord(BaseModel):
     attempt_count: int = 0
     correlation_id: str | None = None
     approval_id: str | None = None
+    manifest_hash: str | None = None
 
 
 class ExecutionAttemptRecord(BaseModel):

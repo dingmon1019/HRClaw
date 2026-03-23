@@ -44,16 +44,15 @@ class ProposalSnapshotService:
         )
         settings_hash = self.settings_service.current_settings_hash()
         resource_hash = sha256_hex(json_dumps(before_state))
-        snapshot_hash = sha256_hex(
-            json_dumps(
-                {
-                    "action_hash": action_hash,
-                    "policy_hash": policy_hash,
-                    "settings_hash": settings_hash,
-                    "resource_hash": resource_hash,
-                }
-            )
+        manifest = self._build_manifest(
+            proposal,
+            action_hash=action_hash,
+            policy_hash=policy_hash,
+            settings_hash=settings_hash,
+            resource_hash=resource_hash,
         )
+        manifest_hash = sha256_hex(json_dumps(manifest))
+        snapshot_hash = manifest_hash
         record = ProposalSnapshotRecord(
             id=new_id("snapshot"),
             proposal_id=proposal.id,
@@ -62,6 +61,8 @@ class ProposalSnapshotService:
             policy_hash=policy_hash,
             settings_hash=settings_hash,
             resource_hash=resource_hash,
+            manifest_hash=manifest_hash,
+            manifest=manifest,
             before_state=before_state,
             preview=preview,
             comparison_json={},
@@ -73,9 +74,10 @@ class ProposalSnapshotService:
             """
             INSERT INTO proposal_snapshots(
                 id, proposal_id, snapshot_hash, action_hash, policy_hash, settings_hash, resource_hash,
+                manifest_hash, manifest_json,
                 before_state_json, preview_json, comparison_json, stale_reason, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -85,6 +87,8 @@ class ProposalSnapshotService:
                 record.policy_hash,
                 record.settings_hash,
                 record.resource_hash,
+                record.manifest_hash,
+                json_dumps(record.manifest),
                 json_dumps(record.before_state),
                 json_dumps(record.preview),
                 json_dumps(record.comparison_json),
@@ -129,6 +133,8 @@ class ProposalSnapshotService:
             "changed_fields": changed_fields,
             "baseline_snapshot_hash": baseline.snapshot_hash,
             "live_snapshot_hash": live.snapshot_hash,
+            "baseline_manifest_hash": baseline.manifest_hash,
+            "live_manifest_hash": live.manifest_hash,
         }
         return {
             "baseline": baseline,
@@ -202,6 +208,8 @@ class ProposalSnapshotService:
             "changed_fields": changed_fields,
             "approval_snapshot_hash": approval.snapshot_hash,
             "live_snapshot_hash": live.snapshot_hash,
+            "approval_manifest_hash": approval.manifest_hash,
+            "live_manifest_hash": live.manifest_hash,
         }
         return {
             "approval": approval,
@@ -225,6 +233,7 @@ class ProposalSnapshotService:
                 approval.policy_hash,
                 approval.settings_hash,
                 approval.resource_hash,
+                approval.manifest_hash,
             ]
         ):
             raise ValueError("Approval record is missing immutable snapshot binding hashes.")
@@ -251,16 +260,15 @@ class ProposalSnapshotService:
         )
         settings_hash = self.settings_service.current_settings_hash()
         resource_hash = sha256_hex(json_dumps(before_state))
-        snapshot_hash = sha256_hex(
-            json_dumps(
-                {
-                    "action_hash": action_hash,
-                    "policy_hash": policy_hash,
-                    "settings_hash": settings_hash,
-                    "resource_hash": resource_hash,
-                }
-            )
+        manifest = self._build_manifest(
+            proposal,
+            action_hash=action_hash,
+            policy_hash=policy_hash,
+            settings_hash=settings_hash,
+            resource_hash=resource_hash,
         )
+        manifest_hash = sha256_hex(json_dumps(manifest))
+        snapshot_hash = manifest_hash
         return ProposalSnapshotRecord(
             id="live",
             proposal_id=proposal.id,
@@ -269,6 +277,8 @@ class ProposalSnapshotService:
             policy_hash=policy_hash,
             settings_hash=settings_hash,
             resource_hash=resource_hash,
+            manifest_hash=manifest_hash,
+            manifest=manifest,
             before_state=before_state,
             preview=preview,
             comparison_json={},
@@ -359,6 +369,28 @@ class ProposalSnapshotService:
         return state, preview
 
     @staticmethod
+    def _build_manifest(
+        proposal: ProposalRecord,
+        *,
+        action_hash: str,
+        policy_hash: str,
+        settings_hash: str,
+        resource_hash: str,
+    ) -> dict[str, Any]:
+        return {
+            "connector": proposal.connector,
+            "action_type": proposal.action_type,
+            "created_by_agent_id": proposal.created_by_agent_id,
+            "created_by_agent_role": proposal.created_by_agent_role,
+            "reviewed_by_agent_id": proposal.reviewed_by_agent_id,
+            "reviewed_by_agent_role": proposal.reviewed_by_agent_role,
+            "action_hash": action_hash,
+            "policy_hash": policy_hash,
+            "settings_hash": settings_hash,
+            "resource_hash": resource_hash,
+        }
+
+    @staticmethod
     def _row_to_record(row) -> ProposalSnapshotRecord:
         return ProposalSnapshotRecord(
             id=row["id"],
@@ -368,6 +400,8 @@ class ProposalSnapshotService:
             policy_hash=row["policy_hash"],
             settings_hash=row["settings_hash"],
             resource_hash=row["resource_hash"],
+            manifest_hash=row["manifest_hash"] or row["snapshot_hash"],
+            manifest=json_loads(row["manifest_json"], {}),
             before_state=json_loads(row["before_state_json"], {}),
             preview=json_loads(row["preview_json"], {}),
             comparison_json=json_loads(row["comparison_json"], {}),

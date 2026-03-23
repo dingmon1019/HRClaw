@@ -78,7 +78,7 @@
         <h2>Action History</h2>
         <table>
             <thead>
-                <tr><th>Action</th><th>Provider</th><th>Status</th><th>Started</th><th>Proposal</th></tr>
+                <tr><th>Action</th><th>Provider</th><th>Status</th><th>Started</th><th>Manifest</th><th>Proposal</th></tr>
             </thead>
             <tbody>
                 {% for entry in history %}
@@ -87,10 +87,11 @@
                     <td>{{ entry.provider_name or "-" }}</td>
                     <td><span class="badge {{ entry.status }}">{{ entry.status }}</span></td>
                     <td>{{ entry.started_at }}</td>
+                    <td>{{ entry.manifest_hash or "-" }}</td>
                     <td><a href="/proposals/{{ entry.proposal_id }}">{{ entry.proposal_id }}</a></td>
                 </tr>
                 {% else %}
-                <tr><td colspan="5" class="muted">No action history matched the current filters.</td></tr>
+                <tr><td colspan="6" class="muted">No action history matched the current filters.</td></tr>
                 {% endfor %}
             </tbody>
         </table>
@@ -139,7 +140,7 @@
         <h2>Execution Jobs</h2>
         <table>
             <thead>
-                <tr><th>Job</th><th>Proposal</th><th>Status</th><th>Queued</th><th>Worker</th></tr>
+                <tr><th>Job</th><th>Proposal</th><th>Status</th><th>Queued</th><th>Worker</th><th>Manifest</th></tr>
             </thead>
             <tbody>
                 {% for job in jobs %}
@@ -149,9 +150,10 @@
                     <td><span class="badge {{ job.status.value }}">{{ job.status.value }}</span></td>
                     <td>{{ job.queued_at }}</td>
                     <td>{{ job.worker_id or "-" }}</td>
+                    <td>{{ job.manifest_hash or "-" }}</td>
                 </tr>
                 {% else %}
-                <tr><td colspan="5" class="muted">No execution jobs yet.</td></tr>
+                <tr><td colspan="6" class="muted">No execution jobs yet.</td></tr>
                 {% endfor %}
             </tbody>
         </table>

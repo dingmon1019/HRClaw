@@ -1,4 +1,19 @@
 {% extends "templates/base.html" %}
+{% macro render_task_branch(branch, depth=0) -%}
+<div class="list-item" style="margin-left: {{ depth * 18 }}px;">
+    <strong>{{ branch.node.title }}</strong>
+    <p>{{ branch.node.role.value }} / {{ branch.node.node_type }} / <span class="badge {{ branch.node.status }}">{{ branch.node.status }}</span></p>
+    <small>
+        {% if branch.node.provider_profile %}profile {{ branch.node.provider_profile }}{% endif %}
+        {% if branch.node.provider_name %} / provider {{ branch.node.provider_name }}{% endif %}
+        {% if branch.dependency_titles %} / depends on {{ branch.dependency_titles | join(", ") }}{% endif %}
+    </small>
+    <pre>{{ branch.node.details | tojson(indent=2) }}</pre>
+</div>
+{% for child in branch.children %}
+{{ render_task_branch(child, depth + 1) }}
+{% endfor %}
+{%- endmacro %}
 {% block content %}
 <section class="card wide">
     <div class="card-header">
@@ -31,12 +46,27 @@
             <div class="metric-row"><span>Proposals</span><strong>{{ proposals|length }}</strong></div>
             <div class="metric-row"><span>Agent Steps</span><strong>{{ agent_runs|length }}</strong></div>
             <div class="metric-row"><span>Handoffs</span><strong>{{ handoffs|length }}</strong></div>
+            <div class="metric-row"><span>Task Nodes</span><strong>{{ task_nodes|length }}</strong></div>
             <div class="metric-row"><span>Connector Collects</span><strong>{{ connector_runs|length }}</strong></div>
         </article>
     </div>
 </section>
 
 <section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h3>Task Graph</h3>
+            <span class="badge ok">{{ task_nodes|length }} nodes</span>
+        </div>
+        <div class="stack">
+            {% for branch in task_tree %}
+            {{ render_task_branch(branch) }}
+            {% else %}
+            <p class="muted">No task graph nodes were stored for this run.</p>
+            {% endfor %}
+        </div>
+    </article>
+
     <article class="card">
         <div class="card-header">
             <h3>Agent Collaboration</h3>
@@ -46,7 +76,7 @@
             {% for step in agent_runs %}
             <div class="list-item">
                 <strong>{{ step.agent_name }}</strong>
-                <p>{{ step.role.value }} / {{ step.status }}</p>
+                <p>{{ step.role.value }} / {{ step.status }} / profile {{ step.provider_profile }}{% if step.provider_name %} / provider {{ step.provider_name }}{% endif %}</p>
                 <small>{{ step.started_at }}{% if step.completed_at %} -> {{ step.completed_at }}{% endif %}</small>
                 {% if step.output %}
                 <pre>{{ step.output | tojson(indent=2) }}</pre>

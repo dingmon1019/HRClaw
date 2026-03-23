@@ -4,7 +4,7 @@ from app.agents.registry import default_agents
 from app.core.database import Database
 from app.core.errors import AuthorizationError, NotFoundError
 from app.core.utils import json_dumps, json_loads, new_id, utcnow_iso
-from app.schemas.agents import AgentDefinition, AgentRole, AgentRunRecord, HandoffRecord
+from app.schemas.agents import AgentDefinition, AgentRole, AgentRunRecord, HandoffRecord, TaskNodeRecord
 
 
 class AgentService:
@@ -186,6 +186,119 @@ class AgentService:
         )
         return [self._row_to_handoff(row) for row in rows]
 
+    def create_task_node(
+        self,
+        run_id: str,
+        *,
+        role: AgentRole,
+        node_type: str,
+        title: str,
+        details: dict,
+        status: str,
+        parent_task_node_id: str | None = None,
+        agent: AgentDefinition | None = None,
+        agent_run_id: str | None = None,
+        handoff_id: str | None = None,
+        provider_profile: str | None = None,
+        provider_name: str | None = None,
+        correlation_id: str | None = None,
+        depends_on: list[str] | None = None,
+    ) -> TaskNodeRecord:
+        record = TaskNodeRecord(
+            id=new_id("tasknode"),
+            run_id=run_id,
+            parent_task_node_id=parent_task_node_id,
+            agent_id=agent.id if agent else None,
+            agent_run_id=agent_run_id,
+            handoff_id=handoff_id,
+            role=role,
+            node_type=node_type,
+            title=title,
+            details=details,
+            status=status,
+            provider_profile=provider_profile or (agent.provider_profile if agent else None),
+            provider_name=provider_name,
+            correlation_id=correlation_id,
+            depends_on=depends_on or [],
+            created_at=utcnow_iso(),
+            completed_at=None,
+        )
+        self.database.execute(
+            """
+            INSERT INTO task_nodes(
+                id, run_id, parent_task_node_id, agent_id, agent_run_id, handoff_id, role, node_type,
+                title, details_json, status, provider_profile, provider_name, correlation_id,
+                depends_on_json, created_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.id,
+                record.run_id,
+                record.parent_task_node_id,
+                record.agent_id,
+                record.agent_run_id,
+                record.handoff_id,
+                record.role.value,
+                record.node_type,
+                record.title,
+                json_dumps(record.details),
+                record.status,
+                record.provider_profile,
+                record.provider_name,
+                record.correlation_id,
+                json_dumps(record.depends_on),
+                record.created_at,
+                record.completed_at,
+            ),
+        )
+        return record
+
+    def complete_task_node(
+        self,
+        task_node_id: str,
+        *,
+        status: str,
+        details: dict | None = None,
+        provider_name: str | None = None,
+        agent_run_id: str | None = None,
+        handoff_id: str | None = None,
+    ) -> TaskNodeRecord:
+        current = self.database.fetch_one("SELECT * FROM task_nodes WHERE id = ?", (task_node_id,))
+        if current is None:
+            raise NotFoundError(f"Task node {task_node_id} was not found.")
+        merged_details = json_loads(current["details_json"], {})
+        if details:
+            merged_details.update(details)
+        completed_at = utcnow_iso()
+        self.database.execute(
+            """
+            UPDATE task_nodes
+            SET status = ?, details_json = ?, provider_name = COALESCE(?, provider_name),
+                agent_run_id = COALESCE(?, agent_run_id), handoff_id = COALESCE(?, handoff_id),
+                completed_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                json_dumps(merged_details),
+                provider_name,
+                agent_run_id,
+                handoff_id,
+                completed_at,
+                task_node_id,
+            ),
+        )
+        row = self.database.fetch_one("SELECT * FROM task_nodes WHERE id = ?", (task_node_id,))
+        return self._row_to_task_node(row)
+
+    def list_task_nodes(self, run_id: str) -> list[TaskNodeRecord]:
+        rows = self.database.fetch_all(
+            "SELECT * FROM task_nodes WHERE run_id = ? ORDER BY created_at ASC",
+            (run_id,),
+        )
+        return [self._row_to_task_node(row) for row in rows]
+
     def recent_runs(self, limit: int = 20) -> list[dict]:
         rows = self.database.fetch_all(
             """
@@ -275,6 +388,28 @@ class AgentService:
             payload=json_loads(row["payload_json"], {}),
             status=row["status"],
             correlation_id=row["correlation_id"],
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+        )
+
+    @staticmethod
+    def _row_to_task_node(row) -> TaskNodeRecord:
+        return TaskNodeRecord(
+            id=row["id"],
+            run_id=row["run_id"],
+            parent_task_node_id=row["parent_task_node_id"],
+            agent_id=row["agent_id"],
+            agent_run_id=row["agent_run_id"],
+            handoff_id=row["handoff_id"],
+            role=row["role"],
+            node_type=row["node_type"],
+            title=row["title"],
+            details=json_loads(row["details_json"], {}),
+            status=row["status"],
+            provider_profile=row["provider_profile"],
+            provider_name=row["provider_name"],
+            correlation_id=row["correlation_id"],
+            depends_on=json_loads(row["depends_on_json"], []),
             created_at=row["created_at"],
             completed_at=row["completed_at"],
         )

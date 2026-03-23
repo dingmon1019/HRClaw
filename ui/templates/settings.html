@@ -127,25 +127,10 @@
                     </label>
                 </div>
 
-                <div class="grid two">
+                <div class="grid one">
                     <label>
-                        Model
+                        Global Default Model
                         <input type="text" name="model" value="{{ settings.model }}">
-                    </label>
-                    <label>
-                        API Key Env
-                        <input type="text" name="api_key_env" value="{{ settings.api_key_env }}">
-                    </label>
-                </div>
-
-                <div class="grid two">
-                    <label>
-                        Base URL
-                        <input type="text" name="base_url" value="{{ settings.base_url or '' }}">
-                    </label>
-                    <label>
-                        Generic HTTP Endpoint
-                        <input type="text" name="generic_http_endpoint" value="{{ settings.generic_http_endpoint or '' }}">
                     </label>
                 </div>
 
@@ -219,6 +204,29 @@
                         <input type="text" name="provider_allowed_hosts" value="{{ settings.provider_allowed_hosts | join(',') }}">
                     </label>
                 </div>
+
+                <details class="panel">
+                    <summary><strong>Legacy Global Provider Defaults</strong> <span class="muted small">Used only when a provider catalog entry leaves the field empty.</span></summary>
+                    <div class="stack form-grid mt-16">
+                        <div class="grid two">
+                            <label>
+                                Legacy API Key Env
+                                <input type="text" name="api_key_env" value="{{ settings.api_key_env }}">
+                            </label>
+                            <label>
+                                Legacy Base URL
+                                <input type="text" name="base_url" value="{{ settings.base_url or '' }}">
+                            </label>
+                        </div>
+
+                        <div class="grid one">
+                            <label>
+                                Legacy Generic HTTP Endpoint
+                                <input type="text" name="generic_http_endpoint" value="{{ settings.generic_http_endpoint or '' }}">
+                            </label>
+                        </div>
+                    </div>
+                </details>
             </div>
 
             <div class="settings-group danger-panel">
@@ -282,15 +290,21 @@
                     </label>
                 </div>
 
-                <div class="grid three">
+                <div class="grid two">
                     <label>
                         Local Protection Mode
                         <select name="local_protection_mode">
-                            {% for value in ["dpapi", "plain-local"] %}
+                            {% for value in ["dpapi", "unprotected-local"] %}
                             <option value="{{ value }}" {% if settings.local_protection_mode == value %}selected{% endif %}>{{ value }}</option>
                             {% endfor %}
                         </select>
                     </label>
+                    <label class="checkbox">
+                        <input type="checkbox" name="allow_insecure_local_storage" value="true" {% if settings.allow_insecure_local_storage %}checked{% endif %}>
+                        Allow insecure local storage fallback
+                    </label>
+                </div>
+                <div class="grid two">
                     <label>
                         History Retention Days
                         <input type="number" min="1" max="3650" name="history_retention_days" value="{{ settings.history_retention_days }}">
@@ -323,12 +337,13 @@
         </div>
 
         <div class="stack">
-            <div class="panel">
-                <h3>Configured Secret Envs</h3>
-                <p>{{ settings.configured_secret_envs | join(', ') if settings.configured_secret_envs else "No secret environment variables detected." }}</p>
-                <p class="small muted">CLI auth mode: {{ settings.cli_auth_mode }}</p>
-                <p class="small muted">Protected local storage mode: {{ protected_storage_mode }}</p>
-            </div>
+                <div class="panel">
+                    <h3>Configured Secret Envs</h3>
+                    <p>{{ settings.configured_secret_envs | join(', ') if settings.configured_secret_envs else "No secret environment variables detected." }}</p>
+                    <p class="small muted">CLI auth mode: {{ settings.cli_auth_mode }}</p>
+                    <p class="small muted">Protected local storage mode: {{ protected_storage_mode }}</p>
+                    <p class="small muted">Storage posture: {{ protected_storage_posture }}</p>
+                </div>
 
             <form method="post" action="/settings/test-provider" class="stack form-grid">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -402,6 +417,126 @@
                 </label>
                 <button type="submit" class="button danger">Reset To Safe Defaults</button>
             </form>
+        </div>
+    </article>
+</section>
+
+<section class="card wide mt-16">
+    <div class="card-header">
+        <div>
+            <h2>Provider Catalog</h2>
+            <p class="muted">Each provider now has its own enabled state, auth source, endpoint, model, and egress host list. These records participate in settings export/hash and are visible to the operator.</p>
+        </div>
+        <span class="badge ok">{{ provider_catalog|length }} providers</span>
+    </div>
+
+    <section class="grid two">
+        {% for entry in provider_catalog %}
+        {% set status = entry.status %}
+        {% set config = entry.config %}
+        <article class="panel">
+            <div class="card-header">
+                <div>
+                    <h3>{{ status.name if status else config.provider_name }}</h3>
+                    <p class="muted">{{ status.description if status else "Provider catalog entry" }}</p>
+                </div>
+                <div class="stack tight align-end">
+                    <span class="badge {{ 'ok' if config.enabled else 'warn' }}">{{ "enabled" if config.enabled else "disabled" }}</span>
+                    {% if status %}
+                    <span class="badge {{ 'ok' if status.configured else 'warn' }}">{{ "configured" if status.configured else "not configured" }}</span>
+                    <span class="badge {{ 'danger' if status.circuit_open else 'ok' }}">{{ "circuit open" if status.circuit_open else "ready" }}</span>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="stack tight">
+                <div class="metric-row">
+                    <span>Used By</span>
+                    <strong>{{ entry.usage | join(', ') if entry.usage else "not currently selected" }}</strong>
+                </div>
+                <div class="metric-row">
+                    <span>Capabilities</span>
+                    <strong>{{ status.capabilities | join(', ') if status else "-" }}</strong>
+                </div>
+                <div class="metric-row">
+                    <span>Allowed Destinations</span>
+                    <strong>{{ config.allowed_hosts | join(', ') if config.allowed_hosts else "inherits global allowlist" }}</strong>
+                </div>
+            </div>
+
+            <form method="post" action="/settings/provider-config" class="stack form-grid mt-16">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="provider_name" value="{{ config.provider_name }}">
+                <div class="grid two">
+                    <label class="checkbox">
+                        <input type="checkbox" name="enabled" value="true" {% if config.enabled %}checked{% endif %}>
+                        Enable provider
+                    </label>
+                    <label>
+                        Auth Source
+                        <select name="auth_source">
+                            <option value="env" {% if config.auth_source == "env" %}selected{% endif %}>env</option>
+                        </select>
+                    </label>
+                </div>
+                <div class="grid two">
+                    <label>
+                        Default Model
+                        <input type="text" name="default_model" value="{{ config.default_model or '' }}">
+                    </label>
+                    <label>
+                        API Key Env
+                        <input type="text" name="api_key_env" value="{{ config.api_key_env or '' }}">
+                    </label>
+                </div>
+                <div class="grid two">
+                    <label>
+                        Base URL
+                        <input type="text" name="base_url" value="{{ config.base_url or '' }}">
+                    </label>
+                    <label>
+                        Generic HTTP Endpoint
+                        <input type="text" name="generic_http_endpoint" value="{{ config.generic_http_endpoint or '' }}">
+                    </label>
+                </div>
+                <label>
+                    Allowed Hosts
+                    <input type="text" name="allowed_hosts" value="{{ config.allowed_hosts | join(',') }}">
+                </label>
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                </label>
+                <div class="actions">
+                    <button type="submit" class="button ghost">Save Provider Entry</button>
+                </div>
+            </form>
+
+            <form method="post" action="/settings/provider-config/reset" class="stack form-grid mt-16" data-confirm="Reset this provider entry to defaults?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="provider_name" value="{{ config.provider_name }}">
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                </label>
+                <div class="actions">
+                    <button type="submit" class="button danger">Reset Provider Entry</button>
+                </div>
+            </form>
+        </article>
+        {% endfor %}
+    </section>
+
+    <article class="panel mt-16">
+        <h3>Windows Operations</h3>
+        <div class="stack">
+            {% for item in windows_operations %}
+            <div class="list-item">
+                <strong>{{ item.title }}</strong>
+                <p>{{ item.detail }}</p>
+                <small><code>{{ item.command }}</code></small>
+            </div>
+            {% endfor %}
         </div>
     </article>
 </section>

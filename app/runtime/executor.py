@@ -38,6 +38,7 @@ class ExecutionDispatcher:
         proposal_id: str,
         *,
         approval_id: str | None,
+        expected_manifest_hash: str | None = None,
         executor_agent: AgentDefinition | None = None,
     ) -> dict:
         proposal = self.proposal_service.get(proposal_id)
@@ -49,13 +50,21 @@ class ExecutionDispatcher:
         approval = self.proposal_service.get_approval(approval_id)
         if approval.proposal_id != proposal.id:
             raise ValueError("Execution job approval binding does not match the queued proposal.")
+        if expected_manifest_hash and approval.manifest_hash != expected_manifest_hash:
+            raise ValueError("Execution job manifest binding does not match the approved manifest.")
         runtime_payload = self.data_governance_service.materialize_action_payload(proposal.payload)
         history_id = self.history_service.log_action_start(
             proposal_id=proposal.id,
             run_id=proposal.run_id,
             connector=proposal.connector,
             action_type=proposal.action_type,
-            payload=proposal.payload,
+            payload=self.data_governance_service.sanitize_for_history(
+                proposal.payload,
+                action_type=proposal.action_type,
+                connector=proposal.connector,
+            ),
+            provider_name=proposal.provider_name,
+            manifest_hash=approval.manifest_hash,
             correlation_id=proposal.correlation_id,
         )
         try:
@@ -65,7 +74,11 @@ class ExecutionDispatcher:
                 proposal.action_type,
                 runtime_payload,
             )
-            safe_result = self.data_governance_service.sanitize_for_history(result)
+            safe_result = self.data_governance_service.sanitize_for_history(
+                result,
+                action_type=proposal.action_type,
+                connector=proposal.connector,
+            )
             self.history_service.log_action_end(history_id, "executed", output=safe_result)
             self.proposal_service.set_execution_status(proposal.id, ProposalStatus.EXECUTED)
             self.audit_service.emit(
@@ -75,6 +88,7 @@ class ExecutionDispatcher:
                     "action_type": proposal.action_type,
                     "result": safe_result,
                     "approval_id": approval.id,
+                    "manifest_hash": approval.manifest_hash,
                     "correlation_id": proposal.correlation_id,
                 },
             )
@@ -90,6 +104,7 @@ class ExecutionDispatcher:
                     "action_type": proposal.action_type,
                     "error": str(exc),
                     "approval_id": approval_id,
+                    "manifest_hash": approval.manifest_hash,
                     "correlation_id": proposal.correlation_id,
                 },
             )
@@ -104,6 +119,7 @@ class ExecutionDispatcher:
                     "action_type": proposal.action_type,
                     "error": str(exc),
                     "approval_id": approval_id,
+                    "manifest_hash": approval.manifest_hash,
                     "correlation_id": proposal.correlation_id,
                 },
             )

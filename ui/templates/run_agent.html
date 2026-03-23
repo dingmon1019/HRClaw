@@ -44,6 +44,36 @@
         </article>
     </div>
 
+    <div class="grid three mt-16">
+        <article class="panel">
+            <h3>What You Will See Next</h3>
+            <ul class="flat-list">
+                <li>Interpreted intent and task decomposition</li>
+                <li>Risk summary and approval requirements</li>
+                <li>Planner proposals with affected resources</li>
+                <li>Reviewer policy and egress notes</li>
+            </ul>
+        </article>
+        <article class="panel">
+            <h3>Agent Participation</h3>
+            <ul class="flat-list">
+                <li>Supervisor: objective decomposition</li>
+                <li>Planner: bounded actions and previews</li>
+                <li>Reviewer: risk and egress gating</li>
+                <li>Reporter: operator-facing summary</li>
+            </ul>
+        </article>
+        <article class="panel">
+            <h3>Expected Outputs</h3>
+            <ul class="flat-list">
+                <li>Typed proposals, not blind execution</li>
+                <li>Manifest-bound approvals for risky steps</li>
+                <li>Worker execution only after approval</li>
+                <li>History, audit, and task graph trace</li>
+            </ul>
+        </article>
+    </div>
+
     <form method="post" action="/run" class="stack form-grid mt-16">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label>
@@ -51,25 +81,25 @@
             <textarea name="objective" rows="5" placeholder="Example: Review the files in notes\\, summarize the work, then propose a safe update to workspace\\report.txt and show me what would change before anything runs." required></textarea>
         </label>
 
-        <div class="grid two">
-            <label>
-                Filesystem Target
-                <input type="text" name="filesystem_path" placeholder="Relative paths resolve inside {{ settings.workspace_root }}">
-            </label>
-            <label>
-                Provider Override
-                <select name="provider_name">
-                    <option value="">Default ({{ settings.provider }})</option>
-                    {% for provider in providers %}
-                    <option value="{{ provider.name }}">{{ provider.name }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-        </div>
-
         <details class="panel">
             <summary><strong>Expert Inputs</strong> <span class="muted small">Optional structured hints for the planner</span></summary>
             <div class="stack form-grid mt-16">
+                <div class="grid two">
+                    <label>
+                        Filesystem Target
+                        <input type="text" name="filesystem_path" placeholder="Relative paths resolve inside {{ settings.workspace_root }}">
+                    </label>
+                    <label>
+                        Provider Override
+                        <select name="provider_name">
+                            <option value="">Default ({{ settings.provider }})</option>
+                            {% for provider in providers %}
+                            <option value="{{ provider.name }}">{{ provider.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
+
                 <label>
                     File Content
                     <textarea name="file_content" rows="4" placeholder="If set, the planner will propose a bounded file write or append action."></textarea>

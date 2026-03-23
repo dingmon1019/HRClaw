@@ -24,7 +24,8 @@ Implemented:
 - session age enforcement
 - idle timeout enforcement
 - recent re-authentication window for sensitive actions
-- short-lived CLI authentication tokens issued only after password verification for dangerous CLI operations
+- interactive short-lived CLI authentication for dangerous CLI operations
+- Python-side secure password prompts for worker and approval CLI flows
 
 Sensitive actions requiring recent re-auth:
 
@@ -51,6 +52,7 @@ Implemented:
 
 Approvals are bound to a stored snapshot containing:
 
+- execution manifest hash
 - action payload hash
 - policy hash
 - settings hash
@@ -115,9 +117,11 @@ DB audit remains enabled even when JSON file mirroring is disabled.
 
 ## Sensitive Local Storage
 
-When a proposal payload includes sensitive text fields such as file content or HTTP request bodies, the runtime stores only digests and previews in the main proposal row. Full raw values are externalized into protected local blob storage under the secrets runtime directory.
+When a proposal payload includes sensitive fields such as file content, HTTP bodies, headers, or task details, the runtime stores only digests and metadata in the main proposal row. Full raw values are externalized into protected local blob storage under the secrets runtime directory.
 
-On Windows with `pywin32` available, DPAPI protection is used. Without it, the runtime falls back to plain local storage and the UI warns about that weaker mode.
+On Windows with `pywin32` available, DPAPI protection is used. Without it, the runtime reports `unprotected-local` posture and sensitive blob writes fail closed unless the operator explicitly enables insecure local storage override for development.
+
+Session secrets, provider auth env references, and protected token files all live under the runtime secrets directory outside the repository by default.
 
 ## Remaining Limits
 

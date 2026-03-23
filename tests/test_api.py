@@ -69,3 +69,20 @@ def test_api_provider_list_after_login(authenticated_client, auth_headers):
     assert response.status_code == 200
     names = {item["name"] for item in response.json()}
     assert "mock" in names
+
+
+def test_run_page_uses_assistant_first_copy(authenticated_client):
+    response = authenticated_client.get("/run", headers={"accept": "text/html"})
+
+    assert response.status_code == 200
+    assert "Ask The Agent" in response.text
+    assert "Expert Inputs" in response.text
+    assert "What You Will See Next" in response.text
+
+
+def test_settings_page_shows_provider_catalog_and_windows_ops(authenticated_client):
+    response = authenticated_client.get("/settings", headers={"accept": "text/html"})
+
+    assert response.status_code == 200
+    assert "Provider Catalog" in response.text
+    assert "Windows Operations" in response.text

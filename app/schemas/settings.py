@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from app.schemas.actions import RuntimeMode
+from app.schemas.providers import ProviderConfigRecord
 
 
 class EffectiveSettings(BaseModel):
@@ -23,6 +24,7 @@ class EffectiveSettings(BaseModel):
     provider_max_retries: int
     provider_circuit_breaker_threshold: int
     provider_circuit_breaker_seconds: int
+    provider_configs: list[ProviderConfigRecord] = Field(default_factory=list)
     summary_profile: str
     planning_profile: str
     fast_provider: str | None = None
@@ -51,8 +53,9 @@ class EffectiveSettings(BaseModel):
     enable_outlook_connector: bool = False
     enable_system_connector: bool = True
     configured_secret_envs: list[str] = Field(default_factory=list)
-    cli_auth_mode: str = "short-lived-password-issued"
+    cli_auth_mode: str = "interactive-short-lived"
     local_protection_mode: str = "dpapi"
+    allow_insecure_local_storage: bool = False
     history_retention_days: int = 30
     cli_token_ttl_seconds: int = 900
     worker_lease_seconds: int = 45
@@ -98,6 +101,7 @@ class SettingsUpdate(BaseModel):
     enable_system_connector: bool
     enable_outlook_connector: bool
     local_protection_mode: str | None = None
+    allow_insecure_local_storage: bool | None = None
     history_retention_days: int | None = None
     cli_token_ttl_seconds: int | None = None
     worker_lease_seconds: int
@@ -117,6 +121,7 @@ class SanitizedSettingsExport(BaseModel):
     provider_max_retries: int
     provider_circuit_breaker_threshold: int
     provider_circuit_breaker_seconds: int
+    provider_configs: list[ProviderConfigRecord] = Field(default_factory=list)
     summary_profile: str
     planning_profile: str
     fast_provider: str | None = None
@@ -144,6 +149,7 @@ class SanitizedSettingsExport(BaseModel):
     enable_system_connector: bool
     enable_outlook_connector: bool
     local_protection_mode: str
+    allow_insecure_local_storage: bool
     history_retention_days: int
     cli_token_ttl_seconds: int
     worker_lease_seconds: int

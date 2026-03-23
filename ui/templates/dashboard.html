@@ -60,6 +60,28 @@
             {% endfor %}
         </div>
     </article>
+
+    <article class="card">
+        <h2>Windows Runtime Posture</h2>
+        <div class="stack">
+            <div class="metric-row">
+                <span>Protection</span>
+                <strong>{{ protected_storage_posture }}</strong>
+            </div>
+            <div class="metric-row">
+                <span>Runtime Root</span>
+                <strong>{{ settings.runtime_state_root }}</strong>
+            </div>
+            <div class="metric-row">
+                <span>Workspace</span>
+                <strong>{{ settings.workspace_root }}</strong>
+            </div>
+            <div class="metric-row">
+                <span>Startup Script</span>
+                <strong>scripts/install-console-startup-task.ps1</strong>
+            </div>
+        </div>
+    </article>
 </section>
 
 {% if unsafe_warnings %}

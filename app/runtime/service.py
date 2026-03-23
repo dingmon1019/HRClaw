@@ -31,6 +31,7 @@ class AgentRuntimeService:
             proposal.run_id,
             decision.actor,
             approval_id=approval.id,
+            manifest_hash=approval.manifest_hash,
             correlation_id=proposal.correlation_id,
         )
         self.proposal_service.set_execution_status(proposal_id, ProposalStatus.QUEUED)
@@ -45,6 +46,7 @@ class AgentRuntimeService:
                 "policy_hash": approval.policy_hash,
                 "settings_hash": approval.settings_hash,
                 "resource_hash": approval.resource_hash,
+                "manifest_hash": approval.manifest_hash,
                 "correlation_id": proposal.correlation_id,
             },
         )
@@ -55,6 +57,7 @@ class AgentRuntimeService:
                 "job_id": job.id,
                 "queued_by": decision.actor,
                 "approval_id": approval.id,
+                "manifest_hash": approval.manifest_hash,
                 "correlation_id": proposal.correlation_id,
             },
         )

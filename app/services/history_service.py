@@ -16,6 +16,8 @@ class HistoryService:
         connector: str,
         action_type: str,
         payload: dict,
+        provider_name: str | None = None,
+        manifest_hash: str | None = None,
         correlation_id: str | None = None,
     ) -> str:
         history_id = new_id("history")
@@ -23,9 +25,9 @@ class HistoryService:
             """
             INSERT INTO action_history(
                 id, proposal_id, run_id, connector, action_type, status,
-                started_at, completed_at, input_json, output_json, error_text, correlation_id
+                started_at, completed_at, input_json, output_json, error_text, provider_name, manifest_hash, correlation_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 history_id,
@@ -39,6 +41,8 @@ class HistoryService:
                 json_dumps(payload),
                 None,
                 None,
+                provider_name,
+                manifest_hash,
                 correlation_id,
             ),
         )
@@ -78,6 +82,8 @@ class HistoryService:
                 input=json_loads(row["input_json"], {}),
                 output=json_loads(row["output_json"], None),
                 error_text=row["error_text"],
+                provider_name=row["provider_name"],
+                manifest_hash=row["manifest_hash"],
                 correlation_id=row["correlation_id"],
             )
             for row in rows

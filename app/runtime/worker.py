@@ -63,6 +63,7 @@ class ExecutionWorker:
             result = self.dispatcher.execute_approved(
                 job.proposal_id,
                 approval_id=job.approval_id,
+                expected_manifest_hash=job.manifest_hash,
                 executor_agent=executor_agent,
             )
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.EXECUTED, result=result)
@@ -79,6 +80,7 @@ class ExecutionWorker:
                     "attempt_id": attempt.id,
                     "proposal_id": job.proposal_id,
                     "worker_id": self.worker_id,
+                    "manifest_hash": job.manifest_hash,
                     "correlation_id": job.correlation_id,
                 },
             )
@@ -98,6 +100,7 @@ class ExecutionWorker:
                     "attempt_id": attempt.id,
                     "proposal_id": job.proposal_id,
                     "error": str(exc),
+                    "manifest_hash": job.manifest_hash,
                     "correlation_id": job.correlation_id,
                 },
             )
@@ -117,6 +120,7 @@ class ExecutionWorker:
                     "attempt_id": attempt.id,
                     "proposal_id": job.proposal_id,
                     "error": str(exc),
+                    "manifest_hash": job.manifest_hash,
                     "correlation_id": job.correlation_id,
                 },
             )

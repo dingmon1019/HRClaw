@@ -22,9 +22,46 @@ Runtime state belongs under the Windows local application data area by default:
 Before publishing:
 
 1. Run the test suite.
-2. Verify `git status` does not include secrets or runtime state.
-3. Confirm docs match the shipped behavior.
-4. Confirm provider credentials are referenced only by environment-variable names.
-5. Confirm worker startup instructions do not recreate repo-local state.
+2. Build the release archive with `.\scripts\package-release.ps1 -Version <tag> -VerifyWorkingTree -Clean`.
+3. Verify `git status` does not include secrets or runtime state.
+4. Confirm docs match the shipped behavior.
+5. Confirm provider credentials are referenced only by environment-variable names.
+6. Confirm worker startup instructions do not recreate repo-local state.
+
+The release packager uses an allowlist and verifies the output archive. It does not zip the working tree blindly. A clean archive also includes `release_manifest.json` with:
+
+- build time (UTC)
+- included relative paths
+- excluded path policy
+- git revision when available
+
+CI-oriented packaging is supported:
+
+```powershell
+.\scripts\package-release.ps1 -Version <tag> -CI
+```
+
+Existing archives can be re-verified:
+
+```powershell
+.\scripts\package-release.ps1 -VerifyArchive .\dist\win-agent-runtime-<tag>.zip
+```
+
+If your local repo still contains ignored caches or legacy repo-scoped runtime folders, clean them before using `-VerifyWorkingTree`:
+
+```powershell
+.\scripts\clean-local-artifacts.ps1
+```
+
+Forbidden content for release archives includes:
+
+- `.git`
+- `.venv`
+- `.codex-pkgs`
+- `.pytest_cache`
+- `data/`
+- `runtime_workspace/`
+- `workspace/`
+- runtime DBs, audit logs, session secrets, and protected blob files
 
 This project is safer than a basic localhost agent wrapper, but it is still not an OS-level sandbox release. Release notes should stay honest about that boundary.

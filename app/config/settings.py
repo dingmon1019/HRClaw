@@ -47,6 +47,7 @@ class AppSettings(BaseSettings):
     workspace_root: Path = Path("workspace")
     protected_blob_dir: Path = Path("protected_blobs")
     local_protection_mode: str = "dpapi"
+    allow_insecure_local_storage: bool = False
     history_retention_days: int = Field(default=30, ge=1, le=3650)
 
     runtime_mode: str = "safe"

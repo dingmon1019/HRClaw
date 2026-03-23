@@ -34,6 +34,8 @@ class ProposalService:
             proposal.payload,
             classification=proposal.data_classification,
             purpose=f"proposal:{proposal.action_type}",
+            action_type=proposal.action_type,
+            connector=proposal.connector,
         )
         proposal = proposal.model_copy(update={"payload": protected_payload})
         proposal_id = new_id("proposal")
@@ -161,6 +163,7 @@ class ProposalService:
                 policy_hash=row["policy_hash"],
                 settings_hash=row["settings_hash"],
                 resource_hash=row["resource_hash"],
+                manifest_hash=row["manifest_hash"],
                 correlation_id=row["correlation_id"],
             )
             for row in rows
@@ -186,6 +189,7 @@ class ProposalService:
             policy_hash=row["policy_hash"],
             settings_hash=row["settings_hash"],
             resource_hash=row["resource_hash"],
+            manifest_hash=row["manifest_hash"],
             correlation_id=row["correlation_id"],
         )
 
@@ -201,9 +205,9 @@ class ProposalService:
             """
             INSERT INTO approvals(
                 id, proposal_id, decision, actor, reason, snapshot_hash, action_hash,
-                policy_hash, settings_hash, resource_hash, correlation_id, created_at
+                policy_hash, settings_hash, resource_hash, manifest_hash, correlation_id, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id("approval"),
@@ -216,6 +220,7 @@ class ProposalService:
                 snapshot.policy_hash if snapshot else None,
                 snapshot.settings_hash if snapshot else None,
                 snapshot.resource_hash if snapshot else None,
+                snapshot.manifest_hash if snapshot else None,
                 self.get(proposal_id).correlation_id,
                 utcnow_iso(),
             ),

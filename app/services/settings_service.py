@@ -5,8 +5,9 @@ from typing import Any
 
 from app.config.settings import AppSettings
 from app.core.database import Database
-from app.core.utils import json_dumps, new_id, sha256_hex, split_csv, utcnow_iso
+from app.core.utils import json_dumps, json_loads, new_id, sha256_hex, split_csv, utcnow_iso
 from app.schemas.actions import RuntimeMode
+from app.schemas.providers import ProviderConfigRecord, ProviderConfigUpdate
 from app.schemas.settings import EffectiveSettings, SanitizedSettingsExport, SettingsUpdate
 
 
@@ -17,6 +18,7 @@ class SettingsService:
 
     def get_effective_settings(self) -> EffectiveSettings:
         overrides = self._load_override_map()
+        provider_configs = self._load_provider_configs(overrides)
         runtime_mode = RuntimeMode(overrides.get("runtime_mode", self.base_settings.runtime_mode))
         configured_secret_envs = [
             env_name
@@ -24,6 +26,7 @@ class SettingsService:
                 overrides.get("api_key_env", self.base_settings.api_key_env),
                 self.base_settings.anthropic_api_key_env,
                 self.base_settings.gemini_api_key_env,
+                *[config.api_key_env for config in provider_configs if config.api_key_env],
             }
             if env_name and os.getenv(env_name)
         ]
@@ -62,6 +65,7 @@ class SettingsService:
                     self.base_settings.provider_circuit_breaker_seconds,
                 )
             ),
+            provider_configs=provider_configs,
             summary_profile=overrides.get("summary_profile", self.base_settings.summary_profile),
             planning_profile=overrides.get("planning_profile", self.base_settings.planning_profile),
             fast_provider=overrides.get("fast_provider", self.base_settings.fast_provider),
@@ -137,8 +141,16 @@ class SettingsService:
                 overrides.get("enable_system_connector", self.base_settings.enable_system_connector)
             ),
             configured_secret_envs=sorted(configured_secret_envs),
-            cli_auth_mode="short-lived-password-issued",
-            local_protection_mode=overrides.get("local_protection_mode", self.base_settings.local_protection_mode),
+            cli_auth_mode="interactive-short-lived",
+            local_protection_mode=self._normalize_protection_mode(
+                overrides.get("local_protection_mode", self.base_settings.local_protection_mode)
+            ),
+            allow_insecure_local_storage=self._parse_bool(
+                overrides.get(
+                    "allow_insecure_local_storage",
+                    self.base_settings.allow_insecure_local_storage,
+                )
+            ),
             history_retention_days=int(
                 overrides.get("history_retention_days", self.base_settings.history_retention_days)
             ),
@@ -158,6 +170,8 @@ class SettingsService:
         update: SettingsUpdate,
         actor: str = "system",
         reason: str | None = None,
+        *,
+        record_version: bool = True,
     ) -> EffectiveSettings:
         payload: dict[str, Any] = update.model_dump()
         updated_at = utcnow_iso()
@@ -174,21 +188,8 @@ class SettingsService:
                 (key, str(serialized), updated_at),
             )
         effective = self.get_effective_settings()
-        export = self.export_sanitized()
-        self.database.execute(
-            """
-            INSERT INTO settings_versions(id, settings_hash, settings_json, actor, reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                new_id("settings"),
-                self.hash_export(export),
-                json_dumps(export.model_dump(mode="json")),
-                actor,
-                reason,
-                updated_at,
-            ),
-        )
+        if record_version:
+            self._record_settings_version(actor=actor, reason=reason, created_at=updated_at)
         return effective
 
     def list_raw_settings(self) -> dict[str, str]:
@@ -209,6 +210,10 @@ class SettingsService:
             provider_max_retries=settings.provider_max_retries,
             provider_circuit_breaker_threshold=settings.provider_circuit_breaker_threshold,
             provider_circuit_breaker_seconds=settings.provider_circuit_breaker_seconds,
+            provider_configs=[
+                config.model_copy(update={"updated_at": None})
+                for config in settings.provider_configs
+            ],
             summary_profile=settings.summary_profile,
             planning_profile=settings.planning_profile,
             fast_provider=settings.fast_provider,
@@ -236,6 +241,7 @@ class SettingsService:
             enable_system_connector=settings.enable_system_connector,
             enable_outlook_connector=settings.enable_outlook_connector,
             local_protection_mode=settings.local_protection_mode,
+            allow_insecure_local_storage=settings.allow_insecure_local_storage,
             history_retention_days=settings.history_retention_days,
             cli_token_ttl_seconds=settings.cli_token_ttl_seconds,
             worker_lease_seconds=settings.worker_lease_seconds,
@@ -248,7 +254,7 @@ class SettingsService:
         actor: str = "system",
         reason: str | None = None,
     ) -> EffectiveSettings:
-        return self.save(
+        effective = self.save(
             SettingsUpdate(
                 runtime_mode=exported.runtime_mode,
                 provider=exported.provider,
@@ -288,6 +294,7 @@ class SettingsService:
                 enable_system_connector=exported.enable_system_connector,
                 enable_outlook_connector=exported.enable_outlook_connector,
                 local_protection_mode=exported.local_protection_mode,
+                allow_insecure_local_storage=exported.allow_insecure_local_storage,
                 history_retention_days=exported.history_retention_days,
                 cli_token_ttl_seconds=exported.cli_token_ttl_seconds,
                 worker_lease_seconds=exported.worker_lease_seconds,
@@ -295,14 +302,25 @@ class SettingsService:
             ),
             actor=actor,
             reason=reason,
+            record_version=False,
         )
+        self.database.execute("DELETE FROM provider_configs")
+        for record in exported.provider_configs:
+            self._save_provider_config_record(
+                ProviderConfigUpdate(**record.model_dump(mode="json")),
+                actor=actor,
+                reason=reason,
+                record_version=False,
+            )
+        self._record_settings_version(actor=actor, reason=reason)
+        return effective
 
     def reset_to_safe_defaults(
         self,
         actor: str = "system",
         reason: str | None = None,
     ) -> EffectiveSettings:
-        return self.save(
+        effective = self.save(
             SettingsUpdate(
                 runtime_mode=RuntimeMode.SAFE,
                 provider=self.base_settings.provider,
@@ -342,6 +360,7 @@ class SettingsService:
                 enable_system_connector=self.base_settings.enable_system_connector,
                 enable_outlook_connector=False,
                 local_protection_mode=self.base_settings.local_protection_mode,
+                allow_insecure_local_storage=self.base_settings.allow_insecure_local_storage,
                 history_retention_days=self.base_settings.history_retention_days,
                 cli_token_ttl_seconds=self.base_settings.cli_token_ttl_seconds,
                 worker_lease_seconds=self.base_settings.worker_lease_seconds,
@@ -349,7 +368,11 @@ class SettingsService:
             ),
             actor=actor,
             reason=reason,
+            record_version=False,
         )
+        self.database.execute("DELETE FROM provider_configs")
+        self._record_settings_version(actor=actor, reason=reason)
+        return effective
 
     def current_settings_hash(self) -> str:
         return self.hash_export(self.export_sanitized())
@@ -358,9 +381,199 @@ class SettingsService:
     def hash_export(exported: SanitizedSettingsExport) -> str:
         return sha256_hex(json_dumps(exported.model_dump(mode="json")))
 
+    def list_provider_configs(self) -> list[ProviderConfigRecord]:
+        return self.get_effective_settings().provider_configs
+
+    def get_provider_config(self, provider_name: str) -> ProviderConfigRecord:
+        for record in self.list_provider_configs():
+            if record.provider_name == provider_name:
+                return record
+        raise KeyError(f"Unknown provider config: {provider_name}")
+
+    def save_provider_config(
+        self,
+        update: ProviderConfigUpdate,
+        *,
+        actor: str = "system",
+        reason: str | None = None,
+    ) -> ProviderConfigRecord:
+        record = self._save_provider_config_record(update, actor=actor, reason=reason, record_version=False)
+        self._record_settings_version(actor=actor, reason=reason)
+        return record
+
+    def reset_provider_config(
+        self,
+        provider_name: str,
+        *,
+        actor: str = "system",
+        reason: str | None = None,
+    ) -> ProviderConfigRecord:
+        self.database.execute("DELETE FROM provider_configs WHERE provider_name = ?", (provider_name,))
+        self._record_settings_version(actor=actor, reason=reason)
+        return self.get_provider_config(provider_name)
+
     def _load_override_map(self) -> dict[str, str]:
         rows = self.database.fetch_all("SELECT key, value FROM settings ORDER BY key")
         return {row["key"]: row["value"] for row in rows}
+
+    def _load_provider_configs(self, overrides: dict[str, str]) -> list[ProviderConfigRecord]:
+        rows = self.database.fetch_all("SELECT * FROM provider_configs ORDER BY provider_name")
+        row_map = {row["provider_name"]: row for row in rows}
+        provider_names = ["mock", "openai", "openai-compatible", "generic-http", "anthropic", "gemini"]
+        return [self._provider_config_from_row(name, row_map.get(name), overrides) for name in provider_names]
+
+    def _provider_config_from_row(
+        self,
+        provider_name: str,
+        row,
+        overrides: dict[str, str],
+    ) -> ProviderConfigRecord:
+        defaults = self._default_provider_config(provider_name, overrides)
+        if row is None:
+            return defaults
+        return ProviderConfigRecord(
+            provider_name=provider_name,
+            enabled=bool(row["enabled"]),
+            base_url=row["base_url"] or defaults.base_url,
+            generic_http_endpoint=row["generic_http_endpoint"] or defaults.generic_http_endpoint,
+            api_key_env=row["api_key_env"] or defaults.api_key_env,
+            default_model=row["default_model"] or defaults.default_model,
+            allowed_hosts=json_loads(row["allowed_hosts_json"], defaults.allowed_hosts),
+            auth_source=row["auth_source"] or defaults.auth_source,
+            updated_at=row["updated_at"],
+        )
+
+    def _default_provider_config(self, provider_name: str, overrides: dict[str, str]) -> ProviderConfigRecord:
+        shared_hosts = split_csv(
+            overrides.get("provider_allowed_hosts", self.base_settings.provider_allowed_hosts)
+        )
+        base_url = overrides.get("base_url", self.base_settings.base_url)
+        generic_http_endpoint = overrides.get(
+            "generic_http_endpoint",
+            self.base_settings.generic_http_endpoint,
+        )
+        model = overrides.get("model", self.base_settings.model)
+        api_key_env = overrides.get("api_key_env", self.base_settings.api_key_env)
+        provider_defaults: dict[str, dict[str, Any]] = {
+            "mock": {
+                "enabled": True,
+                "default_model": "mock-model",
+                "allowed_hosts": [],
+                "api_key_env": None,
+            },
+            "openai": {
+                "enabled": True,
+                "base_url": base_url,
+                "api_key_env": api_key_env,
+                "default_model": model,
+                "allowed_hosts": shared_hosts,
+            },
+            "openai-compatible": {
+                "enabled": True,
+                "base_url": base_url,
+                "api_key_env": api_key_env,
+                "default_model": model,
+                "allowed_hosts": shared_hosts,
+            },
+            "generic-http": {
+                "enabled": True,
+                "base_url": base_url,
+                "generic_http_endpoint": generic_http_endpoint,
+                "api_key_env": api_key_env,
+                "default_model": model,
+                "allowed_hosts": shared_hosts,
+            },
+            "anthropic": {
+                "enabled": True,
+                "api_key_env": self.base_settings.anthropic_api_key_env,
+                "default_model": model,
+                "allowed_hosts": shared_hosts,
+            },
+            "gemini": {
+                "enabled": True,
+                "api_key_env": self.base_settings.gemini_api_key_env,
+                "default_model": model,
+                "allowed_hosts": shared_hosts,
+            },
+        }
+        merged = provider_defaults.get(provider_name, {"enabled": True, "allowed_hosts": shared_hosts})
+        return ProviderConfigRecord(
+            provider_name=provider_name,
+            enabled=bool(merged.get("enabled", True)),
+            base_url=merged.get("base_url"),
+            generic_http_endpoint=merged.get("generic_http_endpoint"),
+            api_key_env=merged.get("api_key_env"),
+            default_model=merged.get("default_model"),
+            allowed_hosts=list(merged.get("allowed_hosts", shared_hosts)),
+            auth_source=str(merged.get("auth_source", "env")),
+            updated_at=None,
+        )
+
+    def _save_provider_config_record(
+        self,
+        update: ProviderConfigUpdate,
+        *,
+        actor: str,
+        reason: str | None,
+        record_version: bool,
+    ) -> ProviderConfigRecord:
+        updated_at = utcnow_iso()
+        self.database.execute(
+            """
+            INSERT INTO provider_configs(
+                provider_name, enabled, base_url, generic_http_endpoint, api_key_env, default_model,
+                allowed_hosts_json, auth_source, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider_name) DO UPDATE SET
+                enabled = excluded.enabled,
+                base_url = excluded.base_url,
+                generic_http_endpoint = excluded.generic_http_endpoint,
+                api_key_env = excluded.api_key_env,
+                default_model = excluded.default_model,
+                allowed_hosts_json = excluded.allowed_hosts_json,
+                auth_source = excluded.auth_source,
+                updated_at = excluded.updated_at
+            """,
+            (
+                update.provider_name,
+                int(update.enabled),
+                update.base_url,
+                update.generic_http_endpoint,
+                update.api_key_env,
+                update.default_model,
+                json_dumps(update.allowed_hosts),
+                update.auth_source,
+                updated_at,
+            ),
+        )
+        if record_version:
+            self._record_settings_version(actor=actor, reason=reason, created_at=updated_at)
+        return self.get_provider_config(update.provider_name)
+
+    def _record_settings_version(
+        self,
+        *,
+        actor: str,
+        reason: str | None,
+        created_at: str | None = None,
+    ) -> None:
+        export = self.export_sanitized()
+        created = created_at or utcnow_iso()
+        self.database.execute(
+            """
+            INSERT INTO settings_versions(id, settings_hash, settings_json, actor, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id("settings"),
+                self.hash_export(export),
+                json_dumps(export.model_dump(mode="json")),
+                actor,
+                reason,
+                created,
+            ),
+        )
 
     @staticmethod
     def _parse_bool(value: Any) -> bool:
@@ -373,3 +586,10 @@ class SettingsService:
         if isinstance(value, list):
             return [int(item) for item in value]
         return [int(item) for item in split_csv(str(value))]
+
+    @staticmethod
+    def _normalize_protection_mode(value: Any) -> str:
+        candidate = str(value or "").strip().lower()
+        if candidate in {"plain-local", "unprotected-local"}:
+            return "unprotected-local"
+        return "dpapi"

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import importlib.util
 import json
 import os
+from pathlib import Path
 import sys
 
 import pytest
@@ -56,6 +58,10 @@ def _settings_update_from_effective(settings) -> SettingsUpdate:
         allowed_http_hosts=",".join(settings.allowed_http_hosts),
         enable_system_connector=settings.enable_system_connector,
         enable_outlook_connector=settings.enable_outlook_connector,
+        local_protection_mode=settings.local_protection_mode,
+        allow_insecure_local_storage=settings.allow_insecure_local_storage,
+        history_retention_days=settings.history_retention_days,
+        cli_token_ttl_seconds=settings.cli_token_ttl_seconds,
         worker_lease_seconds=settings.worker_lease_seconds,
         worker_max_attempts=settings.worker_max_attempts,
     )
@@ -265,6 +271,22 @@ def test_multi_agent_handoffs_are_persisted(container):
     assert all(run.agent_role for run in connector_runs)
 
 
+def test_task_graph_nodes_are_persisted(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Review a file and create a task",
+            filesystem_path="notes.txt",
+            task_title="Trace graph",
+        )
+    )
+
+    task_nodes = container.agent_service.list_task_nodes(result.run_id)
+
+    assert any(node.node_type == "objective" for node in task_nodes)
+    assert any(node.node_type == "proposal" for node in task_nodes)
+    assert any(node.depends_on for node in task_nodes if node.node_type != "objective")
+
+
 def test_default_runtime_state_uses_localappdata(monkeypatch, tmp_path):
     local_appdata = tmp_path / "LocalAppData"
     monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
@@ -296,14 +318,50 @@ def test_sensitive_payload_is_externalized_from_proposal_rows(container):
     assert materialized["content"] == secret_text
 
 
+def test_fail_closed_storage_blocks_sensitive_payload_without_override(tmp_path):
+    settings = AppSettings(
+        app_name="Fail Closed Storage Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        local_protection_mode="unprotected-local",
+        allow_insecure_local_storage=False,
+        session_secret="test-session-secret",
+    )
+    container = AppContainer(settings)
+
+    with pytest.raises(ValueError, match="Strong local protection is required"):
+        container.runtime_service.run_agent(
+            AgentRunRequest(
+                objective="Write protected file content",
+                filesystem_path="secret.txt",
+                file_content="restricted material",
+            )
+        )
+
+
 def test_history_sanitization_redacts_sensitive_fields(container):
     sanitized = container.data_governance_service.sanitize_for_history(
-        {"content": "top-secret", "body": "remote-body", "details": "operator notes"}
+        {
+            "content": "top-secret",
+            "body": "remote-body",
+            "details": "operator notes",
+            "headers": {"Authorization": "Bearer secret-token", "Accept": "application/json"},
+            "rationale": "this should not be stored in full",
+        }
     )
 
     assert sanitized["content"]["redacted"] is True
     assert sanitized["body"]["redacted"] is True
     assert sanitized["details"]["redacted"] is True
+    assert sanitized["headers"]["Authorization"]["redacted"] is True
+    assert sanitized["headers"]["Accept"] == "application/json"
+    assert "this should not be stored in full"[:32] in sanitized["rationale"]
     assert "top-secret" not in json.dumps(sanitized)
 
 
@@ -377,5 +435,87 @@ def test_cli_sensitive_command_requires_short_lived_token(container, monkeypatch
     monkeypatch.setattr(cli_module, "AppContainer", lambda: container)
     monkeypatch.setattr(sys, "argv", ["app.cli", "run-worker", "--once"])
 
-    with pytest.raises(AuthorizationError, match="CLI authentication token"):
+    with pytest.raises(AuthorizationError, match="Sensitive CLI commands require either --token-file or --username"):
         cli_module.main()
+
+
+def test_cli_issue_parser_rejects_password_argument():
+    parser = cli_module.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["issue-cli-token", "--username", "operator", "--password", "bad"])
+
+
+def test_cli_sensitive_command_uses_secure_prompt_without_token_env(container, monkeypatch, capsys):
+    username = "prompt-operator"
+    password = "CliSecure123!"
+    container.auth_service.create_initial_user(username, password)
+    monkeypatch.setattr(cli_module, "AppContainer", lambda: container)
+    monkeypatch.setattr(sys, "argv", ["app.cli", "run-worker", "--once", "--username", username])
+    monkeypatch.setattr(cli_module, "getpass", lambda _: password)
+
+    cli_module.main()
+
+    output = capsys.readouterr().out
+    assert "No queued jobs." in output
+    assert "CliSecure123!" not in output
+
+
+def test_cli_parser_rejects_password_stdin_legacy_flag():
+    parser = cli_module.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["run-worker", "--once", "--username", "operator", "--password-stdin"])
+
+
+def test_release_packaging_verifier_rejects_forbidden_paths(tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "package_release.py"
+    spec = importlib.util.spec_from_file_location("package_release", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    with pytest.raises(ValueError, match="Forbidden artifact path"):
+        module._validate_relative(Path(".venv") / "Scripts" / "python.exe")
+
+
+def test_release_archive_uses_allowlist(tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "package_release.py"
+    spec = importlib.util.spec_from_file_location("package_release", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    root = tmp_path / "repo"
+    (root / "app").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    (root / "ui").mkdir()
+    (root / "docs").mkdir()
+    (root / "README.md").write_text("readme", encoding="utf-8")
+    (root / "LICENSE").write_text("license", encoding="utf-8")
+    (root / "main.py").write_text("print('ok')", encoding="utf-8")
+    (root / "requirements.txt").write_text("fastapi", encoding="utf-8")
+    (root / ".env.example").write_text("APP_NAME=Test", encoding="utf-8")
+    (root / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "scripts" / "bootstrap.ps1").write_text("Write-Host ok", encoding="utf-8")
+    (root / "ui" / "index.html").write_text("<html></html>", encoding="utf-8")
+    (root / "docs" / "release_hygiene.md").write_text("docs", encoding="utf-8")
+    (root / ".venv").mkdir()
+    (root / ".venv" / "bad.txt").write_text("bad", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "runtime.db").write_text("bad", encoding="utf-8")
+
+    module.DIST_DIR = tmp_path / "dist"
+    result = module.build_archive(root, version="pytest")
+    import zipfile
+
+    with zipfile.ZipFile(result.archive_path, "r") as handle:
+        names = set(handle.namelist())
+        manifest_name = next(name for name in names if name.endswith("release_manifest.json"))
+        manifest = json.loads(handle.read(manifest_name).decode("utf-8"))
+
+    assert all(".venv/" not in name for name in names)
+    assert all("/data/" not in name for name in names)
+    assert any(name.endswith("README.md") for name in names)
+    assert manifest["excluded_policy"]["forbidden_segments"]
+    assert manifest["included_paths"]

@@ -15,7 +15,7 @@
 
     <section class="risk-banner {{ proposal.risk_level.value }}">
         <strong>Risk:</strong> {{ proposal.risk_level.value|upper }}
-        <span>Approval is bound to a snapshot hash, policy hash, settings hash, and resource preconditions.</span>
+        <span>Approval is bound to an execution manifest hash, policy hash, settings hash, and resource preconditions.</span>
     </section>
 
     {% if snapshot_context.stale %}
@@ -58,8 +58,15 @@
                 <div class="metric-row"><span>Created Snapshot</span><strong>{{ snapshot_context.created_snapshot.snapshot_hash if snapshot_context.created_snapshot else "-" }}</strong></div>
                 <div class="metric-row"><span>Approved Snapshot</span><strong>{{ snapshot_context.approved_snapshot.snapshot_hash if snapshot_context.approved_snapshot else "-" }}</strong></div>
                 <div class="metric-row"><span>Live Snapshot</span><strong>{{ snapshot_context.live_snapshot.snapshot_hash if snapshot_context.live_snapshot else "-" }}</strong></div>
+                <div class="metric-row"><span>Approved Manifest</span><strong>{{ snapshot_context.approved_snapshot.manifest_hash if snapshot_context.approved_snapshot else "-" }}</strong></div>
+                <div class="metric-row"><span>Live Manifest</span><strong>{{ snapshot_context.live_snapshot.manifest_hash if snapshot_context.live_snapshot else "-" }}</strong></div>
                 <div class="metric-row"><span>Data Classification</span><strong>{{ proposal.data_classification.value }}</strong></div>
             </div>
+
+            {% if snapshot_context.live_snapshot %}
+            <h3>Execution Manifest</h3>
+            <pre>{{ snapshot_context.live_snapshot.manifest | tojson(indent=2) }}</pre>
+            {% endif %}
 
             <h3>Execution Preview</h3>
             <pre>{{ preview.execution_preview | tojson(indent=2) }}</pre>
@@ -148,6 +155,7 @@
                 <small>{{ approval.created_at }}</small>
                 <pre>{{ {
                     "snapshot_hash": approval.snapshot_hash,
+                    "manifest_hash": approval.manifest_hash,
                     "action_hash": approval.action_hash,
                     "policy_hash": approval.policy_hash,
                     "settings_hash": approval.settings_hash,
@@ -168,6 +176,7 @@
                 <small>{{ job.queued_at }}</small>
                 <pre>{{ {
                     "approval_id": job.approval_id,
+                    "manifest_hash": job.manifest_hash,
                     "correlation_id": job.correlation_id,
                     "attempt_count": job.attempt_count,
                     "lease_expires_at": job.lease_expires_at
@@ -219,6 +228,7 @@
         <div class="list-item">
             <strong>{{ entry.status }}</strong>
             <p>{{ entry.action_type }}</p>
+            <small>manifest {{ entry.manifest_hash or "-" }}{% if entry.provider_name %} / provider {{ entry.provider_name }}{% endif %}</small>
             <pre>{{ entry.output | tojson(indent=2) if entry.output else entry.error_text or "No output" }}</pre>
         </div>
         {% else %}
