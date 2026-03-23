@@ -2,25 +2,29 @@
     <td>
         <strong>{{ proposal.title }}</strong>
         <div class="muted small">{{ proposal.action_type }}</div>
+        <div class="small">{{ proposal.description }}</div>
     </td>
     <td>{{ proposal.connector }}</td>
     <td><span class="badge {{ proposal.risk_level.value }}">{{ proposal.risk_level.value }}</span></td>
     <td><span class="badge {{ proposal.status.value }}">{{ proposal.status.value }}</span></td>
     <td>{{ proposal.created_at }}</td>
     <td>
-        <div class="inline-actions">
-            <a class="button mini ghost" href="/proposals/{{ proposal.id }}">View</a>
-            {% if proposal.status.value == "pending" %}
+        <div class="stack tight">
+            <a class="button mini ghost" href="/proposals/{{ proposal.id }}">Detail</a>
+            {% if proposal.status.value == "pending" and proposal.risk_level.value in ["high", "critical"] %}
+            <span class="muted small">High-risk: review detail and re-auth there.</span>
+            {% elif proposal.status.value == "pending" %}
             <form
                 method="post"
                 action="/approvals/{{ proposal.id }}/approve"
                 hx-post="/approvals/{{ proposal.id }}/approve"
                 hx-target="#proposal-row-{{ proposal.id }}"
                 hx-swap="outerHTML"
+                class="stack tight"
             >
-                <input type="hidden" name="actor" value="operator">
-                <input type="hidden" name="reason" value="Approved from inbox">
-                <button class="button mini primary" type="submit">Approve</button>
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="text" name="reason" value="Queued from approval inbox" required>
+                <button class="button mini primary" type="submit">Queue Approval</button>
             </form>
             <form
                 method="post"
@@ -28,13 +32,13 @@
                 hx-post="/approvals/{{ proposal.id }}/reject"
                 hx-target="#proposal-row-{{ proposal.id }}"
                 hx-swap="outerHTML"
+                class="stack tight"
             >
-                <input type="hidden" name="actor" value="operator">
-                <input type="hidden" name="reason" value="Rejected from inbox">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="text" name="reason" value="Rejected from approval inbox" required>
                 <button class="button mini danger" type="submit">Reject</button>
             </form>
             {% endif %}
         </div>
     </td>
 </tr>
-

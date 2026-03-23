@@ -39,14 +39,23 @@ class RuntimePlanner:
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         run_id = new_id("run")
         collected = self._collect(run_id, request)
+        effective_settings = self.provider_service.settings_service.get_effective_settings()
+        summary_text, summary_provider_name = self._summarize(request, collected, effective_settings.summary_profile)
         summary = self.summary_service.create(
             run_id=run_id,
             objective=request.objective,
             collected=collected,
-            summary_text=self._summarize(request, collected),
-            provider_name=request.provider_name or self.provider_service.settings_service.get_effective_settings().provider,
+            summary_text=summary_text,
+            provider_name=summary_provider_name,
         )
-        proposals = self._build_proposals(run_id, request, summary.id, collected, summary.summary_text)
+        proposals = self._build_proposals(
+            run_id,
+            request,
+            summary.id,
+            collected,
+            summary.summary_text,
+            effective_settings.planning_profile,
+        )
         created = self.proposal_service.create_many(proposals)
         self.audit_service.emit(
             "planning.completed",
@@ -100,22 +109,24 @@ class RuntimePlanner:
             )
             return {"error": str(exc), "input": payload}
 
-    def _summarize(self, request: AgentRunRequest, collected: dict) -> str:
+    def _summarize(self, request: AgentRunRequest, collected: dict, profile: str) -> tuple[str, str]:
         prompt = (
             "Summarize the collected local-agent context for a Windows operator. "
             "Highlight risks, likely side effects, and the next approval-ready actions.\n\n"
             f"Objective:\n{request.objective}\n\nCollected:\n{json_dumps(collected)}"
         )
+        provider_name = request.provider_name or self.provider_service.resolve_profile_provider(profile)
         try:
             response = self.provider_service.complete(
                 ProviderRequest(
                     provider_name=request.provider_name,
                     model_name=request.model_name,
+                    profile=profile,
                     prompt=prompt,
                     system_prompt="Produce a concise operator summary for a local-first agent runtime.",
                 )
             )
-            return response.content
+            return response.content, response.provider_name
         except Exception:
             fragments = [f"Objective: {request.objective}"]
             if "filesystem" in collected:
@@ -125,7 +136,7 @@ class RuntimePlanner:
             if collected.get("tasks"):
                 fragments.append("Task snapshot captured.")
             fragments.append("All actions remain approval-gated before execution.")
-            return " ".join(fragments)
+            return " ".join(fragments), (provider_name or "offline-fallback")
 
     def _build_proposals(
         self,
@@ -134,12 +145,14 @@ class RuntimePlanner:
         summary_id: str,
         collected: dict,
         summary_text: str,
+        planning_profile: str,
     ) -> list[ActionProposal]:
         proposals: list[ActionProposal] = []
+        planning_provider = request.provider_name or self.provider_service.resolve_profile_provider(planning_profile)
         if request.filesystem_path:
-            proposals.extend(self._filesystem_proposals(run_id, request, summary_id, collected))
+            proposals.extend(self._filesystem_proposals(run_id, request, summary_id, collected, planning_provider))
         if request.http_url:
-            proposals.append(self._http_proposal(run_id, request, summary_id))
+            proposals.append(self._http_proposal(run_id, request, summary_id, planning_provider))
         if request.task_title:
             proposals.append(
                 ActionProposal(
@@ -151,7 +164,7 @@ class RuntimePlanner:
                     description="Create a tracked local task in the runtime database.",
                     payload={"title": request.task_title, "details": request.task_details or summary_text},
                     rationale="A local task is an explicit, auditable follow-up artifact.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -166,22 +179,22 @@ class RuntimePlanner:
                     description="Read the current local task backlog from SQLite.",
                     payload={"limit": 20},
                     rationale="The objective explicitly asks for task visibility.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
-        if request.powershell_command:
+        if request.system_action:
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
                     objective=request.objective,
                     connector="system",
-                    action_type="system.powershell",
-                    title="Run allowlisted PowerShell command",
-                    description="Execute a PowerShell command through the allowlisted system connector.",
-                    payload={"command": request.powershell_command},
-                    rationale="The operator provided an explicit PowerShell command for controlled execution.",
-                    provider_name=request.provider_name,
+                    action_type=request.system_action,
+                    title=f"Run bounded system action {request.system_action}",
+                    description="Execute a schema-driven read-only system action.",
+                    payload={"path": request.system_path},
+                    rationale="The operator selected a bounded system action.",
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -197,7 +210,7 @@ class RuntimePlanner:
                     description="Create a local follow-up task when no executable connector action was inferred.",
                     payload={"title": fallback_title, "details": summary_text},
                     rationale="No direct connector action was inferred, so the runtime stores the objective as a task.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -209,6 +222,7 @@ class RuntimePlanner:
         request: AgentRunRequest,
         summary_id: str,
         collected: dict,
+        planning_provider: str | None,
     ) -> list[ActionProposal]:
         path = request.filesystem_path or ""
         lower_objective = request.objective.lower()
@@ -227,7 +241,7 @@ class RuntimePlanner:
                     description="Create or update a text file within the configured filesystem allowlist.",
                     payload={"path": path, "content": request.file_content},
                     rationale="The request includes explicit file content.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -244,7 +258,7 @@ class RuntimePlanner:
                     description="Delete an allowlisted file or directory.",
                     payload={"path": path},
                     rationale="The objective explicitly requests deletion.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -259,7 +273,7 @@ class RuntimePlanner:
                     description="Create a directory inside an allowlisted root.",
                     payload={"path": path},
                     rationale="The objective explicitly requests a directory.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -274,7 +288,7 @@ class RuntimePlanner:
                     description="List directory entries within the configured filesystem allowlist.",
                     payload={"path": path},
                     rationale="The objective or collected context points to a directory listing operation.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
@@ -289,13 +303,19 @@ class RuntimePlanner:
                     description="Read a text file from the configured filesystem allowlist.",
                     payload={"path": path},
                     rationale="The objective points to a read-oriented filesystem action.",
-                    provider_name=request.provider_name,
+                    provider_name=planning_provider,
                     summary_id=summary_id,
                 )
             )
         return proposals
 
-    def _http_proposal(self, run_id: str, request: AgentRunRequest, summary_id: str) -> ActionProposal:
+    def _http_proposal(
+        self,
+        run_id: str,
+        request: AgentRunRequest,
+        summary_id: str,
+        planning_provider: str | None,
+    ) -> ActionProposal:
         method = request.http_method.upper()
         headers = self._parse_headers(request.http_headers_text)
         return ActionProposal(
@@ -307,7 +327,7 @@ class RuntimePlanner:
             description="Execute an HTTP request through the allowlisted HTTP connector.",
             payload={"url": request.http_url, "body": request.http_body, "headers": headers},
             rationale="The operator provided an explicit target URL.",
-            provider_name=request.provider_name,
+            provider_name=planning_provider,
             summary_id=summary_id,
         )
 

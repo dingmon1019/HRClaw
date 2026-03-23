@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-from urllib.parse import urlparse
-
 from app.config.settings import AppSettings
+from app.connectors.system import SAFE_SYSTEM_ACTIONS
+from app.core.errors import ConnectorError
+from app.policy.path_guard import PathGuard
 from app.schemas.actions import ActionProposal, ProposalStatus, RiskLevel, RuntimeMode
 from app.services.settings_service import SettingsService
 
@@ -22,13 +22,13 @@ class PolicyEngine:
         "http.delete",
         "task.create",
         "task.complete",
-        "system.powershell",
         "outlook.send_mail",
     }
 
     def __init__(self, base_settings: AppSettings, settings_service: SettingsService):
         self.base_settings = base_settings
         self.settings_service = settings_service
+        self.path_guard = PathGuard(base_settings, settings_service)
 
     def evaluate(self, proposal: ActionProposal) -> ActionProposal:
         settings = self.settings_service.get_effective_settings()
@@ -70,70 +70,44 @@ class PolicyEngine:
 
     def _block_reason(self, proposal: ActionProposal, settings) -> str | None:
         if proposal.connector == "filesystem":
-            return self._validate_filesystem_payload(proposal.payload)
+            write = proposal.action_type not in {"filesystem.list_directory", "filesystem.read_text"}
+            return self.path_guard.check_payload(proposal.payload, write=write)
         if proposal.connector == "http":
-            return self._validate_http_payload(proposal.payload, settings.allowed_http_hosts)
-        if proposal.action_type == "system.powershell":
-            return self._validate_powershell_payload(proposal.payload, settings.powershell_allowlist)
+            return self._validate_http_payload(proposal.payload, proposal.action_type)
+        if proposal.connector == "system":
+            return self._validate_system_action(proposal.action_type, proposal.payload, settings.enable_system_connector)
+        if proposal.connector == "outlook" and not settings.enable_outlook_connector:
+            return "Outlook connector is disabled."
         return None
 
-    def _validate_filesystem_payload(self, payload: dict) -> str | None:
-        for key in ("path", "source_path", "destination_path"):
-            raw_value = payload.get(key)
-            if not raw_value:
-                continue
-            candidate = Path(raw_value).resolve()
-            if not any(self._is_relative_to(candidate, root) for root in self._allowed_root_paths()):
-                return f"Path {candidate} is outside the filesystem allowlist."
-        return None
-
-    def _validate_http_payload(self, payload: dict, allowed_hosts: list[str]) -> str | None:
+    def _validate_http_payload(self, payload: dict, action_type: str) -> str | None:
         url = payload.get("url")
         if not url:
             return "HTTP actions require a URL."
-        host = urlparse(url).hostname
-        if not host:
-            return "HTTP action URL is invalid."
-        if allowed_hosts and host not in allowed_hosts:
-            return f"Host {host} is not in the HTTP allowlist."
-        return None
+        try:
+            from app.connectors.http import HttpConnector
+
+            HttpConnector(self.settings_service)._assert_request_allowed(url, action_type.split(".", 1)[1].upper())
+            return None
+        except ConnectorError as exc:
+            return str(exc)
 
     @staticmethod
-    def _validate_powershell_payload(payload: dict, allowed_commands: list[str]) -> str | None:
-        command = (payload.get("command") or "").strip()
-        if not command:
-            return "PowerShell actions require a command."
-        first_token = command.split()[0]
-        if allowed_commands and first_token not in allowed_commands:
-            return f"PowerShell command {first_token} is not in the allowlist."
+    def _validate_system_action(action_type: str, payload: dict, enabled: bool) -> str | None:
+        if not enabled:
+            return "Bounded system connector is disabled."
+        if action_type not in SAFE_SYSTEM_ACTIONS:
+            return f"System action {action_type} is not allowed."
+        if action_type != "system.get_time" and not payload.get("path"):
+            return "System action requires a path."
         return None
-
-    def _allowed_root_paths(self) -> list[Path]:
-        settings = self.settings_service.get_effective_settings()
-        roots: list[Path] = []
-        for root in settings.allowed_filesystem_roots:
-            path = Path(root)
-            if not path.is_absolute():
-                path = (self.base_settings.project_root / path).resolve()
-            else:
-                path = path.resolve()
-            roots.append(path)
-        return roots
 
     @staticmethod
     def _risk_for_action(action_type: str, side_effecting: bool) -> RiskLevel:
-        if action_type in {"filesystem.delete_path", "outlook.send_mail"}:
+        if action_type in {"filesystem.delete_path", "outlook.send_mail", "http.delete"}:
             return RiskLevel.HIGH
-        if action_type == "system.powershell":
-            return RiskLevel.HIGH
+        if action_type in {"http.post", "http.put", "http.patch", "filesystem.move_path"}:
+            return RiskLevel.MEDIUM
         if side_effecting:
             return RiskLevel.MEDIUM
         return RiskLevel.LOW
-
-    @staticmethod
-    def _is_relative_to(path: Path, root: Path) -> bool:
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import secrets
+from hashlib import sha256
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,3 +34,10 @@ def json_loads(value: str | None, default: Any) -> Any:
 def split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
+
+def random_token(length: int = 32) -> str:
+    return secrets.token_urlsafe(length)
+
+
+def sha256_hex(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()

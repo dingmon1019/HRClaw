@@ -1,32 +1,71 @@
 from __future__ import annotations
 
-
-def test_dashboard_route(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert "Win Agent Runtime" in response.text
+from tests.helpers import bootstrap_operator, extract_csrf_token
 
 
-def test_api_run_and_approve_flow(client):
-    create_response = client.post(
+def test_protected_routes_redirect_to_setup_before_bootstrap(client):
+    response = client.get("/", headers={"accept": "text/html"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/setup"
+
+
+def test_setup_stores_password_hash_and_logout_requires_csrf(client, container):
+    _, password = bootstrap_operator(client)
+    row = container.database.fetch_one("SELECT username, password_hash FROM users LIMIT 1")
+    assert row["username"] == "operator"
+    assert row["password_hash"] != password
+    assert row["password_hash"].startswith("pbkdf2_sha256$")
+
+    home = client.get("/", headers={"accept": "text/html"})
+    csrf_token = extract_csrf_token(home.text)
+    logout = client.post(
+        "/logout",
+        data={"csrf_token": csrf_token},
+        headers={"accept": "text/html"},
+        follow_redirects=False,
+    )
+    assert logout.status_code == 303
+    assert logout.headers["location"].startswith("/login")
+
+
+def test_api_requires_authentication_before_setup(client):
+    response = client.get("/api/providers", headers={"accept": "application/json"})
+    assert response.status_code == 403
+
+
+def test_api_run_requires_csrf(authenticated_client, auth_headers):
+    response = authenticated_client.post(
         "/api/runs",
         json={"objective": "Create a task through the API", "task_title": "API task"},
+        headers={"accept": "application/json"},
+    )
+    assert response.status_code == 400
+    assert "CSRF" in response.json()["detail"]
+
+
+def test_api_run_and_queue_flow(authenticated_client, auth_headers):
+    create_response = authenticated_client.post(
+        "/api/runs",
+        json={"objective": "Create a task through the API", "task_title": "API task"},
+        headers=auth_headers,
     )
     assert create_response.status_code == 200
     payload = create_response.json()
     proposal_id = payload["proposals"][0]["id"]
 
-    approve_response = client.post(
+    approve_response = authenticated_client.post(
         f"/api/proposals/{proposal_id}/approve",
-        json={"actor": "api-test", "reason": "approve through api"},
+        json={"actor": "ignored", "reason": "queue from api"},
+        headers=auth_headers,
     )
-    assert approve_response.status_code == 200
+    assert approve_response.status_code == 202
     result = approve_response.json()
-    assert result["proposal"]["status"] == "executed"
+    assert result["proposal"]["status"] == "queued"
+    assert result["job"]["status"] == "queued"
 
 
-def test_api_provider_list(client):
-    response = client.get("/api/providers")
+def test_api_provider_list_after_login(authenticated_client, auth_headers):
+    response = authenticated_client.get("/api/providers", headers={"accept": "application/json"})
     assert response.status_code == 200
     names = {item["name"] for item in response.json()}
     assert "mock" in names

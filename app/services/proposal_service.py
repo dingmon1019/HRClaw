@@ -91,7 +91,13 @@ class ProposalService:
         return self.list_approvals(proposal_id)[-1]
 
     def set_execution_status(self, proposal_id: str, status: ProposalStatus) -> None:
-        if status not in {ProposalStatus.EXECUTED, ProposalStatus.FAILED, ProposalStatus.BLOCKED}:
+        if status not in {
+            ProposalStatus.QUEUED,
+            ProposalStatus.RUNNING,
+            ProposalStatus.EXECUTED,
+            ProposalStatus.FAILED,
+            ProposalStatus.BLOCKED,
+        }:
             raise InvalidStateError(f"Unsupported execution status transition: {status.value}.")
         self._update_status(proposal_id, status)
 
@@ -155,4 +161,3 @@ class ProposalService:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
-

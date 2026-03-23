@@ -18,7 +18,7 @@ class ConnectorRegistry:
             "filesystem": FilesystemConnector(base_settings, settings_service),
             "http": HttpConnector(settings_service),
             "task": TaskConnector(database),
-            "system": SystemConnector(settings_service),
+            "system": SystemConnector(base_settings, settings_service),
             "outlook": OutlookConnector(),
         }
 

@@ -1,5 +1,20 @@
 {% extends "templates/base.html" %}
 {% block content %}
+<section class="grid three">
+    <article class="card stat-card">
+        <span>Audit Integrity</span>
+        <strong>{{ "OK" if audit_status.ok else "FAIL" }}</strong>
+    </article>
+    <article class="card stat-card">
+        <span>Action Rows</span>
+        <strong>{{ history|length }}</strong>
+    </article>
+    <article class="card stat-card">
+        <span>Queue Jobs</span>
+        <strong>{{ jobs|length }}</strong>
+    </article>
+</section>
+
 <section class="grid two">
     <article class="card">
         <h2>Action History</h2>
@@ -43,5 +58,26 @@
         </table>
     </article>
 </section>
-{% endblock %}
 
+<section class="card">
+    <h2>Execution Jobs</h2>
+    <table>
+        <thead>
+            <tr><th>Job</th><th>Proposal</th><th>Status</th><th>Queued</th><th>Worker</th></tr>
+        </thead>
+        <tbody>
+            {% for job in jobs %}
+            <tr>
+                <td>{{ job.id }}</td>
+                <td><a href="/proposals/{{ job.proposal_id }}">{{ job.proposal_id }}</a></td>
+                <td><span class="badge {{ job.status.value }}">{{ job.status.value }}</span></td>
+                <td>{{ job.queued_at }}</td>
+                <td>{{ job.worker_id or "-" }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="muted">No execution jobs yet.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endblock %}

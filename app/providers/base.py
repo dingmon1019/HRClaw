@@ -12,6 +12,9 @@ from app.schemas.settings import EffectiveSettings
 class BaseProvider(ABC):
     name = "base"
     description = "Abstract provider"
+    profiles: list[str] = []
+    supports_local = False
+    supports_remote = True
 
     def __init__(self, base_settings: AppSettings):
         self.base_settings = base_settings
@@ -26,6 +29,9 @@ class BaseProvider(ABC):
             available=True,
             configured=self.is_configured(settings),
             description=self.description,
+            profiles=self.profiles,
+            supports_local=self.supports_local,
+            supports_remote=self.supports_remote,
         )
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
@@ -37,4 +43,3 @@ class BaseProvider(ABC):
         if not value:
             raise ProviderError(f"Environment variable {env_name} is not set.")
         return value
-

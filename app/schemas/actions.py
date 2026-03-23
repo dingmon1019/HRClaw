@@ -14,6 +14,8 @@ class RuntimeMode(str, Enum):
 class ProposalStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
+    QUEUED = "queued"
+    RUNNING = "running"
     REJECTED = "rejected"
     EXECUTED = "executed"
     FAILED = "failed"
@@ -37,7 +39,8 @@ class AgentRunRequest(BaseModel):
     http_headers_text: str | None = None
     task_title: str | None = None
     task_details: str | None = None
-    powershell_command: str | None = None
+    system_action: str | None = None
+    system_path: str | None = None
     provider_name: str | None = None
     model_name: str | None = None
 
@@ -68,7 +71,8 @@ class ProposalRecord(ActionProposal):
 
 class ApprovalDecisionRequest(BaseModel):
     actor: str = "operator"
-    reason: str | None = None
+    reason: str = Field(min_length=5, max_length=500)
+    current_password: str | None = None
 
 
 class ApprovalRecord(BaseModel):
@@ -121,3 +125,24 @@ class AgentRunResult(BaseModel):
     summary: SummaryRecord
     proposals: list[ProposalRecord]
 
+
+class ExecutionJobStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    EXECUTED = "executed"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
+class ExecutionJobRecord(BaseModel):
+    id: str
+    proposal_id: str
+    run_id: str
+    status: ExecutionJobStatus
+    queued_by: str
+    queued_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    worker_id: str | None = None
+    result: dict[str, Any] | None = None
+    error_text: str | None = None

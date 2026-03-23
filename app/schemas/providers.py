@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class ProviderRequest(BaseModel):
     provider_name: str | None = None
     model_name: str | None = None
+    profile: str | None = None
     prompt: str
     system_prompt: str | None = None
     response_format: str = "text"
@@ -25,6 +26,11 @@ class ProviderStatus(BaseModel):
     available: bool
     configured: bool
     description: str
+    profiles: list[str] = Field(default_factory=list)
+    supports_local: bool = False
+    supports_remote: bool = True
+    circuit_open: bool = False
+    last_error: str | None = None
 
 
 class ProviderTestRequest(BaseModel):
@@ -39,4 +45,3 @@ class ProviderTestResult(BaseModel):
     ok: bool
     message: str
     content: str | None = None
-

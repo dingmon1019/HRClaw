@@ -3,5 +3,9 @@ param(
     [int]$Port = 8000
 )
 
-python -m uvicorn main:app --host $Host --port $Port --reload
+$python = ".\.venv\Scripts\python.exe"
+if (-not (Test-Path $python)) {
+    throw "Virtual environment not found. Run .\scripts\bootstrap.ps1 first."
+}
 
+& $python -m uvicorn main:app --host $Host --port $Port --reload

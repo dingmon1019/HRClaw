@@ -21,3 +21,18 @@ class NotFoundError(AppError):
 class InvalidStateError(AppError):
     """Raised when a state transition is not allowed."""
 
+
+class AuthenticationError(AppError):
+    """Raised when authentication fails."""
+
+
+class AuthorizationError(AppError):
+    """Raised when a user is authenticated but not authorized."""
+
+
+class CsrfError(AppError):
+    """Raised when a CSRF token is missing or invalid."""
+
+
+class RateLimitError(AppError):
+    """Raised when a request exceeds the allowed rate."""

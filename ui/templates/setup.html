@@ -1,0 +1,30 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card auth-card">
+    <div class="card-header">
+        <div>
+            <h2>Initial Setup</h2>
+            <p class="muted">Create the first local operator account. Only a password hash is stored in SQLite.</p>
+        </div>
+        <span class="badge medium">Bootstrap</span>
+    </div>
+    <form method="post" action="/setup" class="stack form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label>
+            Username
+            <input type="text" name="username" autocomplete="username" required>
+        </label>
+        <label>
+            Password
+            <input type="password" name="password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <label>
+            Confirm Password
+            <input type="password" name="confirm_password" autocomplete="new-password" minlength="8" required>
+        </label>
+        <div class="actions">
+            <button type="submit" class="button primary">Create Operator Account</button>
+        </div>
+    </form>
+</section>
+{% endblock %}

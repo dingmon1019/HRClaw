@@ -1,0 +1,27 @@
+{% extends "templates/base.html" %}
+{% block content %}
+<section class="card auth-card">
+    <div class="card-header">
+        <div>
+            <h2>Operator Login</h2>
+            <p class="muted">Session-based authentication is required for proposal review, approval, settings changes, and API access.</p>
+        </div>
+        <span class="badge warn">Localhost Auth</span>
+    </div>
+    <form method="post" action="/login" class="stack form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="next_path" value="{{ next_path }}">
+        <label>
+            Username
+            <input type="text" name="username" autocomplete="username" required>
+        </label>
+        <label>
+            Password
+            <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <div class="actions">
+            <button type="submit" class="button primary">Login</button>
+        </div>
+    </form>
+</section>
+{% endblock %}

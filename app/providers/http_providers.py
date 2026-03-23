@@ -11,6 +11,9 @@ from app.schemas.settings import EffectiveSettings
 class OpenAIProvider(BaseProvider):
     name = "openai"
     description = "OpenAI Chat Completions provider using an API key from the environment."
+    profiles = ["strong"]
+    supports_local = False
+    supports_remote = True
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         try:
@@ -74,6 +77,9 @@ class OpenAIProvider(BaseProvider):
 class OpenAICompatibleProvider(OpenAIProvider):
     name = "openai-compatible"
     description = "OpenAI-compatible HTTP provider for local or self-hosted APIs."
+    profiles = ["fast", "strong", "local-only"]
+    supports_local = True
+    supports_remote = True
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         return bool(settings.base_url)
@@ -104,6 +110,9 @@ class OpenAICompatibleProvider(OpenAIProvider):
 class GenericHTTPProvider(BaseProvider):
     name = "generic-http"
     description = "Generic JSON-over-HTTP provider for custom model gateways."
+    profiles = ["fast", "cheap", "local-only"]
+    supports_local = True
+    supports_remote = True
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         return bool(settings.generic_http_endpoint or settings.base_url)
@@ -153,6 +162,9 @@ class GenericHTTPProvider(BaseProvider):
 class AnthropicProvider(BaseProvider):
     name = "anthropic"
     description = "Anthropic Messages API provider."
+    profiles = ["strong"]
+    supports_local = False
+    supports_remote = True
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         try:
@@ -193,6 +205,9 @@ class AnthropicProvider(BaseProvider):
 class GeminiProvider(BaseProvider):
     name = "gemini"
     description = "Gemini generateContent provider."
+    profiles = ["strong"]
+    supports_local = False
+    supports_remote = True
 
     def is_configured(self, settings: EffectiveSettings) -> bool:
         try:
@@ -230,4 +245,3 @@ class GeminiProvider(BaseProvider):
             content=text,
             raw_response=data,
         )
-

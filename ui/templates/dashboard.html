@@ -3,23 +3,136 @@
 <section class="grid cards four">
     <article class="card stat-card">
         <span>Pending</span>
-        <strong>{{ counts["pending"] }}</strong>
+        <strong>{{ counts["pending"] + counts["approved"] + counts["queued"] + counts["running"] }}</strong>
     </article>
     <article class="card stat-card">
-        <span>Approved</span>
-        <strong>{{ counts["approved"] }}</strong>
+        <span>Blocked</span>
+        <strong>{{ blocked_count }}</strong>
     </article>
     <article class="card stat-card">
-        <span>Executed</span>
-        <strong>{{ counts["executed"] }}</strong>
+        <span>Failed</span>
+        <strong>{{ failed_count }}</strong>
     </article>
     <article class="card stat-card">
-        <span>Failed / Blocked</span>
-        <strong>{{ counts["failed"] + counts["blocked"] }}</strong>
+        <span>Audit Integrity</span>
+        <strong>{{ "OK" if audit_status.ok else "FAIL" }}</strong>
+    </article>
+</section>
+
+<section class="grid three">
+    <article class="card">
+        <h2>Pending By Risk</h2>
+        <div class="stack">
+            {% for level in ["low", "medium", "high", "critical"] %}
+            <div class="metric-row">
+                <span>{{ level }}</span>
+                <strong>{{ pending_by_risk[level] }}</strong>
+            </div>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <h2>Provider Health</h2>
+        <div class="stack">
+            {% for provider in providers %}
+            <div class="list-item">
+                <strong>{{ provider.name }}</strong>
+                <p>
+                    <span class="badge {{ 'ok' if provider.configured else 'warn' }}">{{ "configured" if provider.configured else "not configured" }}</span>
+                    <span class="badge {{ 'danger' if provider.circuit_open else 'ok' }}">{{ "circuit open" if provider.circuit_open else "ready" }}</span>
+                </p>
+                <small>{{ provider.description }}</small>
+            </div>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <h2>Connector Health</h2>
+        <div class="stack">
+            {% for connector in connectors %}
+            <div class="list-item">
+                <strong>{{ connector.name }}</strong>
+                <p><span class="badge {{ 'ok' if connector.available else 'warn' }}">{{ "available" if connector.available else "degraded" }}</span></p>
+                <small>{{ connector.description }}</small>
+            </div>
+            {% endfor %}
+        </div>
+    </article>
+</section>
+
+{% if unsafe_warnings %}
+<section class="card">
+    <div class="card-header">
+        <h2>Unsafe Configuration Warnings</h2>
+        <span class="badge high">{{ unsafe_warnings|length }} warnings</span>
+    </div>
+    <ul class="flat-list">
+        {% for warning in unsafe_warnings %}
+        <li>{{ warning }}</li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+
+<section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h2>Recent High-Risk Proposals</h2>
+            <a href="/approvals">Review queue</a>
+        </div>
+        <div class="stack">
+            {% for proposal in recent_high_risk %}
+            <div class="list-item">
+                <strong><a href="/proposals/{{ proposal.id }}">{{ proposal.title }}</a></strong>
+                <p>{{ proposal.connector }} / {{ proposal.action_type }}</p>
+                <small>{{ proposal.created_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No recent high-risk proposals.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h2>Recent Failed Executions</h2>
+            <a href="/history">Open history</a>
+        </div>
+        <div class="stack">
+            {% for entry in recent_failed_history %}
+            <div class="list-item">
+                <strong>{{ entry.action_type }}</strong>
+                <p>{{ entry.status }} for proposal {{ entry.proposal_id }}</p>
+                <small>{{ entry.started_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No recent failed or blocked executions.</p>
+            {% endfor %}
+        </div>
     </article>
 </section>
 
 <section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h2>Worker Queue</h2>
+            <a href="/history">See all jobs</a>
+        </div>
+        <div class="stack">
+            {% for job in recent_jobs %}
+            <div class="list-item">
+                <strong>{{ job.status.value }}</strong>
+                <p>Proposal {{ job.proposal_id }}</p>
+                <small>{{ job.queued_at }}</small>
+            </div>
+            {% else %}
+            <p class="muted">No queued or completed worker jobs yet.</p>
+            {% endfor %}
+        </div>
+    </article>
+
     <article class="card">
         <div class="card-header">
             <h2>Recent Summaries</h2>
@@ -37,68 +150,5 @@
             {% endfor %}
         </div>
     </article>
-
-    <article class="card">
-        <div class="card-header">
-            <h2>Recent Action History</h2>
-            <a href="/history">View all</a>
-        </div>
-        <div class="stack">
-            {% for entry in recent_history %}
-            <div class="list-item">
-                <strong>{{ entry.action_type }}</strong>
-                <p>{{ entry.status }} for proposal {{ entry.proposal_id }}</p>
-                <small>{{ entry.started_at }}</small>
-            </div>
-            {% else %}
-            <p class="muted">No execution history yet.</p>
-            {% endfor %}
-        </div>
-    </article>
-</section>
-
-<section class="grid two">
-    <article class="card">
-        <div class="card-header">
-            <h2>Provider Status</h2>
-            <a href="/settings">Configure</a>
-        </div>
-        <table>
-            <thead>
-                <tr><th>Name</th><th>Configured</th><th>Description</th></tr>
-            </thead>
-            <tbody>
-                {% for provider in providers %}
-                <tr>
-                    <td>{{ provider.name }}</td>
-                    <td><span class="badge {{ 'ok' if provider.configured else 'warn' }}">{{ "yes" if provider.configured else "no" }}</span></td>
-                    <td>{{ provider.description }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </article>
-
-    <article class="card">
-        <div class="card-header">
-            <h2>Connector Status</h2>
-            <a href="/connectors">Inspect</a>
-        </div>
-        <table>
-            <thead>
-                <tr><th>Name</th><th>Available</th><th>Notes</th></tr>
-            </thead>
-            <tbody>
-                {% for connector in connectors %}
-                <tr>
-                    <td>{{ connector.name }}</td>
-                    <td><span class="badge {{ 'ok' if connector.available else 'warn' }}">{{ "online" if connector.available else "degraded" }}</span></td>
-                    <td>{{ connector.description }}</td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    </article>
 </section>
 {% endblock %}
-

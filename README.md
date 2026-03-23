@@ -1,44 +1,161 @@
 # win-agent-runtime
 
-Windows-first local agent runtime inspired by NemoClaw-style approval safety and architecture, with multi-provider model support in the spirit of OpenClaw.
+`win-agent-runtime` is a Windows-first local agent runtime inspired by NemoClaw-style approval safety and architecture, with multi-provider orchestration in the spirit of OpenClaw.
 
-This project is inspired by those ideas. It is not an official NemoClaw implementation and it does not claim official OpenClaw compatibility.
+It is not an official NemoClaw implementation.
+It does not claim OpenClaw compatibility.
+It is not OpenShell-level sandboxing.
 
-## Purpose
+This repository is aimed at practical localhost operator control on Windows 10/11:
 
-`win-agent-runtime` is a production-oriented local agent runtime for Windows 10/11 that:
+- proposal-first execution
+- approval gating
+- session-based localhost auth
+- tamper-evident audit logging
+- bounded system actions instead of raw shell execution
+- multi-provider routing with fallback and circuit breaking
+- FastAPI + Jinja2 + HTMX UI
+- SQLite persistence
 
-- runs entirely on localhost
-- persists proposals, approvals, summaries, and history in SQLite
-- requires explicit approval before execution
-- enforces allowlist-based policy controls
-- supports multiple model providers behind a shared abstraction
-- exposes both a FastAPI API and a desktop-friendly Jinja2 + HTMX operator UI
+## What This Project Is
 
-The project is designed to be usable as a local agent control plane, a foundation for internal tooling, or a starting point for a safer open-source agent workstation.
+This project is a local operator runtime for structured agent actions.
 
-## Architecture
+It collects context, summarizes it, proposes actions, waits for approval, queues approved work, and executes that work through a separate worker path.
 
-High-level execution flow:
+The design goal is not “autonomous execution at all costs”.
+The design goal is controlled local operation with durable auditability.
 
-1. Collect local context through read-safe connectors.
-2. Summarize the collected context with the selected provider or a local fallback.
-3. Propose structured actions.
-4. Persist proposals in SQLite.
-5. Wait for operator approval.
-6. Execute through the connector dispatcher.
-7. Audit the approval, execution, and outcome.
+## What This Project Is Not
 
-Core principles:
+This project is not:
 
-- Agent suggests, never executes blindly.
-- Side-effecting actions require approval.
-- Policy controls every execution path.
-- Runtime is local-first and localhost-native.
-- Connectors are modular and pluggable.
-- Provider integrations are abstracted behind a registry and shared interface.
+- a kernel sandbox
+- a container runtime
+- a privilege isolation boundary comparable to OpenShell-like systems
+- a remote multi-tenant control plane
+- a replacement for OS-level sandboxing or endpoint security
 
-Project layout:
+If you need hard isolation from the host OS, you still need stronger sandboxing than this repository provides today.
+
+## Security Model
+
+The v2 security posture is built around bounded local trust rather than blind execution:
+
+- localhost binding stays on `127.0.0.1` by default
+- operator login/logout uses session-based auth
+- only password hashes are stored
+- dangerous pages and mutation endpoints require authentication
+- sensitive actions require recent re-authentication
+- CSRF tokens are enforced on POST forms and dangerous POST APIs
+- raw PowerShell execution has been removed
+- bounded system actions replace freeform shell commands
+- filesystem access is constrained to a dedicated workspace root
+- writes to source, config, database, and audit paths are blocked
+- symlink traversal and path escape are blocked
+- HTTP requests are constrained by scheme, host, port, timeout, redirect, and response-size rules
+- localhost/private-network HTTP access is blocked unless explicitly enabled
+- audit entries are hash-chained and verifiable
+
+## Approval Model
+
+Core flow:
+
+1. collect
+2. summarize
+3. propose
+4. approve or reject
+5. queue
+6. execute in worker
+7. audit
+
+Important behavior:
+
+- the planner does not directly execute side effects
+- the web UI does not directly execute approved work
+- approvals queue jobs into SQLite
+- the worker consumes queued jobs and records success, failure, or policy block
+- proposal detail pages surface policy notes, affected resources, previews, diffs, and rollback guidance
+
+## Execution Worker Model
+
+Execution is intentionally separated from proposal generation:
+
+- FastAPI / UI process handles login, planning, review, and approvals
+- approved work is written to the `execution_jobs` queue
+- a worker process consumes queued jobs
+- worker lifecycle events are audit logged
+- worker results are written to job history and action history
+
+This is not a sandbox, but it is a much safer separation of concerns than direct execution inside the web request path.
+
+## Workspace Safety Model
+
+The runtime no longer defaults to the project root for filesystem operations.
+
+Default workspace:
+
+- `workspace/`
+
+Default policy:
+
+- relative paths resolve inside the workspace root
+- source code and repository files are not valid write targets
+- database and audit files are not valid write targets
+- session secret storage is not a valid write target
+
+This means the operator can work with local files without giving the runtime open write access to the repository itself.
+
+## Provider Model
+
+Providers are abstracted behind a shared interface and registry.
+
+Built-in adapters:
+
+- `mock`
+- `openai`
+- `openai-compatible`
+- `generic-http`
+- `anthropic`
+- `gemini`
+
+Provider orchestration features:
+
+- explicit provider selection
+- profile-based routing: `fast`, `cheap`, `strong`, `local-only`
+- fallback provider chain
+- retry policy
+- timeout handling
+- provider capability metadata
+- circuit breaker state
+- provider health status in the UI
+
+Credentials are loaded from environment variables only.
+No API keys are hardcoded.
+No subscription-token reuse claims are made.
+
+## Connectors
+
+Included connectors:
+
+- filesystem
+- http
+- task
+- system
+- outlook (optional, `pywin32`)
+
+System connector actions are bounded and schema-driven:
+
+- `system.list_directory`
+- `system.read_text_file`
+- `system.test_path`
+- `system.get_time`
+
+Removed behavior:
+
+- raw freeform PowerShell command execution
+
+## Repository Layout
 
 ```text
 project_root/
@@ -53,6 +170,7 @@ project_root/
 │   ├── providers/
 │   ├── runtime/
 │   ├── schemas/
+│   ├── security/
 │   └── services/
 ├── docs/
 ├── examples/
@@ -69,62 +187,11 @@ project_root/
 └── requirements.txt
 ```
 
-Additional architecture notes live in [docs/architecture.md](docs/architecture.md).
+More detail is in [docs/architecture.md](docs/architecture.md).
 
-## Features
+## Database Tables
 
-### Safety model
-
-- Safe mode and relaxed mode
-- Allowlisted filesystem roots
-- Allowlisted HTTP hosts
-- Allowlisted PowerShell commands
-- Pending proposal queue
-- Approval and rejection audit trail
-- Action execution history
-- Optional JSON audit log
-- Extensible shape for future RBAC
-
-### Connectors
-
-Required connectors included:
-
-- Filesystem connector
-- HTTP connector
-- Local task connector
-
-Additional connectors:
-
-- PowerShell system connector
-- Optional Outlook connector via `pywin32`
-
-The Outlook connector fails gracefully when `pywin32` is not installed.
-
-### Providers
-
-Built-in providers:
-
-- `mock`
-- `openai`
-- `openai-compatible`
-- `generic-http`
-- `anthropic`
-- `gemini`
-
-Provider capabilities:
-
-- provider selection
-- model selection
-- fallback provider
-- retry handling
-- timeout handling
-- environment-variable authentication
-
-No API keys are hardcoded. Credentials are loaded from environment variables referenced by config.
-
-## Database model
-
-Primary tables:
+Core tables:
 
 - `proposals`
 - `approvals`
@@ -132,20 +199,22 @@ Primary tables:
 - `summaries`
 - `connector_runs`
 - `settings`
-
-Additional local runtime table:
-
+- `users`
+- `execution_jobs`
+- `audit_entries`
 - `tasks`
 
-## Windows setup
+## Windows Setup
 
 Requirements:
 
 - Windows 10 or Windows 11
-- Python 3.11+ recommended
+- Python 3.13 recommended
 - PowerShell
+- no Docker
+- no Linux or WSL requirement
 
-Create and install:
+Bootstrap:
 
 ```powershell
 git clone <your-repo-url>
@@ -153,111 +222,82 @@ cd win-agent-runtime
 .\scripts\bootstrap.ps1
 ```
 
-Or install manually:
+Manual setup:
 
 ```powershell
-python -m venv .venv
+py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-## Localhost usage
+## Localhost Usage
 
-Run the app:
-
-```powershell
-python main.py
-```
-
-Or:
+Start the web app:
 
 ```powershell
 .\scripts\run-local.ps1
+```
+
+Start the worker in a second terminal:
+
+```powershell
+.\scripts\run-worker.ps1
+```
+
+Or process one queued job:
+
+```powershell
+.\scripts\run-worker.ps1 -Once
 ```
 
 Open:
 
 - [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
-Available pages:
+First-run flow:
 
-- Dashboard
-- Run Agent
-- Proposals Inbox
-- Proposal Detail
-- Approval UI
-- Action History
-- Connectors Status
-- Settings
-
-## Configuration
-
-Example `.env` values:
-
-```env
-PROVIDER=openai
-MODEL=gpt-5
-BASE_URL=http://127.0.0.1:8001/v1
-API_KEY_ENV=OPENAI_API_KEY
-FALLBACK_PROVIDER=mock
-RUNTIME_MODE=safe
-ALLOWED_FILESYSTEM_ROOTS=.
-ALLOWED_HTTP_HOSTS=127.0.0.1,localhost
-POWERSHELL_ALLOWLIST=Get-ChildItem,Get-Content,Test-Path,Resolve-Path,Get-Date
-```
-
-Persistent runtime settings are stored in SQLite and can be updated through the Settings page.
-
-## Provider system
-
-Providers are registered through `app/providers/registry.py` and accessed through `ProviderService`.
-
-Design goals:
-
-- swap providers without changing runtime code
-- support OpenAI and OpenAI-compatible APIs
-- support custom HTTP gateways
-- keep test coverage strong with the mock provider
-- make future provider adapters easy to add
-
-Selection order:
-
-1. explicit request override
-2. configured default provider
-3. configured fallback provider
-
-## Connector model
-
-Connectors are isolated execution units that expose:
-
-- `healthcheck()`
-- `collect()`
-- `execute()`
-
-Each proposal names its connector and action type, for example:
-
-- `filesystem.read_text`
-- `filesystem.write_text`
-- `http.get`
-- `task.create`
-- `system.powershell`
-- `outlook.send_mail`
+1. open `/setup`
+2. create the first operator account
+3. log in
+4. run the planner
+5. review proposals
+6. approve or reject
+7. run the worker
+8. inspect history and audit status
 
 ## CLI
 
-Run through the CLI with:
+Examples:
 
 ```powershell
-python -m app.cli run-agent "Inspect .\docs and create a task" --path .\docs --task-title "Review docs"
+python -m app.cli run-agent "Inspect workspace and create a task" --path notes.txt --task-title "Review notes"
 python -m app.cli list-proposals
-python -m app.cli approve-proposal <proposal_id>
-python -m app.cli reject-proposal <proposal_id>
-python -m app.cli show-history
+python -m app.cli approve-proposal <proposal_id> --reason "Approved for worker queue"
+python -m app.cli run-worker --once
+python -m app.cli list-jobs
+python -m app.cli verify-audit
 python -m app.cli list-providers
 python -m app.cli test-provider --provider mock
 ```
+
+## Settings Behavior
+
+The settings page is no longer a raw config dump.
+
+It now includes:
+
+- safe vs sensitive grouping
+- provider test flow
+- audit integrity status
+- explicit warnings for unsafe toggles
+- reset-to-safe-defaults action
+- sanitized export/import
+- secret-environment presence without exposing secret values
+
+Secrets remain environment-variable based.
+Windows Credential Manager integration is not implemented yet.
 
 ## Testing
 
@@ -267,39 +307,54 @@ Run the test suite:
 .\scripts\test.ps1
 ```
 
-Or:
+Current automated coverage includes:
 
-```powershell
-pytest -q
-```
-
-Covered areas include:
-
-- policy enforcement
-- proposal lifecycle
+- authentication bootstrap and logout flow
+- CSRF enforcement
+- proposal queue lifecycle
+- worker execution path
+- policy hardening
+- audit verification
+- provider fallback and circuit breaker behavior
 - SQLite persistence
-- provider fallback behavior
-- basic API routes
+
+## Honest Limitations
+
+- no kernel sandboxing
+- no RBAC yet
+- no automatic rollback engine
+- no secret storage integration beyond environment variables
+- no background worker supervisor included
+- HTTP policy is stricter than some local workflows and may need explicit opt-in changes
 
 ## Roadmap
 
-- RBAC and per-role approval policies
-- batch approvals and approval policies by risk class
-- richer planning prompts and tool schemas
-- connector pack expansion
-- more detailed task orchestration memory
+Planned next steps:
+
+- RBAC and per-role approval scopes
+- Windows Credential Manager support
+- stronger worker isolation options
+- background worker supervision on Windows
+- richer diff previews and rollback helpers
+- improved provider health probes
 - packaged Windows installer
-- vendored HTMX asset for fully offline UI delivery
+- stronger local connector isolation
 
 ## Contributing
 
-1. Create a branch with the `codex/` prefix or your team convention.
-2. Keep safety guarantees intact: no bypasses around approvals, policy, or audit.
-3. Add tests for behavior changes.
-4. Document new providers or connectors in the README and docs.
-5. Prefer small, reviewable pull requests.
+Contributions should preserve these boundaries:
 
-Issues and pull requests are welcome.
+- no blind execution paths
+- no reintroduction of raw shell execution
+- no secret leakage into UI or audit logs
+- no bypass around auth, CSRF, approval, queueing, or audit
+
+Recommended contribution flow:
+
+1. create a branch
+2. add or update tests
+3. document behavior changes
+4. keep the Windows localhost workflow working without Docker
 
 ## License
 

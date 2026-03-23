@@ -1,20 +1,376 @@
 from __future__ import annotations
 
+import difflib
+import json
 from collections import Counter
+from typing import Any
+from urllib.parse import urlencode
 
+from fastapi.encoders import jsonable_encoder
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from app.api.dependencies import get_container, get_templates
 from app.core.container import AppContainer
-from app.core.errors import InvalidStateError, NotFoundError
-from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
+from app.core.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    CsrfError,
+    InvalidStateError,
+    NotFoundError,
+    RateLimitError,
+)
+from app.schemas.actions import (
+    ApprovalDecisionRequest,
+    AgentRunRequest,
+    ProposalRecord,
+    ProposalStatus,
+    RiskLevel,
+)
+from app.schemas.auth import SetupRequest
 from app.schemas.providers import ProviderTestRequest
-from app.schemas.settings import SettingsUpdate
+from app.schemas.settings import SanitizedSettingsExport, SettingsUpdate
+from app.security.auth import (
+    SESSION_AUTHENTICATED_AT,
+    SESSION_RECENT_AUTH_AT,
+    login_session,
+    logout_session,
+    mark_recent_auth,
+    read_session_user,
+)
+from app.security.csrf import ensure_csrf_token, validate_csrf
 
 
 router = APIRouter()
+
+HIGH_RISK_LEVELS = {RiskLevel.HIGH, RiskLevel.CRITICAL}
+PENDING_STATES = {ProposalStatus.PENDING, ProposalStatus.APPROVED, ProposalStatus.QUEUED, ProposalStatus.RUNNING}
+
+
+def _redirect(path: str, message: str | None = None, error: str | None = None) -> RedirectResponse:
+    params = {key: value for key, value in {"message": message, "error": error}.items() if value}
+    url = path if not params else f"{path}{'&' if '?' in path else '?'}{urlencode(params)}"
+    return RedirectResponse(url=url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "local"
+
+
+def _session_user(request: Request, container: AppContainer):
+    if not container.auth_service.has_users():
+        return None
+    settings = container.settings_service.get_effective_settings()
+    now = container.auth_service.now_epoch()
+    authenticated_at = int(request.session.get(SESSION_AUTHENTICATED_AT, 0) or 0)
+    if not authenticated_at or now - authenticated_at > settings.session_max_age_seconds:
+        logout_session(request)
+        return None
+    recent_auth_at = int(request.session.get(SESSION_RECENT_AUTH_AT, 0) or 0)
+    recent_auth = bool(recent_auth_at and now - recent_auth_at <= settings.recent_auth_window_seconds)
+    return read_session_user(request, recent_auth)
+
+
+def _page_user_or_redirect(request: Request, container: AppContainer):
+    if not container.auth_service.has_users():
+        return _redirect("/setup")
+    user = _session_user(request, container)
+    if user is None:
+        next_path = request.url.path
+        if request.url.query:
+            next_path = f"{next_path}?{request.url.query}"
+        return _redirect(f"/login?{urlencode({'next': next_path})}")
+    return user
+
+
+def _api_user_or_401(request: Request, container: AppContainer):
+    if not container.auth_service.has_users():
+        raise HTTPException(status_code=403, detail="Initial setup has not been completed.")
+    user = _session_user(request, container)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    return user
+
+
+def _require_recent_auth(
+    request: Request,
+    container: AppContainer,
+    user,
+    current_password: str | None,
+    purpose: str,
+) -> None:
+    if user.recent_auth:
+        return
+    if not current_password:
+        raise AuthorizationError(f"Recent re-authentication is required to {purpose}.")
+    container.auth_service.verify_current_password(user.id, current_password)
+    mark_recent_auth(request, container.auth_service.now_epoch())
+
+
+def _render(
+    templates: Jinja2Templates,
+    request: Request,
+    name: str,
+    container: AppContainer,
+    **context: Any,
+):
+    base_context = {
+        "request": request,
+        "message": request.query_params.get("message"),
+        "error": request.query_params.get("error"),
+        "csrf_token": ensure_csrf_token(request),
+        "current_user": _session_user(request, container),
+        "auth_configured": container.auth_service.has_users(),
+    }
+    base_context.update(context)
+    return templates.TemplateResponse(request=request, name=name, context=base_context)
+
+
+def _filter_proposals(
+    proposals: list[ProposalRecord],
+    status_filter: str | None,
+    risk_filter: str | None,
+    connector_filter: str | None,
+    run_id: str | None,
+) -> list[ProposalRecord]:
+    filtered = proposals
+    if status_filter:
+        filtered = [proposal for proposal in filtered if proposal.status.value == status_filter]
+    if risk_filter:
+        filtered = [proposal for proposal in filtered if proposal.risk_level.value == risk_filter]
+    if connector_filter:
+        filtered = [proposal for proposal in filtered if proposal.connector == connector_filter]
+    if run_id:
+        filtered = [proposal for proposal in filtered if proposal.run_id == run_id]
+    return filtered
+
+
+def _proposal_resources(proposal: ProposalRecord) -> list[str]:
+    resources: list[str] = []
+    for key in ("path", "source_path", "destination_path", "url", "title", "task_id"):
+        value = proposal.payload.get(key)
+        if value:
+            resources.append(f"{key}: {value}")
+    if not resources:
+        resources.append("No external resource reference captured.")
+    return resources
+
+
+def _preview_text(value: str, limit: int = 2500) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}\n\n... truncated ..."
+
+
+def _filesystem_preview(container: AppContainer, proposal: ProposalRecord) -> dict[str, Any]:
+    path_guard = container.policy_engine.path_guard
+    action_type = proposal.action_type
+    raw_path = proposal.payload.get("path")
+    if not raw_path:
+        return {}
+    try:
+        path = path_guard.resolve_for_probe(raw_path)
+    except Exception as exc:
+        return {"preview_error": str(exc)}
+
+    before_text = ""
+    if path.exists() and path.is_file():
+        before_text = path.read_text(encoding="utf-8", errors="ignore")
+    preview: dict[str, Any] = {"target_path": str(path)}
+    if action_type == "filesystem.read_text":
+        preview["before_preview"] = _preview_text(before_text)
+        return preview
+    if action_type == "filesystem.list_directory":
+        entries = sorted(child.name for child in path.iterdir())[:50] if path.exists() and path.is_dir() else []
+        preview["before_preview"] = json.dumps(entries, indent=2)
+        return preview
+    if action_type in {"filesystem.write_text", "filesystem.append_text"}:
+        incoming = proposal.payload.get("content", "")
+        after_text = incoming if action_type == "filesystem.write_text" else before_text + incoming
+        diff = "\n".join(
+            difflib.unified_diff(
+                before_text.splitlines(),
+                after_text.splitlines(),
+                fromfile="before",
+                tofile="after",
+                lineterm="",
+            )
+        )
+        preview["before_preview"] = _preview_text(before_text or "(file did not previously exist)")
+        preview["after_preview"] = _preview_text(after_text)
+        preview["diff_preview"] = _preview_text(diff or "(no textual diff)")
+        return preview
+    if action_type == "filesystem.delete_path":
+        preview["before_preview"] = _preview_text(before_text or "(directory or missing path)")
+        return preview
+    return preview
+
+
+def _rollback_indicator(proposal: ProposalRecord) -> str:
+    mapping = {
+        "filesystem.write_text": "Manual rollback only. No automatic restore snapshot is stored.",
+        "filesystem.append_text": "Manual rollback only. Diff preview is available before approval.",
+        "filesystem.delete_path": "No automatic rollback. Delete actions should be treated as destructive.",
+        "filesystem.make_directory": "Manual rollback possible by removing the created directory.",
+        "http.post": "Rollback depends entirely on the remote service.",
+        "http.put": "Rollback depends entirely on the remote service.",
+        "http.patch": "Rollback depends entirely on the remote service.",
+        "http.delete": "Rollback depends entirely on the remote service.",
+        "task.create": "Manual rollback is possible by marking or removing the task later.",
+    }
+    return mapping.get(proposal.action_type, "No automatic rollback capability is implemented.")
+
+
+def _proposal_preview(container: AppContainer, proposal: ProposalRecord) -> dict[str, Any]:
+    preview: dict[str, Any] = {
+        "affected_resources": _proposal_resources(proposal),
+        "execution_preview": proposal.payload,
+        "rollback": _rollback_indicator(proposal),
+    }
+    if proposal.connector == "filesystem":
+        preview.update(_filesystem_preview(container, proposal))
+    elif proposal.connector == "http":
+        preview["http_preview"] = {
+            "method": proposal.action_type.split(".", 1)[1].upper(),
+            "url": proposal.payload.get("url"),
+            "headers": proposal.payload.get("headers") or {},
+            "body": proposal.payload.get("body"),
+        }
+    elif proposal.connector == "system":
+        preview["system_preview"] = {
+            "action": proposal.action_type,
+            "path": proposal.payload.get("path"),
+        }
+    return preview
+
+
+def _unsafe_warnings(container: AppContainer) -> list[str]:
+    settings = container.settings_service.get_effective_settings()
+    warnings: list[str] = []
+    if settings.runtime_mode.value == "relaxed":
+        warnings.append("Runtime mode is relaxed. More actions can move through with lighter gating.")
+    if settings.allow_http_private_network:
+        warnings.append("HTTP private-network access is enabled. Localhost and private IP targets are reachable.")
+    if settings.http_follow_redirects:
+        warnings.append("HTTP redirects are enabled. Redirect chains can expand the effective request target.")
+    if settings.enable_outlook_connector:
+        warnings.append("Outlook connector is enabled. Email side effects can leave the local workstation.")
+    if not settings.json_audit_enabled:
+        warnings.append("JSON audit logging is disabled. Tamper-evident audit visibility is reduced.")
+    return warnings
+
+
+def _temporary_settings(
+    container: AppContainer,
+    *,
+    provider_name: str | None,
+    model_name: str | None,
+    base_url: str | None,
+    api_key_env: str | None,
+    generic_http_endpoint: str | None,
+    provider_timeout_seconds: float | None,
+):
+    settings = container.settings_service.get_effective_settings()
+    data = settings.model_dump()
+    if provider_name:
+        data["provider"] = provider_name
+    if model_name:
+        data["model"] = model_name
+    if base_url is not None:
+        data["base_url"] = base_url or None
+    if api_key_env:
+        data["api_key_env"] = api_key_env
+    if generic_http_endpoint is not None:
+        data["generic_http_endpoint"] = generic_http_endpoint or None
+    if provider_timeout_seconds is not None:
+        data["provider_timeout_seconds"] = provider_timeout_seconds
+    return type(settings)(**data)
+
+
+@router.get("/setup")
+def setup_page(
+    request: Request,
+    container: AppContainer = Depends(get_container),
+    templates: Jinja2Templates = Depends(get_templates),
+):
+    if container.auth_service.has_users():
+        return _redirect("/login")
+    return _render(templates, request, "templates/setup.html", container, title="Initial Setup")
+
+
+@router.post("/setup")
+async def setup_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    confirm_password: str = Form(...),
+    container: AppContainer = Depends(get_container),
+):
+    await validate_csrf(request)
+    if container.auth_service.has_users():
+        return _redirect("/login", error="Initial setup has already been completed.")
+    payload = SetupRequest(username=username, password=password, confirm_password=confirm_password)
+    if payload.password != payload.confirm_password:
+        return _redirect("/setup", error="Passwords do not match.")
+    user = container.auth_service.create_initial_user(payload.username, payload.password)
+    authenticated_at = container.auth_service.now_epoch()
+    login_session(request, user, authenticated_at)
+    container.audit_service.emit("auth.bootstrap_completed", {"username": user.username})
+    return _redirect("/", message="Initial operator account created.")
+
+
+@router.get("/login")
+def login_page(
+    request: Request,
+    container: AppContainer = Depends(get_container),
+    templates: Jinja2Templates = Depends(get_templates),
+):
+    if not container.auth_service.has_users():
+        return _redirect("/setup")
+    if _session_user(request, container):
+        return _redirect("/")
+    return _render(
+        templates,
+        request,
+        "templates/login.html",
+        container,
+        title="Operator Login",
+        next_path=request.query_params.get("next") or "/",
+    )
+
+
+@router.post("/login")
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    next_path: str = Form("/"),
+    container: AppContainer = Depends(get_container),
+):
+    await validate_csrf(request)
+    settings = container.base_settings
+    container.rate_limiter.check(
+        f"login:{_client_key(request)}",
+        settings.login_rate_limit_attempts,
+        settings.login_rate_limit_window_seconds,
+    )
+    user = container.auth_service.authenticate(username, password)
+    authenticated_at = container.auth_service.now_epoch()
+    login_session(request, user, authenticated_at)
+    container.audit_service.emit("auth.login", {"username": user.username, "client": _client_key(request)})
+    safe_next = next_path if next_path.startswith("/") else "/"
+    return _redirect(safe_next or "/", message="Authenticated.")
+
+
+@router.post("/logout")
+async def logout_submit(request: Request, container: AppContainer = Depends(get_container)):
+    await validate_csrf(request)
+    user = _session_user(request, container)
+    if user:
+        container.audit_service.emit("auth.logout", {"username": user.username})
+    logout_session(request)
+    return _redirect("/login", message="Signed out.")
 
 
 @router.get("/")
@@ -23,20 +379,38 @@ def dashboard(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+
     proposals = container.proposal_service.list()
     counts = Counter(proposal.status.value for proposal in proposals)
-    recent_history = container.history_service.list_action_history(limit=10)
+    pending_by_risk = Counter(
+        proposal.risk_level.value for proposal in proposals if proposal.status in PENDING_STATES
+    )
+    recent_history = container.history_service.list_action_history(limit=20)
     recent_summaries = container.summary_service.list_recent(limit=5)
+    recent_jobs = container.execution_queue_service.list_recent(limit=10)
+    recent_high_risk = [proposal for proposal in proposals if proposal.risk_level in HIGH_RISK_LEVELS][:8]
+    failed_executions = [entry for entry in recent_history if entry.status in {"failed", "blocked"}][:8]
+    audit_status = container.audit_service.verify_integrity()
     context = {
-        "request": request,
+        "title": "Dashboard",
         "counts": counts,
-        "recent_history": recent_history,
+        "pending_by_risk": pending_by_risk,
+        "recent_history": recent_history[:10],
+        "recent_failed_history": failed_executions,
+        "recent_jobs": recent_jobs,
         "recent_summaries": recent_summaries,
+        "recent_high_risk": recent_high_risk,
         "providers": container.provider_service.list_statuses(),
         "connectors": container.connector_registry.list_health(),
-        "message": request.query_params.get("message"),
+        "audit_status": audit_status,
+        "unsafe_warnings": _unsafe_warnings(container),
+        "blocked_count": counts["blocked"],
+        "failed_count": counts["failed"],
     }
-    return templates.TemplateResponse(request=request, name="templates/dashboard.html", context=context)
+    return _render(templates, request, "templates/dashboard.html", container, **context)
 
 
 @router.get("/run")
@@ -45,13 +419,22 @@ def run_agent_form(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
     context = {
-        "request": request,
+        "title": "Run Agent",
         "providers": container.provider_service.list_statuses(),
         "settings": container.settings_service.get_effective_settings(),
-        "message": request.query_params.get("message"),
+        "system_actions": [
+            "system.list_directory",
+            "system.read_text_file",
+            "system.test_path",
+            "system.get_time",
+        ],
+        "unsafe_warnings": _unsafe_warnings(container),
     }
-    return templates.TemplateResponse(request=request, name="templates/run_agent.html", context=context)
+    return _render(templates, request, "templates/run_agent.html", container, **context)
 
 
 @router.post("/run")
@@ -66,11 +449,17 @@ async def run_agent_submit(
     http_headers_text: str | None = Form(None),
     task_title: str | None = Form(None),
     task_details: str | None = Form(None),
-    powershell_command: str | None = Form(None),
+    system_action: str | None = Form(None),
+    system_path: str | None = Form(None),
     provider_name: str | None = Form(None),
     model_name: str | None = Form(None),
     container: AppContainer = Depends(get_container),
 ):
+    await validate_csrf(request)
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+
     run_request = AgentRunRequest(
         objective=objective,
         filesystem_path=filesystem_path or None,
@@ -81,46 +470,73 @@ async def run_agent_submit(
         http_headers_text=http_headers_text if http_headers_text not in {"", None} else None,
         task_title=task_title or None,
         task_details=task_details or None,
-        powershell_command=powershell_command or None,
+        system_action=system_action or None,
+        system_path=system_path or None,
         provider_name=provider_name or None,
         model_name=model_name or None,
     )
     result = container.runtime_service.run_agent(run_request)
-    return RedirectResponse(
-        url=f"/proposals?run_id={result.run_id}",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
+    return _redirect(f"/proposals?run_id={result.run_id}", message="Collected context and created approval-ready proposals.")
 
 
 @router.get("/proposals")
 def proposals_page(
     request: Request,
     status_filter: str | None = None,
+    risk_filter: str | None = None,
+    connector_filter: str | None = None,
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
-    proposals = container.proposal_service.list(status_filter)
-    run_id = request.query_params.get("run_id")
-    if run_id:
-        proposals = [proposal for proposal in proposals if proposal.run_id == run_id]
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+    proposals = _filter_proposals(
+        container.proposal_service.list(),
+        status_filter,
+        risk_filter,
+        connector_filter,
+        request.query_params.get("run_id"),
+    )
     context = {
-        "request": request,
+        "title": "Proposals Inbox",
         "proposals": proposals,
         "status_filter": status_filter,
-        "message": request.query_params.get("message"),
+        "risk_filter": risk_filter,
+        "connector_filter": connector_filter,
+        "high_risk_count": sum(1 for proposal in proposals if proposal.risk_level in HIGH_RISK_LEVELS),
+        "connector_options": sorted({proposal.connector for proposal in container.proposal_service.list()}),
     }
-    return templates.TemplateResponse(request=request, name="templates/proposals.html", context=context)
+    return _render(templates, request, "templates/proposals.html", container, **context)
 
 
 @router.get("/approvals")
 def approvals_page(
     request: Request,
+    risk_filter: str | None = None,
+    connector_filter: str | None = None,
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
-    proposals = container.proposal_service.list(ProposalStatus.PENDING.value)
-    context = {"request": request, "proposals": proposals, "message": request.query_params.get("message")}
-    return templates.TemplateResponse(request=request, name="templates/approvals.html", context=context)
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+    proposals = _filter_proposals(
+        container.proposal_service.list(ProposalStatus.PENDING.value),
+        None,
+        risk_filter,
+        connector_filter,
+        None,
+    )
+    context = {
+        "title": "Approval UI",
+        "proposals": proposals,
+        "risk_filter": risk_filter,
+        "connector_filter": connector_filter,
+        "high_risk_count": sum(1 for proposal in proposals if proposal.risk_level in HIGH_RISK_LEVELS),
+        "connector_options": sorted({proposal.connector for proposal in container.proposal_service.list()}),
+    }
+    return _render(templates, request, "templates/approvals.html", container, **context)
 
 
 @router.get("/proposals/{proposal_id}")
@@ -130,102 +546,140 @@ def proposal_detail_page(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
     proposal = container.proposal_service.get(proposal_id)
     approvals = container.proposal_service.list_approvals(proposal_id)
-    history = [entry for entry in container.history_service.list_action_history(limit=100) if entry.proposal_id == proposal_id]
+    history = [entry for entry in container.history_service.list_action_history(limit=200) if entry.proposal_id == proposal_id]
+    jobs = [job for job in container.execution_queue_service.list_recent(limit=200) if job.proposal_id == proposal_id]
+    preview = _proposal_preview(container, proposal)
     context = {
-        "request": request,
+        "title": "Proposal Detail",
         "proposal": proposal,
         "approvals": approvals,
         "history": history,
-        "message": request.query_params.get("message"),
-        "error": request.query_params.get("error"),
+        "jobs": jobs,
+        "preview": preview,
+        "require_reauth_for_approval": proposal.risk_level in HIGH_RISK_LEVELS and not user.recent_auth,
     }
-    return templates.TemplateResponse(request=request, name="templates/proposal_detail.html", context=context)
+    return _render(templates, request, "templates/proposal_detail.html", container, **context)
 
 
 @router.post("/proposals/{proposal_id}/approve")
-def approve_proposal(
+async def approve_proposal(
     proposal_id: str,
-    actor: str = Form("operator"),
-    reason: str | None = Form(None),
+    request: Request,
+    reason: str = Form(...),
+    current_password: str | None = Form(None),
     container: AppContainer = Depends(get_container),
 ):
     try:
-        container.runtime_service.approve_and_execute(
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        container.rate_limiter.check(
+            f"approval:{_client_key(request)}",
+            container.base_settings.approval_rate_limit_attempts,
+            container.base_settings.approval_rate_limit_window_seconds,
+        )
+        proposal = container.proposal_service.get(proposal_id)
+        if proposal.risk_level in HIGH_RISK_LEVELS:
+            _require_recent_auth(request, container, user, current_password, "approve a high-risk action")
+        container.runtime_service.approve_and_queue(
             proposal_id,
-            ApprovalDecisionRequest(actor=actor, reason=reason or None),
+            ApprovalDecisionRequest(actor=user.username, reason=reason, current_password=current_password),
         )
-        return RedirectResponse(
-            url=f"/proposals/{proposal_id}?message=Proposal approved and executed.",
-            status_code=status.HTTP_303_SEE_OTHER,
+        return _redirect(
+            f"/proposals/{proposal_id}",
+            message="Proposal approved and queued for the isolated worker.",
         )
-    except Exception as exc:
-        return RedirectResponse(
-            url=f"/proposals/{proposal_id}?error={str(exc)}",
-            status_code=status.HTTP_303_SEE_OTHER,
-        )
+    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError, RateLimitError) as exc:
+        return _redirect(f"/proposals/{proposal_id}", error=str(exc))
 
 
 @router.post("/proposals/{proposal_id}/reject")
-def reject_proposal(
+async def reject_proposal(
     proposal_id: str,
-    actor: str = Form("operator"),
-    reason: str | None = Form(None),
+    request: Request,
+    reason: str = Form(...),
     container: AppContainer = Depends(get_container),
 ):
-    container.runtime_service.reject(
-        proposal_id,
-        ApprovalDecisionRequest(actor=actor, reason=reason or None),
-    )
-    return RedirectResponse(
-        url=f"/proposals/{proposal_id}?message=Proposal rejected.",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        container.runtime_service.reject(
+            proposal_id,
+            ApprovalDecisionRequest(actor=user.username, reason=reason),
+        )
+        return _redirect(f"/proposals/{proposal_id}", message="Proposal rejected.")
+    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError) as exc:
+        return _redirect(f"/proposals/{proposal_id}", error=str(exc))
 
 
 @router.post("/approvals/{proposal_id}/approve")
-def approve_proposal_row(
+async def approve_proposal_row(
     proposal_id: str,
     request: Request,
-    actor: str = Form("operator"),
-    reason: str | None = Form(None),
+    reason: str = Form(...),
+    current_password: str | None = Form(None),
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
-    try:
-        container.runtime_service.approve_and_execute(
-            proposal_id,
-            ApprovalDecisionRequest(actor=actor, reason=reason or None),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await validate_csrf(request)
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        raise HTTPException(status_code=401, detail="Authentication required.")
     proposal = container.proposal_service.get(proposal_id)
-    return templates.TemplateResponse(
-        request=request,
-        name="partials/proposal_row.html",
-        context={"request": request, "proposal": proposal, "compact": True},
+    if proposal.risk_level in HIGH_RISK_LEVELS:
+        raise HTTPException(status_code=409, detail="High-risk approvals require the detail page re-auth flow.")
+    container.rate_limiter.check(
+        f"approval:{_client_key(request)}",
+        container.base_settings.approval_rate_limit_attempts,
+        container.base_settings.approval_rate_limit_window_seconds,
+    )
+    container.runtime_service.approve_and_queue(
+        proposal_id,
+        ApprovalDecisionRequest(actor=user.username, reason=reason, current_password=current_password),
+    )
+    proposal = container.proposal_service.get(proposal_id)
+    return _render(
+        templates,
+        request,
+        "partials/proposal_row.html",
+        container,
+        proposal=proposal,
+        compact=True,
     )
 
 
 @router.post("/approvals/{proposal_id}/reject")
-def reject_proposal_row(
+async def reject_proposal_row(
     proposal_id: str,
     request: Request,
-    actor: str = Form("operator"),
-    reason: str | None = Form(None),
+    reason: str = Form(...),
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    await validate_csrf(request)
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        raise HTTPException(status_code=401, detail="Authentication required.")
     container.runtime_service.reject(
         proposal_id,
-        ApprovalDecisionRequest(actor=actor, reason=reason or None),
+        ApprovalDecisionRequest(actor=user.username, reason=reason),
     )
     proposal = container.proposal_service.get(proposal_id)
-    return templates.TemplateResponse(
-        request=request,
-        name="partials/proposal_row.html",
-        context={"request": request, "proposal": proposal, "compact": True},
+    return _render(
+        templates,
+        request,
+        "partials/proposal_row.html",
+        container,
+        proposal=proposal,
+        compact=True,
     )
 
 
@@ -235,12 +689,17 @@ def history_page(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
     context = {
-        "request": request,
+        "title": "Action History",
         "history": container.history_service.list_action_history(limit=100),
         "connector_runs": container.history_service.list_connector_runs(limit=50),
+        "jobs": container.execution_queue_service.list_recent(limit=50),
+        "audit_status": container.audit_service.verify_integrity(),
     }
-    return templates.TemplateResponse(request=request, name="templates/history.html", context=context)
+    return _render(templates, request, "templates/history.html", container, **context)
 
 
 @router.get("/connectors")
@@ -249,10 +708,17 @@ def connectors_page(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
-    return templates.TemplateResponse(
-        request=request,
-        name="templates/connectors.html",
-        context={"request": request, "connectors": container.connector_registry.list_health()},
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+    return _render(
+        templates,
+        request,
+        "templates/connectors.html",
+        container,
+        title="Connector Status",
+        connectors=container.connector_registry.list_health(),
+        settings=container.settings_service.get_effective_settings(),
     )
 
 
@@ -262,17 +728,29 @@ def settings_page(
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+    settings = container.settings_service.get_effective_settings()
     context = {
-        "request": request,
-        "settings": container.settings_service.get_effective_settings(),
+        "title": "Settings",
+        "settings": settings,
         "providers": container.provider_service.list_statuses(),
-        "message": request.query_params.get("message"),
+        "unsafe_warnings": _unsafe_warnings(container),
+        "audit_status": container.audit_service.verify_integrity(),
+        "export_json": json.dumps(
+            container.settings_service.export_sanitized().model_dump(mode="json"),
+            indent=2,
+        ),
+        "requires_recent_auth": not user.recent_auth,
+        "result": None,
     }
-    return templates.TemplateResponse(request=request, name="templates/settings.html", context=context)
+    return _render(templates, request, "templates/settings.html", container, **context)
 
 
 @router.post("/settings")
-def settings_submit(
+async def settings_submit(
+    request: Request,
     runtime_mode: str = Form(...),
     provider: str = Form(...),
     fallback_provider: str | None = Form(None),
@@ -282,119 +760,300 @@ def settings_submit(
     generic_http_endpoint: str | None = Form(None),
     provider_timeout_seconds: float = Form(...),
     provider_max_retries: int = Form(...),
+    provider_circuit_breaker_threshold: int = Form(...),
+    provider_circuit_breaker_seconds: int = Form(...),
+    summary_profile: str = Form(...),
+    planning_profile: str = Form(...),
+    fast_provider: str | None = Form(None),
+    cheap_provider: str | None = Form(None),
+    strong_provider: str | None = Form(None),
+    local_provider: str | None = Form(None),
     json_audit_enabled: bool = Form(False),
+    session_max_age_seconds: int = Form(...),
+    recent_auth_window_seconds: int = Form(...),
+    max_request_size_bytes: int = Form(...),
+    allowed_http_schemes: str = Form(...),
+    allowed_http_ports: str = Form(...),
+    allow_http_private_network: bool = Form(False),
+    http_follow_redirects: bool = Form(False),
+    http_timeout_seconds: float = Form(...),
+    http_max_response_bytes: int = Form(...),
     allowed_filesystem_roots: str = Form(...),
     allowed_http_hosts: str = Form(...),
-    powershell_allowlist: str = Form(...),
+    enable_system_connector: bool = Form(False),
+    enable_outlook_connector: bool = Form(False),
+    current_password: str | None = Form(None),
     container: AppContainer = Depends(get_container),
 ):
-    container.settings_service.save(
-        SettingsUpdate(
-            runtime_mode=runtime_mode,
-            provider=provider,
-            fallback_provider=fallback_provider or None,
-            model=model,
-            base_url=base_url or None,
-            api_key_env=api_key_env,
-            generic_http_endpoint=generic_http_endpoint or None,
-            provider_timeout_seconds=provider_timeout_seconds,
-            provider_max_retries=provider_max_retries,
-            json_audit_enabled=json_audit_enabled,
-            allowed_filesystem_roots=allowed_filesystem_roots,
-            allowed_http_hosts=allowed_http_hosts,
-            powershell_allowlist=powershell_allowlist,
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(request, container, user, current_password, "change runtime settings")
+        container.settings_service.save(
+            SettingsUpdate(
+                runtime_mode=runtime_mode,
+                provider=provider,
+                fallback_provider=fallback_provider or None,
+                model=model,
+                base_url=base_url or None,
+                api_key_env=api_key_env,
+                generic_http_endpoint=generic_http_endpoint or None,
+                provider_timeout_seconds=provider_timeout_seconds,
+                provider_max_retries=provider_max_retries,
+                provider_circuit_breaker_threshold=provider_circuit_breaker_threshold,
+                provider_circuit_breaker_seconds=provider_circuit_breaker_seconds,
+                summary_profile=summary_profile,
+                planning_profile=planning_profile,
+                fast_provider=fast_provider or None,
+                cheap_provider=cheap_provider or None,
+                strong_provider=strong_provider or None,
+                local_provider=local_provider or None,
+                json_audit_enabled=json_audit_enabled,
+                session_max_age_seconds=session_max_age_seconds,
+                recent_auth_window_seconds=recent_auth_window_seconds,
+                max_request_size_bytes=max_request_size_bytes,
+                allowed_http_schemes=allowed_http_schemes,
+                allowed_http_ports=allowed_http_ports,
+                allow_http_private_network=allow_http_private_network,
+                http_follow_redirects=http_follow_redirects,
+                http_timeout_seconds=http_timeout_seconds,
+                http_max_response_bytes=http_max_response_bytes,
+                allowed_filesystem_roots=allowed_filesystem_roots,
+                allowed_http_hosts=allowed_http_hosts,
+                enable_system_connector=enable_system_connector,
+                enable_outlook_connector=enable_outlook_connector,
+            )
         )
-    )
-    return RedirectResponse(
-        url="/settings?message=Settings saved.",
-        status_code=status.HTTP_303_SEE_OTHER,
-    )
+        container.audit_service.emit(
+            "settings.updated",
+            {
+                "actor": user.username,
+                "runtime_mode": runtime_mode,
+                "provider": provider,
+                "enable_system_connector": enable_system_connector,
+                "enable_outlook_connector": enable_outlook_connector,
+            },
+        )
+        return _redirect("/settings", message="Settings saved.")
+    except (AuthenticationError, AuthorizationError, CsrfError) as exc:
+        return _redirect("/settings", error=str(exc))
+
+
+@router.post("/settings/reset")
+async def settings_reset(
+    request: Request,
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(request, container, user, current_password, "reset runtime settings")
+        container.settings_service.reset_to_safe_defaults()
+        container.audit_service.emit("settings.reset_to_safe_defaults", {"actor": user.username})
+        return _redirect("/settings", message="Safe defaults restored.")
+    except (AuthenticationError, AuthorizationError, CsrfError) as exc:
+        return _redirect("/settings", error=str(exc))
+
+
+@router.get("/settings/export")
+def settings_export(
+    request: Request,
+    container: AppContainer = Depends(get_container),
+):
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        return user
+    exported = container.settings_service.export_sanitized()
+    return JSONResponse(content=exported.model_dump(mode="json"))
+
+
+@router.post("/settings/import")
+async def settings_import(
+    request: Request,
+    settings_json: str = Form(...),
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(request, container, user, current_password, "import runtime settings")
+        exported = SanitizedSettingsExport(**json.loads(settings_json))
+        container.settings_service.import_sanitized(exported)
+        container.audit_service.emit("settings.imported", {"actor": user.username})
+        return _redirect("/settings", message="Sanitized settings imported.")
+    except (AuthenticationError, AuthorizationError, CsrfError, ValueError, json.JSONDecodeError) as exc:
+        return _redirect("/settings", error=str(exc))
 
 
 @router.post("/settings/test-provider")
-def test_provider_partial(
+async def test_provider_partial(
     request: Request,
     provider_name: str = Form(...),
     model_name: str = Form(...),
     prompt: str = Form("Return a one-line readiness confirmation."),
+    base_url: str | None = Form(None),
+    api_key_env: str | None = Form(None),
+    generic_http_endpoint: str | None = Form(None),
+    provider_timeout_seconds: float | None = Form(None),
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
 ):
+    await validate_csrf(request)
+    user = _page_user_or_redirect(request, container)
+    if isinstance(user, RedirectResponse):
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    settings_override = _temporary_settings(
+        container,
+        provider_name=provider_name,
+        model_name=model_name,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        generic_http_endpoint=generic_http_endpoint,
+        provider_timeout_seconds=provider_timeout_seconds,
+    )
     result = container.provider_service.test_provider(
-        ProviderTestRequest(provider_name=provider_name, model_name=model_name, prompt=prompt)
+        ProviderTestRequest(provider_name=provider_name, model_name=model_name, prompt=prompt),
+        settings_override=settings_override,
     )
-    return templates.TemplateResponse(
-        request=request,
-        name="partials/provider_test_result.html",
-        context={"request": request, "result": result},
+    return _render(
+        templates,
+        request,
+        "partials/provider_test_result.html",
+        container,
+        result=result,
     )
-
-
-@router.post("/api/runs")
-def api_run_agent(payload: AgentRunRequest, container: AppContainer = Depends(get_container)):
-    return container.runtime_service.run_agent(payload)
 
 
 @router.get("/api/proposals")
 def api_list_proposals(
+    request: Request,
     status_filter: str | None = None,
     container: AppContainer = Depends(get_container),
 ):
+    _api_user_or_401(request, container)
     return container.proposal_service.list(status_filter)
 
 
 @router.get("/api/proposals/{proposal_id}")
-def api_get_proposal(proposal_id: str, container: AppContainer = Depends(get_container)):
+def api_get_proposal(
+    proposal_id: str,
+    request: Request,
+    container: AppContainer = Depends(get_container),
+):
+    _api_user_or_401(request, container)
     try:
         return container.proposal_service.get(proposal_id)
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/api/runs")
+async def api_run_agent(
+    request: Request,
+    payload: AgentRunRequest,
+    container: AppContainer = Depends(get_container),
+):
+    _api_user_or_401(request, container)
+    await validate_csrf(request)
+    return container.runtime_service.run_agent(payload)
+
+
 @router.post("/api/proposals/{proposal_id}/approve")
-def api_approve_proposal(
+async def api_approve_proposal(
     proposal_id: str,
+    request: Request,
     payload: ApprovalDecisionRequest,
     container: AppContainer = Depends(get_container),
 ):
+    user = _api_user_or_401(request, container)
+    await validate_csrf(request)
+    proposal = container.proposal_service.get(proposal_id)
+    if proposal.risk_level in HIGH_RISK_LEVELS:
+        _require_recent_auth(
+            request,
+            container,
+            user,
+            payload.current_password,
+            "approve a high-risk action",
+        )
     try:
-        return container.runtime_service.approve_and_execute(proposal_id, payload)
-    except (InvalidStateError, NotFoundError) as exc:
+        result = container.runtime_service.approve_and_queue(
+            proposal_id,
+            payload.model_copy(update={"actor": user.username}),
+        )
+        return JSONResponse(content=jsonable_encoder(result), status_code=202)
+    except (InvalidStateError, NotFoundError, AuthorizationError, AuthenticationError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/api/proposals/{proposal_id}/reject")
-def api_reject_proposal(
+async def api_reject_proposal(
     proposal_id: str,
+    request: Request,
     payload: ApprovalDecisionRequest,
     container: AppContainer = Depends(get_container),
 ):
+    user = _api_user_or_401(request, container)
+    await validate_csrf(request)
     try:
-        return container.runtime_service.reject(proposal_id, payload)
+        return container.runtime_service.reject(
+            proposal_id,
+            payload.model_copy(update={"actor": user.username}),
+        )
     except (InvalidStateError, NotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/api/history")
-def api_history(container: AppContainer = Depends(get_container)):
+def api_history(request: Request, container: AppContainer = Depends(get_container)):
+    _api_user_or_401(request, container)
     return {
         "actions": container.history_service.list_action_history(limit=100),
         "connector_runs": container.history_service.list_connector_runs(limit=100),
+        "jobs": container.execution_queue_service.list_recent(limit=100),
     }
 
 
 @router.get("/api/providers")
-def api_providers(container: AppContainer = Depends(get_container)):
+def api_providers(request: Request, container: AppContainer = Depends(get_container)):
+    _api_user_or_401(request, container)
     return container.provider_service.list_statuses()
 
 
 @router.get("/api/connectors")
-def api_connectors(container: AppContainer = Depends(get_container)):
+def api_connectors(request: Request, container: AppContainer = Depends(get_container)):
+    _api_user_or_401(request, container)
     return container.connector_registry.list_health()
 
 
+@router.get("/api/jobs")
+def api_jobs(request: Request, container: AppContainer = Depends(get_container)):
+    _api_user_or_401(request, container)
+    return container.execution_queue_service.list_recent(limit=100)
+
+
+@router.get("/api/audit/verify")
+def api_verify_audit(request: Request, container: AppContainer = Depends(get_container)):
+    _api_user_or_401(request, container)
+    return container.audit_service.verify_integrity()
+
+
 @router.post("/api/providers/test")
-def api_test_provider(payload: ProviderTestRequest, container: AppContainer = Depends(get_container)):
+async def api_test_provider(
+    request: Request,
+    payload: ProviderTestRequest,
+    container: AppContainer = Depends(get_container),
+):
+    _api_user_or_401(request, container)
+    await validate_csrf(request)
     result = container.provider_service.test_provider(payload)
     status_code = 200 if result.ok else 400
     return JSONResponse(content=result.model_dump(), status_code=status_code)

@@ -8,6 +8,9 @@ from app.schemas.settings import EffectiveSettings
 class MockProvider(BaseProvider):
     name = "mock"
     description = "Deterministic provider for local testing and offline development."
+    profiles = ["fast", "cheap", "local-only"]
+    supports_local = True
+    supports_remote = False
 
     def complete(self, request: ProviderRequest, settings: EffectiveSettings) -> ProviderResponse:
         prompt = request.prompt.strip()

@@ -2,13 +2,49 @@
 {% block content %}
 <section class="card">
     <div class="card-header">
-        <h2>Proposals Inbox</h2>
-        <div class="inline-actions">
-            <a class="button ghost" href="/proposals">All</a>
-            <a class="button ghost" href="/proposals?status_filter=pending">Pending</a>
-            <a class="button ghost" href="/proposals?status_filter=executed">Executed</a>
+        <div>
+            <h2>Proposals Inbox</h2>
+            <p class="muted">Risk-first review surface for pending, queued, running, and historical proposals.</p>
+        </div>
+        <div class="stack tight align-end">
+            <span class="badge high">{{ high_risk_count }} high-risk visible</span>
         </div>
     </div>
+
+    <form method="get" action="/proposals" class="toolbar">
+        <label>
+            Status
+            <select name="status_filter">
+                <option value="">All</option>
+                {% for value in ["pending","approved","queued","running","executed","failed","blocked","rejected"] %}
+                <option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Risk
+            <select name="risk_filter">
+                <option value="">All</option>
+                {% for value in ["low","medium","high","critical"] %}
+                <option value="{{ value }}" {% if risk_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Connector
+            <select name="connector_filter">
+                <option value="">All</option>
+                {% for value in connector_options %}
+                <option value="{{ value }}" {% if connector_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <div class="actions align-end">
+            <button type="submit" class="button ghost">Filter</button>
+            <a class="button ghost" href="/proposals">Reset</a>
+        </div>
+    </form>
+
     <table>
         <thead>
             <tr>
@@ -17,7 +53,7 @@
                 <th>Risk</th>
                 <th>Status</th>
                 <th>Created</th>
-                <th></th>
+                <th>Review</th>
             </tr>
         </thead>
         <tbody>
@@ -25,11 +61,10 @@
                 {% include "partials/proposal_row.html" %}
             {% else %}
             <tr>
-                <td colspan="6" class="muted">No proposals found.</td>
+                <td colspan="6" class="muted">No proposals matched the current filters.</td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
 </section>
 {% endblock %}
-

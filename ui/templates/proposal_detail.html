@@ -12,47 +12,114 @@
         </div>
     </div>
 
+    <section class="risk-banner {{ proposal.risk_level.value }}">
+        <strong>Risk:</strong> {{ proposal.risk_level.value|upper }}
+        <span>Approval reason is mandatory, and high-risk approvals require recent re-authentication.</span>
+    </section>
+
     <div class="grid two">
         <article class="panel">
-            <h3>Action</h3>
-            <p><strong>Connector:</strong> {{ proposal.connector }}</p>
-            <p><strong>Action Type:</strong> {{ proposal.action_type }}</p>
-            <p><strong>Requires Approval:</strong> {{ "yes" if proposal.requires_approval else "no" }}</p>
-            <p><strong>Created:</strong> {{ proposal.created_at }}</p>
-            <p><strong>Objective:</strong> {{ proposal.objective }}</p>
-            <p><strong>Rationale:</strong> {{ proposal.rationale }}</p>
-            <pre>{{ proposal.payload | tojson(indent=2) }}</pre>
-        </article>
+            <h3>Why This Was Proposed</h3>
+            <p>{{ proposal.rationale or "No explicit rationale was stored." }}</p>
 
-        <article class="panel">
-            <h3>Policy Notes</h3>
+            <h3>Policy Evaluation</h3>
             <ul class="flat-list">
                 {% for note in proposal.policy_notes %}
                 <li>{{ note }}</li>
                 {% else %}
-                <li class="muted">No policy notes.</li>
+                <li class="muted">No policy notes were stored.</li>
                 {% endfor %}
             </ul>
 
-            {% if proposal.status.value == "pending" %}
-            <div class="actions">
-                <form method="post" action="/proposals/{{ proposal.id }}/approve">
-                    <input type="hidden" name="actor" value="operator">
-                    <input type="hidden" name="reason" value="Approved from proposal detail view">
-                    <button class="button primary" type="submit">Approve and Execute</button>
-                </form>
-                <form method="post" action="/proposals/{{ proposal.id }}/reject">
-                    <input type="hidden" name="actor" value="operator">
-                    <input type="hidden" name="reason" value="Rejected from proposal detail view">
-                    <button class="button danger" type="submit">Reject</button>
-                </form>
-            </div>
+            <h3>Affected Resources</h3>
+            <ul class="flat-list">
+                {% for resource in preview.affected_resources %}
+                <li>{{ resource }}</li>
+                {% endfor %}
+            </ul>
+
+            <h3>Rollback Indicator</h3>
+            <p>{{ preview.rollback }}</p>
+        </article>
+
+        <article class="panel">
+            <h3>Execution Preview</h3>
+            <pre>{{ preview.execution_preview | tojson(indent=2) }}</pre>
+
+            {% if preview.http_preview %}
+            <h3>HTTP Request Preview</h3>
+            <pre>{{ preview.http_preview | tojson(indent=2) }}</pre>
+            {% endif %}
+
+            {% if preview.system_preview %}
+            <h3>System Action Preview</h3>
+            <pre>{{ preview.system_preview | tojson(indent=2) }}</pre>
             {% endif %}
         </article>
     </div>
 </section>
 
+{% if preview.before_preview or preview.after_preview or preview.diff_preview %}
+<section class="grid three">
+    {% if preview.before_preview %}
+    <article class="card">
+        <h3>Before Preview</h3>
+        <pre>{{ preview.before_preview }}</pre>
+    </article>
+    {% endif %}
+    {% if preview.after_preview %}
+    <article class="card">
+        <h3>After Preview</h3>
+        <pre>{{ preview.after_preview }}</pre>
+    </article>
+    {% endif %}
+    {% if preview.diff_preview %}
+    <article class="card">
+        <h3>Diff Preview</h3>
+        <pre>{{ preview.diff_preview }}</pre>
+    </article>
+    {% endif %}
+</section>
+{% endif %}
+
 <section class="grid two">
+    <article class="card">
+        <div class="card-header">
+            <h3>Approval Decision</h3>
+            <span class="badge {{ 'warn' if require_reauth_for_approval else 'ok' }}">{{ "Re-auth required" if require_reauth_for_approval else "Ready" }}</span>
+        </div>
+
+        {% if proposal.status.value == "pending" %}
+        <div class="stack">
+            <form method="post" action="/proposals/{{ proposal.id }}/approve" class="stack form-grid">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label>
+                    Approval Reason
+                    <textarea name="reason" rows="3" minlength="5" placeholder="Explain why this action is acceptable." required></textarea>
+                </label>
+                {% if require_reauth_for_approval %}
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" required>
+                </label>
+                {% endif %}
+                <button class="button primary" type="submit">Approve and Queue</button>
+            </form>
+
+            <form method="post" action="/proposals/{{ proposal.id }}/reject" class="stack form-grid">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label>
+                    Rejection Reason
+                    <textarea name="reason" rows="3" minlength="5" placeholder="Explain why this proposal should be rejected." required></textarea>
+                </label>
+                <button class="button danger" type="submit">Reject</button>
+            </form>
+        </div>
+        {% else %}
+        <p class="muted">This proposal is no longer pending. Review the logs below for the final state.</p>
+        {% endif %}
+    </article>
+
     <article class="card">
         <h3>Approval Log</h3>
         <div class="stack">
@@ -66,22 +133,34 @@
             <p class="muted">No approval records yet.</p>
             {% endfor %}
         </div>
-    </article>
 
-    <article class="card">
-        <h3>Execution Log</h3>
+        <h3>Worker Queue</h3>
         <div class="stack">
-            {% for entry in history %}
+            {% for job in jobs %}
             <div class="list-item">
-                <strong>{{ entry.status }}</strong>
-                <p>{{ entry.action_type }}</p>
-                <pre>{{ entry.output | tojson(indent=2) if entry.output else entry.error_text or "No output" }}</pre>
+                <strong>{{ job.status.value }}</strong>
+                <p>Job {{ job.id }} queued by {{ job.queued_by }}</p>
+                <small>{{ job.queued_at }}</small>
             </div>
             {% else %}
-            <p class="muted">No execution history yet.</p>
+            <p class="muted">No worker job has been created for this proposal yet.</p>
             {% endfor %}
         </div>
     </article>
 </section>
-{% endblock %}
 
+<section class="card">
+    <h3>Execution Log</h3>
+    <div class="stack">
+        {% for entry in history %}
+        <div class="list-item">
+            <strong>{{ entry.status }}</strong>
+            <p>{{ entry.action_type }}</p>
+            <pre>{{ entry.output | tojson(indent=2) if entry.output else entry.error_text or "No output" }}</pre>
+        </div>
+        {% else %}
+        <p class="muted">No execution history yet.</p>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}

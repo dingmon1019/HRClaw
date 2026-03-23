@@ -85,6 +85,15 @@ CREATE TABLE IF NOT EXISTS settings (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -94,10 +103,36 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS execution_jobs (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    queued_by TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    worker_id TEXT,
+    result_json TEXT,
+    error_text TEXT,
+    FOREIGN KEY(proposal_id) REFERENCES proposals(id)
+);
+
+CREATE TABLE IF NOT EXISTS audit_entries (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    prev_hash TEXT,
+    entry_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_created_at ON proposals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_action_history_started_at ON action_history(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_connector_runs_created_at ON connector_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_jobs_status ON execution_jobs(status, queued_at ASC);
+CREATE INDEX IF NOT EXISTS idx_audit_entries_created_at ON audit_entries(created_at ASC);
 """
 
 
@@ -136,4 +171,3 @@ class Database:
     def fetch_all(self, query: str, params: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         with self.connection() as conn:
             return conn.execute(query, params).fetchall()
-

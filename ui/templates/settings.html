@@ -3,126 +3,315 @@
 <section class="grid two">
     <article class="card">
         <div class="card-header">
-            <h2>Runtime Settings</h2>
-            <p class="muted">Persistent settings are stored in SQLite and merged with `.env` defaults.</p>
+            <div>
+                <h2>Runtime Settings</h2>
+                <p class="muted">Settings are persisted in SQLite and merged with `.env` defaults. Sensitive changes require recent re-authentication.</p>
+            </div>
+            <span class="badge {{ 'warn' if requires_recent_auth else 'ok' }}">{{ "Re-auth needed" if requires_recent_auth else "Recent auth active" }}</span>
         </div>
+
+        {% if unsafe_warnings %}
+        <section class="notice danger">
+            {% for warning in unsafe_warnings %}
+            <div>{{ warning }}</div>
+            {% endfor %}
+        </section>
+        {% endif %}
+
         <form method="post" action="/settings" class="stack form-grid">
-            <div class="grid two">
-                <label>
-                    Runtime Mode
-                    <select name="runtime_mode">
-                        <option value="safe" {% if settings.runtime_mode.value == "safe" %}selected{% endif %}>safe</option>
-                        <option value="relaxed" {% if settings.runtime_mode.value == "relaxed" %}selected{% endif %}>relaxed</option>
-                    </select>
-                </label>
-                <label>
-                    Provider
-                    <select name="provider">
-                        {% for provider in providers %}
-                        <option value="{{ provider.name }}" {% if settings.provider == provider.name %}selected{% endif %}>{{ provider.name }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <div class="settings-group">
+                <h3>Safe Defaults</h3>
+                <div class="grid two">
+                    <label>
+                        Runtime Mode
+                        <select name="runtime_mode">
+                            <option value="safe" {% if settings.runtime_mode.value == "safe" %}selected{% endif %}>safe</option>
+                            <option value="relaxed" {% if settings.runtime_mode.value == "relaxed" %}selected{% endif %}>relaxed</option>
+                        </select>
+                    </label>
+                    <label>
+                        Allowed Filesystem Roots
+                        <input type="text" name="allowed_filesystem_roots" value="{{ settings.allowed_filesystem_roots | join(',') }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Allowed HTTP Hosts
+                        <input type="text" name="allowed_http_hosts" value="{{ settings.allowed_http_hosts | join(',') }}">
+                    </label>
+                    <label>
+                        Allowed HTTP Schemes
+                        <input type="text" name="allowed_http_schemes" value="{{ settings.allowed_http_schemes | join(',') }}">
+                    </label>
+                </div>
+
+                <div class="grid three">
+                    <label>
+                        Allowed HTTP Ports
+                        <input type="text" name="allowed_http_ports" value="{{ settings.allowed_http_ports | join(',') }}">
+                    </label>
+                    <label>
+                        HTTP Timeout Seconds
+                        <input type="number" step="1" min="1" name="http_timeout_seconds" value="{{ settings.http_timeout_seconds }}">
+                    </label>
+                    <label>
+                        Max Response Bytes
+                        <input type="number" min="1024" name="http_max_response_bytes" value="{{ settings.http_max_response_bytes }}">
+                    </label>
+                </div>
             </div>
 
-            <div class="grid two">
-                <label>
-                    Fallback Provider
-                    <input type="text" name="fallback_provider" value="{{ settings.fallback_provider or '' }}">
-                </label>
-                <label>
-                    Model
-                    <input type="text" name="model" value="{{ settings.model }}">
-                </label>
+            <div class="settings-group">
+                <h3>Provider Orchestration</h3>
+                <div class="grid two">
+                    <label>
+                        Primary Provider
+                        <select name="provider">
+                            {% for provider in providers %}
+                            <option value="{{ provider.name }}" {% if settings.provider == provider.name %}selected{% endif %}>{{ provider.name }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        Fallback Provider
+                        <input type="text" name="fallback_provider" value="{{ settings.fallback_provider or '' }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Model
+                        <input type="text" name="model" value="{{ settings.model }}">
+                    </label>
+                    <label>
+                        API Key Env
+                        <input type="text" name="api_key_env" value="{{ settings.api_key_env }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Base URL
+                        <input type="text" name="base_url" value="{{ settings.base_url or '' }}">
+                    </label>
+                    <label>
+                        Generic HTTP Endpoint
+                        <input type="text" name="generic_http_endpoint" value="{{ settings.generic_http_endpoint or '' }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Provider Timeout Seconds
+                        <input type="number" step="1" min="1" name="provider_timeout_seconds" value="{{ settings.provider_timeout_seconds }}">
+                    </label>
+                    <label>
+                        Provider Max Retries
+                        <input type="number" min="0" name="provider_max_retries" value="{{ settings.provider_max_retries }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Circuit Breaker Threshold
+                        <input type="number" min="1" name="provider_circuit_breaker_threshold" value="{{ settings.provider_circuit_breaker_threshold }}">
+                    </label>
+                    <label>
+                        Circuit Breaker Cooldown
+                        <input type="number" min="5" name="provider_circuit_breaker_seconds" value="{{ settings.provider_circuit_breaker_seconds }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Summary Profile
+                        <select name="summary_profile">
+                            {% for value in ["fast","cheap","strong","local-only"] %}
+                            <option value="{{ value }}" {% if settings.summary_profile == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        Planning Profile
+                        <select name="planning_profile">
+                            {% for value in ["fast","cheap","strong","local-only"] %}
+                            <option value="{{ value }}" {% if settings.planning_profile == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Fast Provider
+                        <input type="text" name="fast_provider" value="{{ settings.fast_provider or '' }}">
+                    </label>
+                    <label>
+                        Cheap Provider
+                        <input type="text" name="cheap_provider" value="{{ settings.cheap_provider or '' }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Strong Provider
+                        <input type="text" name="strong_provider" value="{{ settings.strong_provider or '' }}">
+                    </label>
+                    <label>
+                        Local-only Provider
+                        <input type="text" name="local_provider" value="{{ settings.local_provider or '' }}">
+                    </label>
+                </div>
             </div>
 
-            <div class="grid two">
-                <label>
-                    Base URL
-                    <input type="text" name="base_url" value="{{ settings.base_url or '' }}">
-                </label>
-                <label>
-                    API Key Env
-                    <input type="text" name="api_key_env" value="{{ settings.api_key_env }}">
-                </label>
-            </div>
+            <div class="settings-group danger-panel">
+                <h3>Dangerous / Sensitive</h3>
+                <div class="grid two">
+                    <label class="checkbox">
+                        <input type="checkbox" name="allow_http_private_network" value="true" {% if settings.allow_http_private_network %}checked{% endif %}>
+                        Allow localhost/private-network HTTP access
+                    </label>
+                    <label class="checkbox">
+                        <input type="checkbox" name="http_follow_redirects" value="true" {% if settings.http_follow_redirects %}checked{% endif %}>
+                        Follow HTTP redirects
+                    </label>
+                </div>
 
-            <div class="grid two">
-                <label>
-                    Generic HTTP Endpoint
-                    <input type="text" name="generic_http_endpoint" value="{{ settings.generic_http_endpoint or '' }}">
-                </label>
-                <label>
-                    Provider Timeout Seconds
-                    <input type="number" step="1" min="1" name="provider_timeout_seconds" value="{{ settings.provider_timeout_seconds }}">
-                </label>
-            </div>
+                <div class="grid two">
+                    <label class="checkbox">
+                        <input type="checkbox" name="enable_system_connector" value="true" {% if settings.enable_system_connector %}checked{% endif %}>
+                        Enable bounded system connector
+                    </label>
+                    <label class="checkbox">
+                        <input type="checkbox" name="enable_outlook_connector" value="true" {% if settings.enable_outlook_connector %}checked{% endif %}>
+                        Enable Outlook connector
+                    </label>
+                </div>
 
-            <div class="grid two">
-                <label>
-                    Provider Max Retries
-                    <input type="number" min="0" name="provider_max_retries" value="{{ settings.provider_max_retries }}">
-                </label>
-                <label class="checkbox">
-                    <input type="checkbox" name="json_audit_enabled" value="true" {% if settings.json_audit_enabled %}checked{% endif %}>
-                    Enable JSON audit log
-                </label>
+                <div class="grid two">
+                    <label class="checkbox">
+                        <input type="checkbox" name="json_audit_enabled" value="true" {% if settings.json_audit_enabled %}checked{% endif %}>
+                        Enable JSON audit log
+                    </label>
+                    <label>
+                        Max Request Size Bytes
+                        <input type="number" min="4096" name="max_request_size_bytes" value="{{ settings.max_request_size_bytes }}">
+                    </label>
+                </div>
+
+                <div class="grid two">
+                    <label>
+                        Session Max Age Seconds
+                        <input type="number" min="300" name="session_max_age_seconds" value="{{ settings.session_max_age_seconds }}">
+                    </label>
+                    <label>
+                        Recent Auth Window Seconds
+                        <input type="number" min="30" name="recent_auth_window_seconds" value="{{ settings.recent_auth_window_seconds }}">
+                    </label>
+                </div>
             </div>
 
             <label>
-                Allowed Filesystem Roots
-                <input type="text" name="allowed_filesystem_roots" value="{{ settings.allowed_filesystem_roots | join(',') }}">
-            </label>
-
-            <label>
-                Allowed HTTP Hosts
-                <input type="text" name="allowed_http_hosts" value="{{ settings.allowed_http_hosts | join(',') }}">
-            </label>
-
-            <label>
-                PowerShell Allowlist
-                <input type="text" name="powershell_allowlist" value="{{ settings.powershell_allowlist | join(',') }}">
+                Current Password
+                <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
             </label>
 
             <div class="actions">
-                <button type="submit" class="button primary">Save Settings</button>
+                <button type="submit" class="button primary">Validate and Save</button>
             </div>
         </form>
     </article>
 
     <article class="card">
         <div class="card-header">
-            <h2>Provider Smoke Test</h2>
-            <p class="muted">Run a live provider test without leaving the page.</p>
+            <div>
+                <h2>Validation / Export</h2>
+                <p class="muted">Test provider settings before saving, verify audit integrity, and move sanitized configuration without secrets.</p>
+            </div>
+            <span class="badge {{ 'ok' if audit_status.ok else 'danger' }}">{{ "Audit OK" if audit_status.ok else "Audit Broken" }}</span>
         </div>
-        <form
-            class="stack"
-            hx-post="/settings/test-provider"
-            hx-target="#provider-test-result"
-            hx-swap="innerHTML"
-        >
-            <label>
-                Provider
-                <select name="provider_name">
-                    {% for provider in providers %}
-                    <option value="{{ provider.name }}">{{ provider.name }}</option>
-                    {% endfor %}
-                </select>
-            </label>
-            <label>
-                Model
-                <input type="text" name="model_name" value="{{ settings.model }}">
-            </label>
-            <label>
-                Prompt
-                <textarea name="prompt" rows="4">Return a one-line readiness confirmation.</textarea>
-            </label>
-            <button type="submit" class="button ghost">Test Provider</button>
-        </form>
-        <div id="provider-test-result" class="mt-16">
-            {% include "partials/provider_test_result.html" %}
+
+        <div class="stack">
+            <div class="panel">
+                <h3>Configured Secret Envs</h3>
+                <p>{{ settings.configured_secret_envs | join(', ') if settings.configured_secret_envs else "No secret environment variables detected." }}</p>
+            </div>
+
+            <form
+                class="stack"
+                hx-post="/settings/test-provider"
+                hx-target="#provider-test-result"
+                hx-swap="innerHTML"
+            >
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label>
+                    Provider
+                    <select name="provider_name">
+                        {% for provider in providers %}
+                        <option value="{{ provider.name }}">{{ provider.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>
+                    Model
+                    <input type="text" name="model_name" value="{{ settings.model }}">
+                </label>
+                <label>
+                    Base URL
+                    <input type="text" name="base_url" value="{{ settings.base_url or '' }}">
+                </label>
+                <label>
+                    Generic HTTP Endpoint
+                    <input type="text" name="generic_http_endpoint" value="{{ settings.generic_http_endpoint or '' }}">
+                </label>
+                <label>
+                    API Key Env
+                    <input type="text" name="api_key_env" value="{{ settings.api_key_env }}">
+                </label>
+                <label>
+                    Prompt
+                    <textarea name="prompt" rows="3">Return a one-line readiness confirmation.</textarea>
+                </label>
+                <button type="submit" class="button ghost">Test Provider Config</button>
+            </form>
+
+            <div id="provider-test-result">
+                {% include "partials/provider_test_result.html" %}
+            </div>
+
+            <div class="panel">
+                <h3>Export Sanitized Config</h3>
+                <div class="actions">
+                    <a href="/settings/export" class="button ghost">Download JSON</a>
+                </div>
+                <pre>{{ export_json }}</pre>
+            </div>
+
+            <form method="post" action="/settings/import" class="stack form-grid">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label>
+                    Import Sanitized Config
+                    <textarea name="settings_json" rows="8" placeholder="Paste sanitized JSON export here."></textarea>
+                </label>
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                </label>
+                <button type="submit" class="button ghost">Import Sanitized Config</button>
+            </form>
+
+            <form method="post" action="/settings/reset" class="stack form-grid">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                </label>
+                <button type="submit" class="button danger">Reset To Safe Defaults</button>
+            </form>
         </div>
     </article>
 </section>
 {% endblock %}
-

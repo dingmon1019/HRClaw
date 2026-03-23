@@ -9,7 +9,7 @@ htmlcov/
 .venv/
 .env
 data/
+workspace/
 dist/
 build/
 *.egg-info/
-

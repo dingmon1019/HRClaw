@@ -9,10 +9,29 @@
 </head>
 <body>
     <header class="shell-header">
-        <div>
-            <p class="eyebrow">Inspired architecture</p>
-            <h1>Win Agent Runtime</h1>
-            <p class="subhead">Windows-first, localhost-native, approval-gated agent runtime inspired by NemoClaw and multi-provider patterns similar to OpenClaw.</p>
+        <div class="header-main">
+            <div>
+                <p class="eyebrow">Inspired Architecture</p>
+                <h1>Win Agent Runtime</h1>
+                <p class="subhead">Windows-first local agent runtime with approval gating, localhost operator control, and multi-provider orchestration. This is not OpenShell-level sandboxing and should be operated as a bounded localhost runtime.</p>
+            </div>
+            <div class="auth-panel">
+                {% if current_user %}
+                <div class="stack tight align-end">
+                    <span class="badge ok">Authenticated</span>
+                    <strong>{{ current_user.username }}</strong>
+                    <small class="muted">{{ "Recent auth active" if current_user.recent_auth else "Recent auth expired" }}</small>
+                </div>
+                <form method="post" action="/logout" class="inline-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit" class="button ghost">Logout</button>
+                </form>
+                {% elif auth_configured %}
+                <a href="/login" class="button ghost">Login</a>
+                {% else %}
+                <a href="/setup" class="button ghost">Initial Setup</a>
+                {% endif %}
+            </div>
         </div>
         <nav class="shell-nav">
             <a href="/">Dashboard</a>
@@ -36,4 +55,3 @@
     </main>
 </body>
 </html>
-

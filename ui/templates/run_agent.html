@@ -2,19 +2,32 @@
 {% block content %}
 <section class="card wide">
     <div class="card-header">
-        <h2>Run Agent</h2>
-        <p class="muted">Collect context, summarize it, and generate approval-ready proposals. The runtime does not execute during this step.</p>
+        <div>
+            <h2>Run Agent</h2>
+            <p class="muted">This step only collects, summarizes, and proposes. Execution stays behind approval and the isolated worker queue.</p>
+        </div>
+        <span class="badge ok">No Direct Execution</span>
     </div>
+
+    {% if unsafe_warnings %}
+    <section class="notice danger">
+        {% for warning in unsafe_warnings %}
+        <div>{{ warning }}</div>
+        {% endfor %}
+    </section>
+    {% endif %}
+
     <form method="post" action="/run" class="stack form-grid">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <label>
             Objective
-            <textarea name="objective" rows="4" placeholder="Describe the task you want the runtime to plan." required></textarea>
+            <textarea name="objective" rows="4" placeholder="Describe the operator task you want the runtime to analyze." required></textarea>
         </label>
 
         <div class="grid two">
             <label>
                 Filesystem Path
-                <input type="text" name="filesystem_path" placeholder=".\docs\notes.txt or C:\work\folder">
+                <input type="text" name="filesystem_path" placeholder="Relative paths resolve inside {{ settings.workspace_root }}">
             </label>
             <label>
                 Provider Override
@@ -29,13 +42,13 @@
 
         <label>
             File Content
-            <textarea name="file_content" rows="4" placeholder="If set, the planner proposes a write or append action."></textarea>
+            <textarea name="file_content" rows="4" placeholder="If set, the planner will propose a bounded write or append action inside the safe workspace."></textarea>
         </label>
 
         <div class="grid three">
             <label>
                 HTTP URL
-                <input type="text" name="http_url" placeholder="http://127.0.0.1:8000/api">
+                <input type="text" name="http_url" placeholder="https://example.com/api">
             </label>
             <label>
                 HTTP Method
@@ -55,7 +68,7 @@
 
         <label>
             HTTP Headers
-            <textarea name="http_headers_text" rows="3" placeholder='{"Authorization":"Bearer ..."} or Header: value'></textarea>
+            <textarea name="http_headers_text" rows="3" placeholder='{"Content-Type":"application/json"} or Header: value'></textarea>
         </label>
 
         <label>
@@ -69,21 +82,31 @@
                 <input type="text" name="task_title" placeholder="Optional local task title">
             </label>
             <label>
-                PowerShell Command
-                <input type="text" name="powershell_command" placeholder="Get-ChildItem .\docs">
+                Bounded System Action
+                <select name="system_action">
+                    <option value="">None</option>
+                    {% for action in system_actions %}
+                    <option value="{{ action }}">{{ action }}</option>
+                    {% endfor %}
+                </select>
             </label>
         </div>
 
-        <label>
-            Task Details
-            <textarea name="task_details" rows="3" placeholder="Optional task details for the local task connector."></textarea>
-        </label>
+        <div class="grid two">
+            <label>
+                Task Details
+                <textarea name="task_details" rows="3" placeholder="Optional task details for the local task connector."></textarea>
+            </label>
+            <label>
+                System Path
+                <input type="text" name="system_path" placeholder="Path used by system.list_directory, system.read_text_file, or system.test_path">
+            </label>
+        </div>
 
         <div class="actions">
             <button type="submit" class="button primary">Collect, Summarize, Propose</button>
-            <a href="/proposals" class="button ghost">View existing proposals</a>
+            <a href="/proposals" class="button ghost">Open Proposals Inbox</a>
         </div>
     </form>
 </section>
 {% endblock %}
-

@@ -2,9 +2,40 @@
 {% block content %}
 <section class="card">
     <div class="card-header">
-        <h2>Approval UI</h2>
-        <p class="muted">Approve or reject pending proposals. Approvals immediately trigger execution.</p>
+        <div>
+            <h2>Approval UI</h2>
+            <p class="muted">Approvals queue work for the isolated worker. High-risk items require the detail page re-auth flow.</p>
+        </div>
+        <div class="stack tight align-end">
+            <span class="badge high">{{ high_risk_count }} high-risk pending</span>
+        </div>
     </div>
+
+    <form method="get" action="/approvals" class="toolbar">
+        <label>
+            Risk
+            <select name="risk_filter">
+                <option value="">All</option>
+                {% for value in ["low","medium","high","critical"] %}
+                <option value="{{ value }}" {% if risk_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
+            Connector
+            <select name="connector_filter">
+                <option value="">All</option>
+                {% for value in connector_options %}
+                <option value="{{ value }}" {% if connector_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <div class="actions align-end">
+            <button type="submit" class="button ghost">Filter</button>
+            <a class="button ghost" href="/approvals">Reset</a>
+        </div>
+    </form>
+
     <table>
         <thead>
             <tr>
@@ -13,15 +44,15 @@
                 <th>Risk</th>
                 <th>Status</th>
                 <th>Created</th>
-                <th>Approval</th>
+                <th>Decision</th>
             </tr>
         </thead>
         <tbody>
             {% for proposal in proposals %}
-                {% include "partials/proposal_row.html" with context %}
+                {% include "partials/proposal_row.html" %}
             {% else %}
             <tr>
-                <td colspan="6" class="muted">No pending proposals.</td>
+                <td colspan="6" class="muted">No pending proposals matched the current filters.</td>
             </tr>
             {% endfor %}
         </tbody>
