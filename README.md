@@ -84,9 +84,11 @@ More detail:
 
 - [architecture](D:/User_Data/Documents/Playground/win-agent-runtime/docs/architecture.md)
 - [multi-agent model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/multi_agent.md)
+- [provider model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/provider_model.md)
 - [security model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/security_model.md)
 - [threat model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/threat_model.md)
 - [Windows setup](D:/User_Data/Documents/Playground/win-agent-runtime/docs/windows_setup.md)
+- [release hygiene](D:/User_Data/Documents/Playground/win-agent-runtime/docs/release_hygiene.md)
 
 ## Multi-Agent Model
 
@@ -109,7 +111,7 @@ Real multi-agent properties in the codebase:
 
 - agent registry with role definitions
 - per-agent provider profiles
-- per-agent capability and connector restrictions
+- enforced per-agent capability and connector restrictions
 - agent run history in SQLite
 - explicit handoff records in SQLite
 - visible task graph/timeline in the UI
@@ -127,8 +129,8 @@ Implemented controls:
 - recent re-authentication for sensitive operations
 - CSRF protection on dangerous POST routes
 - CSP, frame denial, no-referrer, and no-sniff headers
-- session secret generated on first run when not supplied by env
-- CLI admin token requirement for dangerous CLI actions
+- session secret generated on first run and stored outside the repository when not supplied by env
+- short-lived password-issued CLI authentication tokens for dangerous CLI actions
 - approval snapshot binding with stale detection
 - dedicated worker queue and lease-based execution claiming
 - bounded system actions instead of raw PowerShell or raw shell execution
@@ -137,6 +139,7 @@ Implemented controls:
 - symlink traversal blocking
 - HTTP connector policy on scheme, host, port, redirects, timeout, and response size
 - provider egress policy on host allowlists and restricted-data handling
+- protected local blob storage for sensitive payload fields with DPAPI when available
 - hash-chained audit trail with verification
 
 Important limit:
@@ -169,9 +172,12 @@ The proposal detail page surfaces:
 
 ## Workspace Model
 
-Default workspace:
+Default runtime state on Windows:
 
-- `runtime_workspace/`
+- `%LOCALAPPDATA%\\WinAgentRuntime\\data`
+- `%LOCALAPPDATA%\\WinAgentRuntime\\secrets`
+- `%LOCALAPPDATA%\\WinAgentRuntime\\logs`
+- `%LOCALAPPDATA%\\WinAgentRuntime\\workspace`
 
 Default behavior:
 
@@ -180,6 +186,7 @@ Default behavior:
 - source tree writes are denied
 - DB, audit, settings, token, and log file writes are denied
 - symlink traversal is denied
+- sensitive payload bodies are externalized into protected local blob storage instead of being duplicated across runtime tables
 
 This is designed to let operators work with local files without granting broad write access to the repository itself.
 
@@ -219,9 +226,9 @@ The web process does not directly run dangerous actions.
 Execution flow:
 
 1. approval creates a queue record
-2. worker claims a job atomically
+2. worker claims a job atomically and binds it to a specific approval record
 3. worker takes a lease and records an execution attempt
-4. executor validates the approved snapshot again
+4. executor validates the exact queued approval hashes again
 5. bounded connector action runs
 6. result or failure is written to history and audit
 
@@ -255,6 +262,12 @@ Run localhost UI:
 
 ```powershell
 .\scripts\run-local.ps1
+```
+
+Development hot reload is optional:
+
+```powershell
+.\scripts\run-local.ps1 -Reload
 ```
 
 Run worker:
@@ -291,15 +304,16 @@ python -m app.cli list-providers
 python -m app.cli verify-audit
 ```
 
-Sensitive commands require a local admin token:
+Sensitive commands require a short-lived CLI authentication token issued after password verification:
 
 ```powershell
-python -m app.cli approve-proposal <proposal_id> --reason "Approved" --admin-token <token>
-python -m app.cli reject-proposal <proposal_id> --reason "Rejected" --admin-token <token>
-python -m app.cli run-worker --once --admin-token <token>
+python -m app.cli issue-cli-token --username <user> --password <password> --purpose approval
+python -m app.cli approve-proposal <proposal_id> --reason "Approved" --cli-token <token>
+python -m app.cli reject-proposal <proposal_id> --reason "Rejected" --cli-token <token>
+python -m app.cli run-worker --once --cli-token <token>
 ```
 
-`.\scripts\run-worker.ps1` loads the local token automatically from `data\admin_token.txt`.
+`.\scripts\run-worker.ps1` can prompt interactively, mint a short-lived worker token, and keep it only in the current PowerShell process environment.
 
 ## Testing
 
@@ -327,7 +341,8 @@ The repository is prepared to avoid accidental runtime leakage:
 
 - `.venv/` ignored
 - `data/` ignored
-- `runtime_workspace/` ignored
+- legacy repo-local workspace directories ignored for cleanup safety
+- `workspace/` ignored
 - `.env` ignored
 - runtime tokens and audit files ignored
 - example config only, no live secrets committed
@@ -335,7 +350,7 @@ The repository is prepared to avoid accidental runtime leakage:
 Before publishing a release, verify:
 
 - no local runtime DB is tracked
-- no session secret or admin token is tracked
+- no session secret or protected secret blob is tracked
 - tests pass
 - README and docs match shipped behavior
 

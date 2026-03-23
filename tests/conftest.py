@@ -16,6 +16,7 @@ def app_settings(tmp_path: Path) -> AppSettings:
     workspace_root = tmp_path / "workspace"
     return AppSettings(
         app_name="Win Agent Runtime Test",
+        runtime_state_root=tmp_path / "runtime-state",
         database_path=tmp_path / "runtime.db",
         audit_log_path=tmp_path / "audit" / "audit.jsonl",
         workspace_root=workspace_root,

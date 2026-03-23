@@ -121,7 +121,7 @@
         {% for entry in connector_runs %}
         <div class="list-item">
             <strong>{{ entry.connector }}</strong>
-            <p>{{ entry.operation }} / {{ entry.status }}</p>
+            <p>{{ entry.operation }} / {{ entry.status }}{% if entry.agent_role %} / requested by {{ entry.agent_role }}{% endif %}</p>
             <small>{{ entry.created_at }}</small>
             {% if entry.output %}
             <pre>{{ entry.output | tojson(indent=2) }}</pre>

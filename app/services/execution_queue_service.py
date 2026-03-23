@@ -88,6 +88,7 @@ class ExecutionQueueService:
         now_iso = now.isoformat()
         lease_expires = (now + timedelta(seconds=lease_seconds)).isoformat()
         with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             candidates = conn.execute(
                 """
                 SELECT * FROM execution_jobs
@@ -100,24 +101,34 @@ class ExecutionQueueService:
             for row in candidates:
                 attempt_count = int(row["attempt_count"] or 0) + 1
                 if attempt_count > max_attempts:
-                    conn.execute(
+                    update_dead = conn.execute(
                         """
                         UPDATE execution_jobs
                         SET status = ?, finished_at = ?, dead_letter_reason = ?, lease_expires_at = NULL
-                        WHERE id = ?
+                        WHERE id = ? AND (
+                            status = 'queued'
+                            OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+                        )
                         """,
-                        ("dead_letter", now_iso, "attempt_limit_reached", row["id"]),
+                        ("dead_letter", now_iso, "attempt_limit_reached", row["id"], now_iso),
                     )
+                    if update_dead.rowcount != 1:
+                        continue
                     continue
-                conn.execute(
+                claimed_update = conn.execute(
                     """
                     UPDATE execution_jobs
                     SET status = ?, started_at = ?, worker_id = ?, lease_expires_at = ?,
                         last_heartbeat_at = ?, attempt_count = ?, dead_letter_reason = NULL
-                    WHERE id = ?
+                    WHERE id = ? AND (
+                        status = 'queued'
+                        OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+                    )
                     """,
-                    ("running", now_iso, worker_id, lease_expires, now_iso, attempt_count, row["id"]),
+                    ("running", now_iso, worker_id, lease_expires, now_iso, attempt_count, row["id"], now_iso),
                 )
+                if claimed_update.rowcount != 1:
+                    continue
                 attempt = self._create_attempt(
                     conn=conn,
                     job_id=row["id"],

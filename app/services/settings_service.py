@@ -27,13 +27,13 @@ class SettingsService:
             }
             if env_name and os.getenv(env_name)
         ]
-        admin_token_configured = bool(
-            os.getenv("WIN_AGENT_ADMIN_TOKEN", "").strip()
-            or self.base_settings.resolved_admin_token_path.exists()
-        )
         return EffectiveSettings(
             app_name=self.base_settings.app_name,
             runtime_mode=runtime_mode,
+            runtime_state_root=str(self.base_settings.resolved_runtime_state_root),
+            data_dir=str(self.base_settings.resolved_data_dir),
+            secrets_dir=str(self.base_settings.resolved_secrets_dir),
+            logs_dir=str(self.base_settings.resolved_logs_dir),
             workspace_root=str(self.base_settings.resolved_workspace_root),
             provider=overrides.get("provider", self.base_settings.provider),
             fallback_provider=overrides.get("fallback_provider", self.base_settings.fallback_provider),
@@ -137,7 +137,14 @@ class SettingsService:
                 overrides.get("enable_system_connector", self.base_settings.enable_system_connector)
             ),
             configured_secret_envs=sorted(configured_secret_envs),
-            admin_token_configured=admin_token_configured,
+            cli_auth_mode="short-lived-password-issued",
+            local_protection_mode=overrides.get("local_protection_mode", self.base_settings.local_protection_mode),
+            history_retention_days=int(
+                overrides.get("history_retention_days", self.base_settings.history_retention_days)
+            ),
+            cli_token_ttl_seconds=int(
+                overrides.get("cli_token_ttl_seconds", self.base_settings.cli_token_ttl_seconds)
+            ),
             worker_lease_seconds=int(
                 overrides.get("worker_lease_seconds", self.base_settings.worker_lease_seconds)
             ),
@@ -228,6 +235,9 @@ class SettingsService:
             allowed_http_hosts=settings.allowed_http_hosts,
             enable_system_connector=settings.enable_system_connector,
             enable_outlook_connector=settings.enable_outlook_connector,
+            local_protection_mode=settings.local_protection_mode,
+            history_retention_days=settings.history_retention_days,
+            cli_token_ttl_seconds=settings.cli_token_ttl_seconds,
             worker_lease_seconds=settings.worker_lease_seconds,
             worker_max_attempts=settings.worker_max_attempts,
         )
@@ -277,6 +287,9 @@ class SettingsService:
                 allowed_http_hosts=",".join(exported.allowed_http_hosts),
                 enable_system_connector=exported.enable_system_connector,
                 enable_outlook_connector=exported.enable_outlook_connector,
+                local_protection_mode=exported.local_protection_mode,
+                history_retention_days=exported.history_retention_days,
+                cli_token_ttl_seconds=exported.cli_token_ttl_seconds,
                 worker_lease_seconds=exported.worker_lease_seconds,
                 worker_max_attempts=exported.worker_max_attempts,
             ),
@@ -328,6 +341,9 @@ class SettingsService:
                 allowed_http_hosts=self.base_settings.allowed_http_hosts,
                 enable_system_connector=self.base_settings.enable_system_connector,
                 enable_outlook_connector=False,
+                local_protection_mode=self.base_settings.local_protection_mode,
+                history_retention_days=self.base_settings.history_retention_days,
+                cli_token_ttl_seconds=self.base_settings.cli_token_ttl_seconds,
                 worker_lease_seconds=self.base_settings.worker_lease_seconds,
                 worker_max_attempts=self.base_settings.worker_max_attempts,
             ),

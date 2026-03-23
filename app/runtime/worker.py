@@ -60,7 +60,11 @@ class ExecutionWorker:
         )
         try:
             self.queue_service.heartbeat(job.id, self.worker_id, self.base_settings.worker_lease_seconds)
-            result = self.dispatcher.execute_approved(job.proposal_id)
+            result = self.dispatcher.execute_approved(
+                job.proposal_id,
+                approval_id=job.approval_id,
+                executor_agent=executor_agent,
+            )
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.EXECUTED, result=result)
             self.agent_service.complete_run(
                 executor_run.id,

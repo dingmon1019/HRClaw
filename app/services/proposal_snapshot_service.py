@@ -7,22 +7,31 @@ from typing import Any
 
 from app.config.settings import AppSettings
 from app.core.database import Database
-from app.core.utils import json_dumps, json_loads, new_id, sha256_hex, utcnow_iso
+from app.core.utils import canonical_directory_digest, json_dumps, json_loads, new_id, sha256_file, sha256_hex, utcnow_iso
 from app.policy.path_guard import PathGuard
-from app.schemas.actions import ProposalRecord, ProposalSnapshotRecord
+from app.schemas.actions import ApprovalRecord, ProposalRecord, ProposalSnapshotRecord
+from app.services.data_governance_service import DataGovernanceService
 from app.services.settings_service import SettingsService
 
 
 class ProposalSnapshotService:
-    def __init__(self, base_settings: AppSettings, database: Database, settings_service: SettingsService):
+    def __init__(
+        self,
+        base_settings: AppSettings,
+        database: Database,
+        settings_service: SettingsService,
+        data_governance_service: DataGovernanceService,
+    ):
         self.base_settings = base_settings
         self.database = database
         self.settings_service = settings_service
         self.path_guard = PathGuard(base_settings, settings_service)
+        self.data_governance_service = data_governance_service
 
     def capture(self, proposal: ProposalRecord, status: str) -> ProposalSnapshotRecord:
+        runtime_payload = self.data_governance_service.materialize_action_payload(proposal.payload)
         before_state, preview = self._safe_before_state_and_preview(proposal)
-        action_hash = sha256_hex(f"{proposal.action_type}|{json_dumps(proposal.payload)}")
+        action_hash = sha256_hex(f"{proposal.action_type}|{json_dumps(runtime_payload)}")
         policy_hash = sha256_hex(
             json_dumps(
                 {
@@ -167,9 +176,69 @@ class ProposalSnapshotService:
             raise ValueError(reason)
         return comparison["live"]
 
+    def compare_live_to_approval(
+        self,
+        proposal: ProposalRecord,
+        approval: ApprovalRecord,
+    ) -> dict[str, Any]:
+        live = self._build_live_snapshot(proposal)
+        changed_fields: list[str] = []
+        if approval.action_hash != live.action_hash:
+            changed_fields.append("action")
+        if approval.policy_hash != live.policy_hash:
+            changed_fields.append("policy")
+        if approval.settings_hash != live.settings_hash:
+            changed_fields.append("settings")
+        if approval.resource_hash != live.resource_hash:
+            changed_fields.append("resources")
+        stale = bool(changed_fields)
+        reason = None
+        if stale:
+            reason = (
+                "Snapshot drift detected against the queued approval in "
+                f"{', '.join(changed_fields)}."
+            )
+        live.comparison_json = {
+            "changed_fields": changed_fields,
+            "approval_snapshot_hash": approval.snapshot_hash,
+            "live_snapshot_hash": live.snapshot_hash,
+        }
+        return {
+            "approval": approval,
+            "live": live,
+            "stale": stale,
+            "reason": reason,
+            "changed_fields": changed_fields,
+        }
+
+    def verify_approval_or_raise(
+        self,
+        proposal: ProposalRecord,
+        approval: ApprovalRecord,
+    ) -> ProposalSnapshotRecord:
+        if approval.decision != "approved":
+            raise ValueError("Execution job is not bound to an approved decision.")
+        if not all(
+            [
+                approval.snapshot_hash,
+                approval.action_hash,
+                approval.policy_hash,
+                approval.settings_hash,
+                approval.resource_hash,
+            ]
+        ):
+            raise ValueError("Approval record is missing immutable snapshot binding hashes.")
+        comparison = self.compare_live_to_approval(proposal, approval)
+        if comparison["stale"]:
+            reason = comparison["reason"] or "Queued approval no longer matches live state."
+            self.mark_stale(proposal.id, reason)
+            raise ValueError(reason)
+        return comparison["live"]
+
     def _build_live_snapshot(self, proposal: ProposalRecord) -> ProposalSnapshotRecord:
+        runtime_payload = self.data_governance_service.materialize_action_payload(proposal.payload)
         before_state, preview = self._safe_before_state_and_preview(proposal)
-        action_hash = sha256_hex(f"{proposal.action_type}|{json_dumps(proposal.payload)}")
+        action_hash = sha256_hex(f"{proposal.action_type}|{json_dumps(runtime_payload)}")
         policy_hash = sha256_hex(
             json_dumps(
                 {
@@ -209,30 +278,32 @@ class ProposalSnapshotService:
         )
 
     def _before_state_and_preview(self, proposal: ProposalRecord) -> tuple[dict[str, Any], dict[str, Any]]:
-        if proposal.connector == "filesystem":
-            return self._filesystem_state(proposal)
-        if proposal.connector == "http":
-            method = proposal.action_type.split(".", 1)[1].upper()
-            headers = proposal.payload.get("headers") or {}
-            body = proposal.payload.get("body") or ""
+        runtime_payload = self.data_governance_service.materialize_action_payload(proposal.payload)
+        runtime_proposal = proposal.model_copy(update={"payload": runtime_payload})
+        if runtime_proposal.connector == "filesystem":
+            return self._filesystem_state(runtime_proposal)
+        if runtime_proposal.connector == "http":
+            method = runtime_proposal.action_type.split(".", 1)[1].upper()
+            headers = runtime_proposal.payload.get("headers") or {}
+            body = runtime_proposal.payload.get("body") or ""
             before_state = {
                 "method": method,
-                "url": proposal.payload.get("url"),
+                "url": runtime_proposal.payload.get("url"),
                 "headers": headers,
                 "body_digest": sha256_hex(body),
                 "follow_redirects": self.settings_service.get_effective_settings().http_follow_redirects,
             }
             return before_state, {"http_request": before_state, "body_preview": body[:2000]}
-        if proposal.connector == "system":
+        if runtime_proposal.connector == "system":
             before_state = {
-                "action": proposal.action_type,
-                "path": proposal.payload.get("path"),
+                "action": runtime_proposal.action_type,
+                "path": runtime_proposal.payload.get("path"),
             }
             return before_state, {"system_action": before_state}
-        if proposal.connector == "task":
-            before_state = proposal.payload
-            return before_state, {"task_payload": proposal.payload}
-        return proposal.payload, {"payload": proposal.payload}
+        if runtime_proposal.connector == "task":
+            before_state = runtime_proposal.payload
+            return before_state, {"task_payload": runtime_proposal.payload}
+        return runtime_proposal.payload, {"payload": runtime_proposal.payload}
 
     def _safe_before_state_and_preview(self, proposal: ProposalRecord) -> tuple[dict[str, Any], dict[str, Any]]:
         try:
@@ -264,12 +335,13 @@ class ProposalSnapshotService:
             entries = sorted(child.name for child in resolved.iterdir())[:100]
             state["kind"] = "directory"
             state["entries"] = entries
+            state["tree_digest"] = canonical_directory_digest(resolved)
             preview["before_preview"] = json.dumps(entries, indent=2)
             return state, preview
         text = resolved.read_text(encoding="utf-8", errors="ignore")
         limited_text = text[: self.settings_service.get_effective_settings().filesystem_max_read_bytes]
         state["kind"] = "file"
-        state["content_hash"] = sha256_hex(limited_text)
+        state["content_hash"] = sha256_file(resolved)
         preview["before_preview"] = limited_text
         if proposal.action_type in {"filesystem.write_text", "filesystem.append_text"}:
             incoming = proposal.payload.get("content", "")

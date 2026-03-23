@@ -22,6 +22,11 @@ class ProviderService:
         "local-only": "local_provider",
         "privacy-preferred": "privacy_provider",
     }
+    TASK_CAPABILITY_MAP = {
+        "planning-summary": {"planning"},
+        "report-plan": {"text"},
+        "provider-test": {"text"},
+    }
 
     def __init__(
         self,
@@ -48,6 +53,7 @@ class ProviderService:
             provider = self.registry.get(provider_name)
             try:
                 self._validate_provider_usage(provider_name, provider.supports_remote, request, settings)
+                self._validate_provider_capabilities(provider_name, provider.capabilities, request)
             except ProviderError as exc:
                 last_error = exc
                 self._record_failure(provider_name, settings, exc)
@@ -223,6 +229,19 @@ class ProviderService:
         ):
             raise ProviderError(
                 f"Restricted data cannot be sent to remote provider {provider_name} without override."
+            )
+
+    def _validate_provider_capabilities(
+        self,
+        provider_name: str,
+        capabilities: list[str],
+        request: ProviderRequest,
+    ) -> None:
+        required = self.TASK_CAPABILITY_MAP.get(request.task_type or "", {"text"})
+        if not required.issubset(set(capabilities)):
+            missing = ", ".join(sorted(required.difference(set(capabilities))))
+            raise ProviderError(
+                f"Provider {provider_name} does not support required capabilities: {missing}."
             )
 
     def _is_circuit_open(self, provider_name: str) -> bool:

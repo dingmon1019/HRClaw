@@ -14,8 +14,9 @@ from app.schemas.actions import (
     AgentRunResult,
     DataClassification,
 )
-from app.schemas.agents import AgentRole
+from app.schemas.agents import AgentDefinition, AgentRole
 from app.schemas.providers import ProviderRequest
+from app.services.data_governance_service import DataGovernanceService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.provider_service import ProviderService
@@ -34,6 +35,7 @@ class RuntimePlanner:
         policy_engine: PolicyEngine,
         audit_service: AuditService,
         agent_service: AgentService,
+        data_governance_service: DataGovernanceService,
     ):
         self.base_settings = base_settings
         self.connector_registry = connector_registry
@@ -44,6 +46,7 @@ class RuntimePlanner:
         self.policy_engine = policy_engine
         self.audit_service = audit_service
         self.agent_service = agent_service
+        self.data_governance_service = data_governance_service
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         run_id = new_id("run")
@@ -54,6 +57,13 @@ class RuntimePlanner:
         planner = self.agent_service.get_by_role(AgentRole.PLANNER)
         reviewer = self.agent_service.get_by_role(AgentRole.REVIEWER)
         reporter = self.agent_service.get_by_role(AgentRole.REPORTER)
+        self.agent_service.assert_capability(supervisor, "decompose-objective")
+        self.agent_service.assert_capability(supervisor, "create-handoffs")
+        self.agent_service.assert_capability(planner, "summarize-context")
+        self.agent_service.assert_capability(planner, "plan-actions")
+        self.agent_service.assert_capability(reviewer, "policy-review")
+        self.agent_service.assert_capability(reviewer, "approval-gating")
+        self.agent_service.assert_capability(reporter, "summarize-plan")
 
         supervisor_run = self.agent_service.start_run(
             run_id,
@@ -62,13 +72,12 @@ class RuntimePlanner:
             provider_profile=self._provider_profile_for_role(AgentRole.SUPERVISOR, effective_settings),
             correlation_id=correlation_id,
         )
-        collected = self._collect(run_id, request)
         subtasks = self._decompose(request)
         intent_summary = self._intent_summary(request, subtasks)
         self.agent_service.complete_run(
             supervisor_run.id,
             status="completed",
-            output_payload={"intent_summary": intent_summary, "subtasks": subtasks, "collected_keys": list(collected)},
+            output_payload={"intent_summary": intent_summary, "subtasks": subtasks},
         )
 
         planner_handoff = self.agent_service.create_handoff(
@@ -82,11 +91,12 @@ class RuntimePlanner:
         planner_run = self.agent_service.start_run(
             run_id,
             planner,
-            input_payload={"collected": collected, "subtasks": subtasks, "objective": request.objective},
+            input_payload={"subtasks": subtasks, "objective": request.objective},
             parent_agent_run_id=supervisor_run.id,
             provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
             correlation_id=correlation_id,
         )
+        collected = self._collect(run_id, request, supervisor, planner, correlation_id)
         planning_classification = self._planning_classification(request, collected)
         summary_text, summary_provider_name = self._summarize(
             request,
@@ -98,7 +108,7 @@ class RuntimePlanner:
         summary = self.summary_service.create(
             run_id=run_id,
             objective=request.objective,
-            collected=collected,
+            collected=self.data_governance_service.sanitize_for_history(collected),
             summary_text=summary_text,
             provider_name=summary_provider_name,
         )
@@ -111,7 +121,7 @@ class RuntimePlanner:
             planning_provider=request.provider_name or self.provider_service.resolve_profile_provider(
                 self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
             ),
-            planner_agent_id=planner.id,
+            planner_agent=planner,
             correlation_id=correlation_id,
         )
         self.agent_service.complete_handoff(planner_handoff.id)
@@ -121,6 +131,7 @@ class RuntimePlanner:
             provider_name=summary_provider_name,
             output_payload={
                 "summary_id": summary.id,
+                "collected_keys": list(collected),
                 "proposal_titles": [proposal.title for proposal in raw_proposals],
                 "proposal_count": len(raw_proposals),
             },
@@ -142,7 +153,7 @@ class RuntimePlanner:
             provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings),
             correlation_id=correlation_id,
         )
-        reviewed = [self._review_proposal(proposal, reviewer.id) for proposal in raw_proposals]
+        reviewed = [self._review_proposal(proposal, reviewer) for proposal in raw_proposals]
         created = self.proposal_service.create_many(reviewed)
         self.agent_service.complete_handoff(reviewer_handoff.id)
         self.agent_service.complete_run(
@@ -202,8 +213,16 @@ class RuntimePlanner:
         )
         return AgentRunResult(run_id=run_id, summary=summary, proposals=created)
 
-    def _collect(self, run_id: str, request: AgentRunRequest) -> dict:
+    def _collect(
+        self,
+        run_id: str,
+        request: AgentRunRequest,
+        supervisor_agent: AgentDefinition,
+        planner_agent: AgentDefinition,
+        correlation_id: str,
+    ) -> dict:
         collected: dict = {"objective": request.objective}
+        self.agent_service.assert_connector_allowed(supervisor_agent, "task")
         task_snapshot = self.connector_registry.get("task").collect({"limit": 5})
         collected["tasks"] = task_snapshot
         self.history_service.log_connector_run(
@@ -211,31 +230,59 @@ class RuntimePlanner:
             connector="task",
             operation="collect",
             status="success",
-            payload={"limit": 5},
-            output=task_snapshot,
+            payload=self.data_governance_service.sanitize_for_history({"limit": 5}),
+            agent_id=supervisor_agent.id,
+            agent_role=supervisor_agent.role.value,
+            correlation_id=correlation_id,
+            output=self.data_governance_service.sanitize_for_history(task_snapshot),
         )
         if request.filesystem_path:
-            collected["filesystem"] = self._safe_collect(run_id, "filesystem", {"path": request.filesystem_path})
+            collected["filesystem"] = self._safe_collect(
+                run_id,
+                planner_agent,
+                "filesystem",
+                {"path": request.filesystem_path},
+                correlation_id,
+            )
         if request.http_url and request.http_method.upper() in {"GET", "HEAD"}:
-            collected["http"] = self._safe_collect(run_id, "http", {"url": request.http_url})
+            collected["http"] = self._safe_collect(
+                run_id,
+                planner_agent,
+                "http",
+                {"url": request.http_url},
+                correlation_id,
+            )
         if request.system_action and request.system_path:
             collected["system"] = self._safe_collect(
                 run_id,
+                planner_agent,
                 "system",
                 {"path": request.system_path, "action": request.system_action},
+                correlation_id,
             )
         return collected
 
-    def _safe_collect(self, run_id: str, connector_name: str, payload: dict) -> dict:
+    def _safe_collect(
+        self,
+        run_id: str,
+        agent: AgentDefinition,
+        connector_name: str,
+        payload: dict,
+        correlation_id: str,
+    ) -> dict:
         try:
+            self.agent_service.assert_connector_allowed(agent, connector_name)
             output = self.connector_registry.get(connector_name).collect(payload)
             self.history_service.log_connector_run(
                 run_id=run_id,
                 connector=connector_name,
                 operation="collect",
                 status="success",
-                payload=payload,
-                output=output,
+                payload=self.data_governance_service.sanitize_for_history(payload),
+                agent_id=agent.id,
+                agent_role=agent.role.value,
+                correlation_id=correlation_id,
+                output=self.data_governance_service.sanitize_for_history(output),
             )
             return output
         except Exception as exc:
@@ -244,7 +291,10 @@ class RuntimePlanner:
                 connector=connector_name,
                 operation="collect",
                 status="failed",
-                payload=payload,
+                payload=self.data_governance_service.sanitize_for_history(payload),
+                agent_id=agent.id,
+                agent_role=agent.role.value,
+                correlation_id=correlation_id,
                 error_text=str(exc),
             )
             return {"error": str(exc), "input": payload}
@@ -298,7 +348,7 @@ class RuntimePlanner:
         collected: dict,
         summary_text: str,
         planning_provider: str | None,
-        planner_agent_id: str,
+        planner_agent: AgentDefinition,
         correlation_id: str,
     ) -> list[ActionProposal]:
         proposals: list[ActionProposal] = []
@@ -310,7 +360,7 @@ class RuntimePlanner:
                     summary_id,
                     collected,
                     planning_provider,
-                    planner_agent_id,
+                    planner_agent,
                     correlation_id,
                 )
             )
@@ -321,11 +371,12 @@ class RuntimePlanner:
                     request,
                     summary_id,
                     planning_provider,
-                    planner_agent_id,
+                    planner_agent,
                     correlation_id,
                 )
             )
         if request.task_title:
+            self.agent_service.assert_connector_allowed(planner_agent, "task")
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
@@ -338,13 +389,14 @@ class RuntimePlanner:
                     rationale="The operator asked for a concrete follow-up item.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         elif "list task" in request.objective.lower():
+            self.agent_service.assert_connector_allowed(planner_agent, "task")
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
@@ -357,13 +409,14 @@ class RuntimePlanner:
                     rationale="The objective explicitly asks for task visibility.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
         if request.system_action:
+            self.agent_service.assert_connector_allowed(planner_agent, "system")
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
@@ -376,7 +429,7 @@ class RuntimePlanner:
                     rationale="The operator selected a bounded system action.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
@@ -396,7 +449,7 @@ class RuntimePlanner:
                     rationale="No direct connector action was inferred, so the runtime stores the objective as a task.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
@@ -411,7 +464,7 @@ class RuntimePlanner:
         summary_id: str,
         collected: dict,
         planning_provider: str | None,
-        planner_agent_id: str,
+        planner_agent: AgentDefinition,
         correlation_id: str,
     ) -> list[ActionProposal]:
         path = request.filesystem_path or ""
@@ -419,6 +472,7 @@ class RuntimePlanner:
         observed_kind = (collected.get("filesystem") or {}).get("kind")
         proposals: list[ActionProposal] = []
         classification = DataClassification.RESTRICTED if request.file_content is not None else DataClassification.LOCAL_ONLY
+        self.agent_service.assert_connector_allowed(planner_agent, "filesystem")
 
         if request.file_content is not None:
             action_type = "filesystem.append_text" if "append" in lower_objective else "filesystem.write_text"
@@ -434,7 +488,7 @@ class RuntimePlanner:
                     rationale="The request includes explicit file content.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=classification,
@@ -455,7 +509,7 @@ class RuntimePlanner:
                     rationale="The objective explicitly requests deletion.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
@@ -474,7 +528,7 @@ class RuntimePlanner:
                     rationale="The objective explicitly requests a directory.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
@@ -493,7 +547,7 @@ class RuntimePlanner:
                     rationale="The objective or collected context points to a directory listing operation.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
@@ -512,7 +566,7 @@ class RuntimePlanner:
                     rationale="The objective points to a read-oriented filesystem action.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
-                    created_by_agent_id=planner_agent_id,
+                    created_by_agent_id=planner_agent.id,
                     created_by_agent_role=AgentRole.PLANNER.value,
                     correlation_id=correlation_id,
                     data_classification=DataClassification.LOCAL_ONLY,
@@ -526,12 +580,13 @@ class RuntimePlanner:
         request: AgentRunRequest,
         summary_id: str,
         planning_provider: str | None,
-        planner_agent_id: str,
+        planner_agent: AgentDefinition,
         correlation_id: str,
     ) -> ActionProposal:
         method = request.http_method.upper()
         headers = self._parse_headers(request.http_headers_text)
         classification = DataClassification.RESTRICTED if request.http_body else DataClassification.EXTERNAL_OK
+        self.agent_service.assert_connector_allowed(planner_agent, "http")
         return ActionProposal(
             run_id=run_id,
             objective=request.objective,
@@ -543,14 +598,15 @@ class RuntimePlanner:
             rationale="The operator provided an explicit target URL.",
             provider_name=planning_provider,
             summary_id=summary_id,
-            created_by_agent_id=planner_agent_id,
+            created_by_agent_id=planner_agent.id,
             created_by_agent_role=AgentRole.PLANNER.value,
             correlation_id=correlation_id,
             data_classification=classification,
         )
 
-    def _review_proposal(self, proposal: ActionProposal, reviewer_agent_id: str) -> ActionProposal:
+    def _review_proposal(self, proposal: ActionProposal, reviewer_agent: AgentDefinition) -> ActionProposal:
         policy_notes = list(proposal.policy_notes)
+        self.agent_service.assert_capability(reviewer_agent, "egress-review")
         if proposal.data_classification == DataClassification.RESTRICTED:
             policy_notes.append("Data classification is restricted. Remote provider egress is blocked by default.")
         elif proposal.data_classification == DataClassification.LOCAL_ONLY:
@@ -558,7 +614,7 @@ class RuntimePlanner:
         reviewed = proposal.model_copy(
             update={
                 "policy_notes": policy_notes,
-                "reviewed_by_agent_id": reviewer_agent_id,
+                "reviewed_by_agent_id": reviewer_agent.id,
                 "reviewed_by_agent_role": AgentRole.REVIEWER.value,
             }
         )

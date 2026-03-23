@@ -1,31 +1,30 @@
 from __future__ import annotations
 
-import hmac
-import os
-
 from app.config.settings import AppSettings
-from app.core.errors import AuthorizationError
-from app.core.utils import ensure_parent_dir, random_token
+from app.core.database import Database
+from app.schemas.auth import CliTokenRecord
+from app.services.auth_service import AuthService
+from app.services.cli_token_service import CliTokenService
 
 
 class AdminTokenService:
-    def __init__(self, base_settings: AppSettings):
-        self.base_settings = base_settings
+    def __init__(self, database: Database, auth_service: AuthService, base_settings: AppSettings):
+        self.cli_tokens = CliTokenService(database, auth_service, base_settings)
 
-    def ensure_token(self) -> str:
-        env_token = os.getenv("WIN_AGENT_ADMIN_TOKEN", "").strip()
-        if env_token:
-            return env_token
-        token_path = self.base_settings.resolved_admin_token_path
-        ensure_parent_dir(token_path)
-        if token_path.exists():
-            return token_path.read_text(encoding="utf-8").strip()
-        token = random_token(24)
-        token_path.write_text(token, encoding="utf-8")
-        return token
+    def issue(
+        self,
+        *,
+        username: str,
+        password: str,
+        purpose: str,
+        ttl_seconds: int | None = None,
+    ) -> tuple[str, CliTokenRecord]:
+        return self.cli_tokens.issue(
+            username=username,
+            password=password,
+            purpose=purpose,
+            ttl_seconds=ttl_seconds,
+        )
 
-    def verify(self, provided_token: str | None) -> None:
-        expected = self.ensure_token()
-        candidate = (provided_token or "").strip()
-        if not candidate or not hmac.compare_digest(candidate, expected):
-            raise AuthorizationError("A valid local admin token is required for this CLI action.")
+    def verify(self, provided_token: str | None, *, purpose: str | None = None) -> CliTokenRecord:
+        return self.cli_tokens.verify(provided_token, purpose=purpose)

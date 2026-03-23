@@ -90,6 +90,9 @@ class HistoryService:
         operation: str,
         status: str,
         payload: dict,
+        agent_id: str | None = None,
+        agent_role: str | None = None,
+        correlation_id: str | None = None,
         output: dict | None = None,
         error_text: str | None = None,
     ) -> str:
@@ -97,9 +100,10 @@ class HistoryService:
         self.database.execute(
             """
             INSERT INTO connector_runs(
-                id, run_id, connector, operation, status, input_json, output_json, error_text, created_at
+                id, run_id, connector, operation, status, agent_id, agent_role, correlation_id,
+                input_json, output_json, error_text, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_record_id,
@@ -107,6 +111,9 @@ class HistoryService:
                 connector,
                 operation,
                 status,
+                agent_id,
+                agent_role,
+                correlation_id,
                 json_dumps(payload),
                 json_dumps(output) if output is not None else None,
                 error_text,
@@ -127,6 +134,9 @@ class HistoryService:
                 connector=row["connector"],
                 operation=row["operation"],
                 status=row["status"],
+                agent_id=row["agent_id"],
+                agent_role=row["agent_role"],
+                correlation_id=row["correlation_id"],
                 input=json_loads(row["input_json"], {}),
                 output=json_loads(row["output_json"], None),
                 error_text=row["error_text"],

@@ -11,18 +11,31 @@ from app.schemas.actions import (
     ProposalRecord,
     ProposalStatus,
 )
+from app.services.data_governance_service import DataGovernanceService
 from app.services.proposal_snapshot_service import ProposalSnapshotService
 
 
 class ProposalService:
-    def __init__(self, database: Database, snapshot_service: ProposalSnapshotService):
+    def __init__(
+        self,
+        database: Database,
+        snapshot_service: ProposalSnapshotService,
+        data_governance_service: DataGovernanceService,
+    ):
         self.database = database
         self.snapshot_service = snapshot_service
+        self.data_governance_service = data_governance_service
 
     def create_many(self, proposals: Iterable[ActionProposal]) -> list[ProposalRecord]:
         return [self.create(proposal) for proposal in proposals]
 
     def create(self, proposal: ActionProposal) -> ProposalRecord:
+        protected_payload = self.data_governance_service.protect_action_payload(
+            proposal.payload,
+            classification=proposal.data_classification,
+            purpose=f"proposal:{proposal.action_type}",
+        )
+        proposal = proposal.model_copy(update={"payload": protected_payload})
         proposal_id = new_id("proposal")
         now = utcnow_iso()
         self.database.execute(
@@ -156,6 +169,25 @@ class ProposalService:
     def latest_approval(self, proposal_id: str) -> ApprovalRecord | None:
         approvals = self.list_approvals(proposal_id)
         return approvals[-1] if approvals else None
+
+    def get_approval(self, approval_id: str) -> ApprovalRecord:
+        row = self.database.fetch_one("SELECT * FROM approvals WHERE id = ?", (approval_id,))
+        if row is None:
+            raise NotFoundError(f"Approval {approval_id} was not found.")
+        return ApprovalRecord(
+            id=row["id"],
+            proposal_id=row["proposal_id"],
+            decision=row["decision"],
+            actor=row["actor"],
+            reason=row["reason"],
+            created_at=row["created_at"],
+            snapshot_hash=row["snapshot_hash"],
+            action_hash=row["action_hash"],
+            policy_hash=row["policy_hash"],
+            settings_hash=row["settings_hash"],
+            resource_hash=row["resource_hash"],
+            correlation_id=row["correlation_id"],
+        )
 
     def _record_approval(
         self,

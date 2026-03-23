@@ -20,7 +20,7 @@ class AuditService:
         timestamp = utcnow_iso()
         payload_json = json_dumps(payload)
         prev_row = self.database.fetch_one(
-            "SELECT entry_hash FROM audit_entries ORDER BY created_at DESC LIMIT 1"
+            "SELECT entry_hash FROM audit_entries ORDER BY rowid DESC LIMIT 1"
         )
         prev_hash = prev_row["entry_hash"] if prev_row else ""
         entry_hash = sha256_hex(f"{prev_hash}|{timestamp}|{event_type}|{payload_json}")
@@ -45,7 +45,8 @@ class AuditService:
 
     def verify_integrity(self) -> dict[str, Any]:
         rows = self.database.fetch_all(
-            "SELECT event_type, payload_json, prev_hash, entry_hash, created_at FROM audit_entries ORDER BY created_at ASC"
+            "SELECT rowid, event_type, payload_json, prev_hash, entry_hash, created_at "
+            "FROM audit_entries ORDER BY rowid ASC"
         )
         previous_hash = ""
         for index, row in enumerate(rows, start=1):

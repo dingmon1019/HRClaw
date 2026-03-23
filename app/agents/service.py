@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.agents.registry import default_agents
 from app.core.database import Database
-from app.core.errors import NotFoundError
+from app.core.errors import AuthorizationError, NotFoundError
 from app.core.utils import json_dumps, json_loads, new_id, utcnow_iso
 from app.schemas.agents import AgentDefinition, AgentRole, AgentRunRecord, HandoffRecord
 
@@ -198,6 +198,20 @@ class AgentService:
             (limit,),
         )
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def assert_connector_allowed(agent: AgentDefinition, connector: str) -> None:
+        if connector not in agent.allowed_connectors:
+            raise AuthorizationError(
+                f"{agent.name} is not allowed to use connector {connector}."
+            )
+
+    @staticmethod
+    def assert_capability(agent: AgentDefinition, capability: str) -> None:
+        if capability not in agent.capabilities:
+            raise AuthorizationError(
+                f"{agent.name} does not have capability {capability}."
+            )
 
     def _seed_registry(self) -> None:
         for agent in default_agents():

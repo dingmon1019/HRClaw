@@ -20,10 +20,11 @@ Implemented:
 
 - initial setup flow for the first operator
 - PBKDF2-SHA256 password hashes
-- session cookies
+- server-side session records with an opaque session ID in the browser cookie
 - session age enforcement
 - idle timeout enforcement
 - recent re-authentication window for sensitive actions
+- short-lived CLI authentication tokens issued only after password verification for dangerous CLI operations
 
 Sensitive actions requiring recent re-auth:
 
@@ -56,17 +57,19 @@ Approvals are bound to a stored snapshot containing:
 - resource precondition hash
 - snapshot hash
 
-Before execution, the worker recalculates a live snapshot. If the live state no longer matches the approved snapshot, the proposal becomes `stale` and execution is blocked.
+Before execution, the worker verifies the exact approval record attached to the queued job, then recalculates a live snapshot. If the live state no longer matches the queued approval hashes, the proposal becomes `stale` and execution is blocked.
 
 ## Connector Safety
 
 ### Filesystem
 
 - dedicated workspace root
+- runtime state stored under the Windows local app-data area by default, not inside the repository
 - default deny outside allowlist
 - protected writes denied for source, DB, audit, log, token, and env-like targets
 - symlink traversal blocked
 - bounded text preview limits
+- full-file digests and canonical directory digests for stale approval detection
 
 ### System
 
@@ -109,6 +112,12 @@ Each entry stores:
 - timestamp
 
 DB audit remains enabled even when JSON file mirroring is disabled.
+
+## Sensitive Local Storage
+
+When a proposal payload includes sensitive text fields such as file content or HTTP request bodies, the runtime stores only digests and previews in the main proposal row. Full raw values are externalized into protected local blob storage under the secrets runtime directory.
+
+On Windows with `pywin32` available, DPAPI protection is used. Without it, the runtime falls back to plain local storage and the UI warns about that weaker mode.
 
 ## Remaining Limits
 

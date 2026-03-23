@@ -36,19 +36,22 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("proposal_id")
     approve.add_argument("--actor", default="cli-operator")
     approve.add_argument("--reason", required=True)
-    approve.add_argument("--admin-token")
+    approve.add_argument("--cli-token")
+    approve.add_argument("--admin-token", dest="cli_token")
 
     reject = subparsers.add_parser("reject-proposal", help="Reject a proposal.")
     reject.add_argument("proposal_id")
     reject.add_argument("--actor", default="cli-operator")
     reject.add_argument("--reason", required=True)
-    reject.add_argument("--admin-token")
+    reject.add_argument("--cli-token")
+    reject.add_argument("--admin-token", dest="cli_token")
 
     worker = subparsers.add_parser("run-worker", help="Run the isolated execution worker.")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--limit", type=int, default=1)
     worker.add_argument("--interval", type=float, default=2.0)
-    worker.add_argument("--admin-token")
+    worker.add_argument("--cli-token")
+    worker.add_argument("--admin-token", dest="cli_token")
 
     jobs = subparsers.add_parser("list-jobs", help="List recent execution jobs.")
     jobs.add_argument("--limit", type=int, default=20)
@@ -63,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     test_provider.add_argument("--model", dest="model_name")
     test_provider.add_argument("--prompt", default="Return a one-line readiness confirmation.")
 
+    issue_cli = subparsers.add_parser("issue-cli-token", help="Issue a short-lived CLI auth token.")
+    issue_cli.add_argument("--username", required=True)
+    issue_cli.add_argument("--password", required=True)
+    issue_cli.add_argument("--purpose", default="worker")
+    issue_cli.add_argument("--ttl-seconds", type=int, default=None)
+
     subparsers.add_parser("verify-audit", help="Verify tamper-evident audit chain integrity.")
     return parser
 
@@ -72,9 +81,9 @@ def main() -> None:
     args = parser.parse_args()
     container = AppContainer()
 
-    def require_admin_token() -> None:
-        provided = getattr(args, "admin_token", None) or os.getenv("WIN_AGENT_ADMIN_TOKEN")
-        container.admin_token_service.verify(provided)
+    def require_cli_token(purpose: str) -> None:
+        provided = getattr(args, "cli_token", None) or os.getenv("WIN_AGENT_CLI_TOKEN")
+        container.admin_token_service.verify(provided, purpose=purpose)
 
     if args.command == "run-agent":
         result = container.runtime_service.run_agent(
@@ -111,7 +120,7 @@ def main() -> None:
         return
 
     if args.command == "approve-proposal":
-        require_admin_token()
+        require_cli_token("approval")
         result = container.runtime_service.approve_and_queue(
             args.proposal_id,
             ApprovalDecisionRequest(actor=args.actor, reason=args.reason),
@@ -120,7 +129,7 @@ def main() -> None:
         return
 
     if args.command == "reject-proposal":
-        require_admin_token()
+        require_cli_token("approval")
         result = container.runtime_service.reject(
             args.proposal_id,
             ApprovalDecisionRequest(actor=args.actor, reason=args.reason),
@@ -129,7 +138,7 @@ def main() -> None:
         return
 
     if args.command == "run-worker":
-        require_admin_token()
+        require_cli_token("worker")
         if args.once:
             result = container.worker.run_once()
             print(json.dumps(result, indent=2, default=str) if result is not None else "No queued jobs.")
@@ -142,6 +151,26 @@ def main() -> None:
                 processed += 1
                 print(json.dumps(result, indent=2, default=str))
             sleep(args.interval)
+        return
+
+    if args.command == "issue-cli-token":
+        token, record = container.admin_token_service.issue(
+            username=args.username,
+            password=args.password,
+            purpose=args.purpose,
+            ttl_seconds=args.ttl_seconds,
+        )
+        print(
+            json.dumps(
+                {
+                    "token": token,
+                    "purpose": record.purpose,
+                    "expires_at": record.expires_at,
+                    "username": record.username,
+                },
+                indent=2,
+            )
+        )
         return
 
     if args.command == "list-jobs":

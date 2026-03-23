@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS connector_runs (
     connector TEXT NOT NULL,
     operation TEXT NOT NULL,
     status TEXT NOT NULL,
+    agent_id TEXT,
+    agent_role TEXT,
+    correlation_id TEXT,
     input_json TEXT NOT NULL,
     output_json TEXT,
     error_text TEXT,
@@ -107,6 +110,32 @@ CREATE TABLE IF NOT EXISTS users (
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    csrf_token TEXT NOT NULL,
+    client_ip TEXT,
+    user_agent TEXT,
+    created_at TEXT NOT NULL,
+    last_activity_at TEXT NOT NULL,
+    recent_auth_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS cli_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_used_at TEXT,
+    revoked_at TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -259,6 +288,8 @@ CREATE INDEX IF NOT EXISTS idx_proposal_snapshots_proposal ON proposal_snapshots
 CREATE INDEX IF NOT EXISTS idx_agent_runs_run_id ON agent_runs(run_id, started_at ASC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_execution_attempts_job_id ON execution_attempts(job_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cli_tokens_user_id ON cli_tokens(user_id, expires_at DESC);
 """
 
 
@@ -321,6 +352,11 @@ class Database:
                 "correlation_id": "TEXT",
             },
             "action_history": {
+                "correlation_id": "TEXT",
+            },
+            "connector_runs": {
+                "agent_id": "TEXT",
+                "agent_role": "TEXT",
                 "correlation_id": "TEXT",
             },
             "execution_jobs": {

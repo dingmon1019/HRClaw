@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from datetime import timedelta
+import json
 import os
+import sys
 
 import pytest
 
+from app import cli as cli_module
 from app.config.settings import AppSettings
 from app.core.container import AppContainer
+from app.core.errors import AuthorizationError
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
 from app.schemas.providers import ProviderRequest
 from app.schemas.settings import SettingsUpdate
@@ -58,8 +63,10 @@ def _settings_update_from_effective(settings) -> SettingsUpdate:
 
 def test_session_idle_timeout_forces_relogin(client, container):
     bootstrap_operator(client)
-    original_now = container.auth_service.now_epoch()
-    container.auth_service.now_epoch = lambda: original_now + container.settings_service.get_effective_settings().session_idle_timeout_seconds + 1
+    original_now = container.session_service.now_utc()
+    container.session_service.now_utc = lambda: original_now + timedelta(
+        seconds=container.settings_service.get_effective_settings().session_idle_timeout_seconds + 1
+    )
 
     response = client.get("/", headers={"accept": "text/html"}, follow_redirects=False)
 
@@ -110,6 +117,7 @@ def test_path_guard_blocks_symlink_escape(container, tmp_path):
 def test_provider_restricted_data_stays_local(tmp_path):
     settings = AppSettings(
         app_name="Restricted Egress Test",
+        runtime_state_root=tmp_path / "runtime-state",
         database_path=tmp_path / "runtime.db",
         audit_log_path=tmp_path / "audit.jsonl",
         workspace_root=tmp_path / "workspace",
@@ -171,6 +179,71 @@ def test_json_audit_disable_keeps_database_audit(container):
     assert row["event_type"] == "test.db_only"
 
 
+def test_audit_chain_uses_insertion_order_when_timestamps_match(container, monkeypatch):
+    monkeypatch.setattr("app.audit.service.utcnow_iso", lambda: "2026-03-23T00:00:00+00:00")
+
+    container.audit_service.emit("test.same_second_a", {"value": 1})
+    container.audit_service.emit("test.same_second_b", {"value": 2})
+
+    result = container.audit_service.verify_integrity()
+
+    assert result["ok"] is True
+    assert result["entry_count"] >= 2
+
+
+def test_worker_blocks_when_approval_binding_is_tampered(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Approval binding")
+    )
+    proposal = result.proposals[0]
+    queued = container.runtime_service.approve_and_queue(
+        proposal.id,
+        ApprovalDecisionRequest(actor="pytest", reason="queue for approval binding test"),
+    )
+
+    container.database.execute(
+        "UPDATE approvals SET action_hash = ? WHERE id = ?",
+        ("tampered", queued["approval"].id),
+    )
+
+    with pytest.raises(ValueError, match="queued approval"):
+        container.worker.run_once()
+
+    updated = container.proposal_service.get(proposal.id)
+    assert updated.status == ProposalStatus.STALE
+    assert queued["job"].approval_id == queued["approval"].id
+
+
+def test_live_running_job_is_not_reclaimed_before_lease_expires(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Lease guard")
+    )
+    proposal = result.proposals[0]
+    container.runtime_service.approve_and_queue(
+        proposal.id,
+        ApprovalDecisionRequest(actor="pytest", reason="queue for live lease test"),
+    )
+
+    claimed = container.execution_queue_service.claim_next_job("worker-a", lease_seconds=30, max_attempts=3)
+    assert claimed is not None
+
+    second_claim = container.execution_queue_service.claim_next_job("worker-b", lease_seconds=30, max_attempts=3)
+
+    assert second_claim is None
+
+
+def test_planner_connector_permissions_are_enforced(container):
+    container.database.execute(
+        "UPDATE agents SET allowed_connectors_json = ? WHERE role = ?",
+        ('[]', "planner"),
+    )
+
+    with pytest.raises(AuthorizationError, match="Planner Agent is not allowed to use connector"):
+        container.runtime_service.run_agent(
+            AgentRunRequest(objective="Read a file", filesystem_path="notes.txt")
+        )
+
+
 def test_multi_agent_handoffs_are_persisted(container):
     result = container.runtime_service.run_agent(
         AgentRunRequest(
@@ -188,3 +261,121 @@ def test_multi_agent_handoffs_are_persisted(container):
     assert len(handoffs) >= 3
     assert all(proposal.created_by_agent_role == "planner" for proposal in result.proposals)
     assert all(proposal.reviewed_by_agent_role == "reviewer" for proposal in result.proposals)
+    connector_runs = container.history_service.list_connector_runs(limit=20)
+    assert all(run.agent_role for run in connector_runs)
+
+
+def test_default_runtime_state_uses_localappdata(monkeypatch, tmp_path):
+    local_appdata = tmp_path / "LocalAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.resolved_runtime_state_root == (local_appdata / "WinAgentRuntime").resolve()
+    assert settings.resolved_database_path == (local_appdata / "WinAgentRuntime" / "data" / "win_agent_runtime.db").resolve()
+    assert settings.resolved_session_secret_path == (local_appdata / "WinAgentRuntime" / "secrets" / "session_secret.bin").resolve()
+
+
+def test_sensitive_payload_is_externalized_from_proposal_rows(container):
+    secret_text = "super-sensitive proposal body"
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Write a note safely",
+            filesystem_path="note.txt",
+            file_content=secret_text,
+        )
+    )
+    proposal = next(proposal for proposal in result.proposals if proposal.action_type == "filesystem.write_text")
+
+    row = container.database.fetch_one("SELECT payload_json FROM proposals WHERE id = ?", (proposal.id,))
+    assert row is not None
+    assert secret_text not in row["payload_json"]
+    assert proposal.payload.get("content_blob_id")
+
+    materialized = container.data_governance_service.materialize_action_payload(proposal.payload)
+    assert materialized["content"] == secret_text
+
+
+def test_history_sanitization_redacts_sensitive_fields(container):
+    sanitized = container.data_governance_service.sanitize_for_history(
+        {"content": "top-secret", "body": "remote-body", "details": "operator notes"}
+    )
+
+    assert sanitized["content"]["redacted"] is True
+    assert sanitized["body"]["redacted"] is True
+    assert sanitized["details"]["redacted"] is True
+    assert "top-secret" not in json.dumps(sanitized)
+
+
+def test_full_file_digest_detects_same_size_content_change(container):
+    target = container.base_settings.resolved_workspace_root / "digest.txt"
+    target.write_text("AAAA", encoding="utf-8")
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Read digest file", filesystem_path="digest.txt")
+    )
+    proposal = next(proposal for proposal in result.proposals if proposal.action_type == "filesystem.read_text")
+    container.runtime_service.approve_and_queue(
+        proposal.id,
+        ApprovalDecisionRequest(actor="pytest", reason="approve file digest"),
+    )
+
+    target.write_text("BBBB", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Snapshot drift detected"):
+        container.worker.run_once()
+
+    updated = container.proposal_service.get(proposal.id)
+    assert updated.status == ProposalStatus.STALE
+
+
+def test_directory_digest_detects_nested_same_size_content_change(container):
+    folder = container.base_settings.resolved_workspace_root / "folder"
+    folder.mkdir(exist_ok=True)
+    nested = folder / "item.txt"
+    nested.write_text("AAAA", encoding="utf-8")
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="List folder contents", filesystem_path="folder")
+    )
+    proposal = next(proposal for proposal in result.proposals if proposal.action_type == "filesystem.list_directory")
+    container.runtime_service.approve_and_queue(
+        proposal.id,
+        ApprovalDecisionRequest(actor="pytest", reason="approve folder digest"),
+    )
+
+    nested.write_text("BBBB", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Snapshot drift detected"):
+        container.worker.run_once()
+
+    updated = container.proposal_service.get(proposal.id)
+    assert updated.status == ProposalStatus.STALE
+
+
+def test_cli_token_issue_and_verify(container):
+    username = "cli-operator"
+    password = "CliSecure123!"
+    container.auth_service.create_initial_user(username, password)
+
+    token, record = container.cli_token_service.issue(
+        username=username,
+        password=password,
+        purpose="worker",
+        ttl_seconds=60,
+    )
+    verified = container.cli_token_service.verify(token, purpose="worker")
+
+    assert verified.id == record.id
+    assert verified.username == username
+
+    with pytest.raises(AuthorizationError):
+        container.cli_token_service.verify(token, purpose="approval")
+
+
+def test_cli_sensitive_command_requires_short_lived_token(container, monkeypatch):
+    monkeypatch.setattr(cli_module, "AppContainer", lambda: container)
+    monkeypatch.setattr(sys, "argv", ["app.cli", "run-worker", "--once"])
+
+    with pytest.raises(AuthorizationError, match="CLI authentication token"):
+        cli_module.main()

@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_runtime_state_root(app_slug: str = "WinAgentRuntime") -> Path:
+    local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+    if local_appdata:
+        return Path(local_appdata) / app_slug
+    return Path.home() / f".{app_slug.lower()}"
+
+
+def _resolve_under(base_dir: Path, value: Path | None, fallback_name: str) -> Path:
+    candidate = value or Path(fallback_name)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (base_dir / candidate).resolve()
 
 
 class AppSettings(BaseSettings):
@@ -16,18 +31,26 @@ class AppSettings(BaseSettings):
     )
 
     app_name: str = "Win Agent Runtime"
+    app_slug: str = "WinAgentRuntime"
     host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "info"
 
-    database_path: Path = Path("data/win_agent_runtime.db")
-    audit_log_path: Path = Path("data/audit/audit.jsonl")
+    runtime_state_root: Path | None = None
+    data_dir: Path | None = None
+    secrets_dir: Path | None = None
+    logs_dir: Path | None = None
+
+    database_path: Path = Path("win_agent_runtime.db")
+    audit_log_path: Path = Path("audit.jsonl")
     json_audit_enabled: bool = True
-    workspace_root: Path = Path("runtime_workspace")
-    admin_token_path: Path = Path("data/admin_token.txt")
+    workspace_root: Path = Path("workspace")
+    protected_blob_dir: Path = Path("protected_blobs")
+    local_protection_mode: str = "dpapi"
+    history_retention_days: int = Field(default=30, ge=1, le=3650)
 
     runtime_mode: str = "safe"
-    allowed_filesystem_roots: str = "runtime_workspace"
+    allowed_filesystem_roots: str = "workspace"
     allowed_http_hosts: str = "127.0.0.1,localhost"
     allowed_http_schemes: str = "http,https"
     allowed_http_ports: str = "80,443,8000,8080,11434"
@@ -65,11 +88,12 @@ class AppSettings(BaseSettings):
     anthropic_api_key_env: str = "ANTHROPIC_API_KEY"
     gemini_api_key_env: str = "GEMINI_API_KEY"
     session_secret: str | None = None
-    session_secret_path: Path = Path("data/session_secret.txt")
+    session_secret_path: Path = Path("session_secret.bin")
     session_cookie_name: str = "win_agent_session"
     session_max_age_seconds: int = Field(default=3600, ge=300, le=86400)
     session_idle_timeout_seconds: int = Field(default=900, ge=60, le=86400)
     recent_auth_window_seconds: int = Field(default=300, ge=30, le=3600)
+    cli_token_ttl_seconds: int = Field(default=900, ge=60, le=86400)
     secure_cookies: bool = False
     max_request_size_bytes: int = Field(default=1_048_576, ge=4096, le=10_485_760)
     trusted_hosts: str = "127.0.0.1,localhost"
@@ -86,24 +110,41 @@ class AppSettings(BaseSettings):
         return Path(__file__).resolve().parents[2]
 
     @property
+    def resolved_runtime_state_root(self) -> Path:
+        base = self.runtime_state_root or _default_runtime_state_root(self.app_slug)
+        return base.resolve()
+
+    @property
+    def resolved_data_dir(self) -> Path:
+        return _resolve_under(self.resolved_runtime_state_root, self.data_dir, "data")
+
+    @property
+    def resolved_secrets_dir(self) -> Path:
+        return _resolve_under(self.resolved_runtime_state_root, self.secrets_dir, "secrets")
+
+    @property
+    def resolved_logs_dir(self) -> Path:
+        return _resolve_under(self.resolved_runtime_state_root, self.logs_dir, "logs")
+
+    @property
     def resolved_database_path(self) -> Path:
-        return (self.project_root / self.database_path).resolve()
+        return _resolve_under(self.resolved_data_dir, self.database_path, "win_agent_runtime.db")
 
     @property
     def resolved_audit_log_path(self) -> Path:
-        return (self.project_root / self.audit_log_path).resolve()
+        return _resolve_under(self.resolved_logs_dir, self.audit_log_path, "audit.jsonl")
 
     @property
     def resolved_workspace_root(self) -> Path:
-        return (self.project_root / self.workspace_root).resolve()
+        return _resolve_under(self.resolved_runtime_state_root, self.workspace_root, "workspace")
 
     @property
     def resolved_session_secret_path(self) -> Path:
-        return (self.project_root / self.session_secret_path).resolve()
+        return _resolve_under(self.resolved_secrets_dir, self.session_secret_path, "session_secret.bin")
 
     @property
-    def resolved_admin_token_path(self) -> Path:
-        return (self.project_root / self.admin_token_path).resolve()
+    def resolved_protected_blob_dir(self) -> Path:
+        return _resolve_under(self.resolved_secrets_dir, self.protected_blob_dir, "protected_blobs")
 
 
 @lru_cache(maxsize=1)

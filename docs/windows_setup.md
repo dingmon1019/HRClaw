@@ -40,6 +40,17 @@ Open:
 
 - [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
+## Runtime State Layout
+
+By default the runtime keeps live state outside the repository:
+
+- `%LOCALAPPDATA%\WinAgentRuntime\data`
+- `%LOCALAPPDATA%\WinAgentRuntime\logs`
+- `%LOCALAPPDATA%\WinAgentRuntime\secrets`
+- `%LOCALAPPDATA%\WinAgentRuntime\workspace`
+
+That means the local database, audit mirror, generated session secret, and protected payload blobs should not live under the cloned git working tree unless you explicitly override paths.
+
 ## What Bootstrap Does
 
 `.\scripts\bootstrap.ps1`:
@@ -47,8 +58,8 @@ Open:
 - creates `.venv`
 - installs dependencies
 - copies `.env.example` to `.env` if missing
-- creates `runtime_workspace\`
-- creates `data\admin_token.txt` if missing
+- initializes `%LOCALAPPDATA%\WinAgentRuntime\`
+- creates `data\`, `logs\`, `secrets\`, and `workspace\` under that runtime root
 
 ## Manual Setup
 
@@ -70,9 +81,10 @@ Then:
 ## Windows Notes
 
 - the UI is loopback-bound by default
-- worker CLI actions require a local admin token
+- worker CLI actions require a short-lived CLI auth token issued after password verification
 - if `python` is not on PATH, use `py -3.13`
 - `pywin32` is optional; the Outlook connector fails gracefully when unavailable
+- when `pywin32` is installed, DPAPI-backed local secret protection is used automatically
 
 ## Troubleshooting
 
@@ -91,10 +103,10 @@ If that works, either use `py -3.13` directly or add Python to the Windows user 
 If `run-worker.ps1` reports a missing token, run:
 
 ```powershell
-.\scripts\bootstrap.ps1
+.\scripts\run-worker.ps1
 ```
 
-This creates `data\admin_token.txt`.
+The script can prompt for local credentials, mint a short-lived token for the `worker` purpose, and keep it only in the current PowerShell process environment.
 
 ### Outlook connector unavailable
 

@@ -17,6 +17,7 @@ def test_mock_provider_returns_content(container):
 def test_provider_falls_back_to_mock_when_primary_is_unconfigured(tmp_path):
     settings = AppSettings(
         app_name="Fallback Test",
+        runtime_state_root=tmp_path / "runtime-state",
         database_path=tmp_path / "runtime.db",
         audit_log_path=tmp_path / "audit.jsonl",
         workspace_root=tmp_path / "workspace",
@@ -36,6 +37,7 @@ def test_provider_falls_back_to_mock_when_primary_is_unconfigured(tmp_path):
 def test_circuit_breaker_opens_after_repeated_provider_failure(tmp_path):
     settings = AppSettings(
         app_name="Circuit Test",
+        runtime_state_root=tmp_path / "runtime-state",
         database_path=tmp_path / "runtime.db",
         audit_log_path=tmp_path / "audit.jsonl",
         workspace_root=tmp_path / "workspace",
@@ -63,3 +65,15 @@ def test_local_only_profile_prefers_local_provider(container):
     )
 
     assert response.provider_name == "mock"
+
+
+def test_provider_health_is_persisted_to_database(container):
+    statuses = container.provider_service.list_statuses()
+
+    row = container.database.fetch_one(
+        "SELECT provider_name, metadata_json FROM provider_health WHERE provider_name = ?",
+        (statuses[0].name,),
+    )
+
+    assert row is not None
+    assert row["provider_name"] == statuses[0].name

@@ -81,7 +81,7 @@ class PathGuard:
         for raw_root in settings.allowed_filesystem_roots:
             root = Path(raw_root)
             if not root.is_absolute():
-                root = (self.base_settings.project_root / root).resolve()
+                root = (self.base_settings.resolved_runtime_state_root / root).resolve()
             else:
                 root = root.resolve()
             roots.append(root)
@@ -107,7 +107,9 @@ class PathGuard:
         protected_paths.append(self.base_settings.resolved_database_path)
         protected_paths.append(self.base_settings.resolved_audit_log_path)
         protected_paths.append(self.base_settings.resolved_session_secret_path)
-        protected_paths.append(self.base_settings.resolved_admin_token_path)
+        protected_paths.append(self.base_settings.resolved_data_dir)
+        protected_paths.append(self.base_settings.resolved_logs_dir)
+        protected_paths.append(self.base_settings.resolved_secrets_dir)
         for protected in protected_paths:
             if candidate == protected or self._is_relative_to(candidate, protected):
                 raise ConnectorError(f"Writes to protected path {protected} are not allowed.")

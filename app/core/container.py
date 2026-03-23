@@ -13,26 +13,39 @@ from app.runtime.planner import RuntimePlanner
 from app.runtime.service import AgentRuntimeService
 from app.runtime.worker import ExecutionWorker
 from app.security.admin_token import AdminTokenService
+from app.security.protected_storage import ProtectedStorageService
 from app.security.rate_limit import RateLimiter
 from app.services.auth_service import AuthService
+from app.services.cli_token_service import CliTokenService
+from app.services.data_governance_service import DataGovernanceService
 from app.services.execution_queue_service import ExecutionQueueService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.proposal_snapshot_service import ProposalSnapshotService
 from app.services.provider_service import ProviderService
+from app.services.session_service import SessionService
 from app.services.settings_service import SettingsService
 
 
 class AppContainer:
     def __init__(self, base_settings: AppSettings | None = None):
         self.base_settings = base_settings or get_app_settings()
+        self.base_settings.resolved_runtime_state_root.mkdir(parents=True, exist_ok=True)
+        self.base_settings.resolved_data_dir.mkdir(parents=True, exist_ok=True)
+        self.base_settings.resolved_secrets_dir.mkdir(parents=True, exist_ok=True)
+        self.base_settings.resolved_protected_blob_dir.mkdir(parents=True, exist_ok=True)
+        self.base_settings.resolved_logs_dir.mkdir(parents=True, exist_ok=True)
         self.base_settings.resolved_workspace_root.mkdir(parents=True, exist_ok=True)
         self.database = Database(self.base_settings.resolved_database_path)
         self.database.initialize()
 
         self.settings_service = SettingsService(self.base_settings, self.database)
         self.auth_service = AuthService(self.database)
-        self.admin_token_service = AdminTokenService(self.base_settings)
+        self.protected_storage = ProtectedStorageService(self.base_settings)
+        self.session_service = SessionService(self.database, self.base_settings)
+        self.admin_token_service = AdminTokenService(self.database, self.auth_service, self.base_settings)
+        self.data_governance_service = DataGovernanceService(self.protected_storage)
+        self.cli_token_service = CliTokenService(self.database, self.auth_service, self.base_settings)
         self.rate_limiter = RateLimiter()
         self.audit_service = AuditService(self.database, self.base_settings.resolved_audit_log_path, self.settings_service)
         self.history_service = HistoryService(self.database)
@@ -41,8 +54,13 @@ class AppContainer:
             self.base_settings,
             self.database,
             self.settings_service,
+            self.data_governance_service,
         )
-        self.proposal_service = ProposalService(self.database, self.proposal_snapshot_service)
+        self.proposal_service = ProposalService(
+            self.database,
+            self.proposal_snapshot_service,
+            self.data_governance_service,
+        )
         self.execution_queue_service = ExecutionQueueService(self.database)
         self.summary_service = SummaryService(self.database)
         self.policy_engine = PolicyEngine(self.base_settings, self.settings_service)
@@ -66,6 +84,7 @@ class AppContainer:
             policy_engine=self.policy_engine,
             audit_service=self.audit_service,
             agent_service=self.agent_service,
+            data_governance_service=self.data_governance_service,
         )
         self.executor = ExecutionDispatcher(
             connector_registry=self.connector_registry,
@@ -74,6 +93,8 @@ class AppContainer:
             policy_engine=self.policy_engine,
             audit_service=self.audit_service,
             snapshot_service=self.proposal_snapshot_service,
+            agent_service=self.agent_service,
+            data_governance_service=self.data_governance_service,
         )
         self.worker = ExecutionWorker(
             worker_id="local-worker",

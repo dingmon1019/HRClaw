@@ -8,6 +8,10 @@ from app.schemas.actions import RuntimeMode
 class EffectiveSettings(BaseModel):
     app_name: str
     runtime_mode: RuntimeMode
+    runtime_state_root: str
+    data_dir: str
+    secrets_dir: str
+    logs_dir: str
     workspace_root: str
     provider: str
     fallback_provider: str | None = None
@@ -47,7 +51,10 @@ class EffectiveSettings(BaseModel):
     enable_outlook_connector: bool = False
     enable_system_connector: bool = True
     configured_secret_envs: list[str] = Field(default_factory=list)
-    admin_token_configured: bool = False
+    cli_auth_mode: str = "short-lived-password-issued"
+    local_protection_mode: str = "dpapi"
+    history_retention_days: int = 30
+    cli_token_ttl_seconds: int = 900
     worker_lease_seconds: int = 45
     worker_max_attempts: int = 3
 
@@ -90,6 +97,9 @@ class SettingsUpdate(BaseModel):
     allowed_http_hosts: str
     enable_system_connector: bool
     enable_outlook_connector: bool
+    local_protection_mode: str | None = None
+    history_retention_days: int | None = None
+    cli_token_ttl_seconds: int | None = None
     worker_lease_seconds: int
     worker_max_attempts: int
 
@@ -133,5 +143,8 @@ class SanitizedSettingsExport(BaseModel):
     allowed_http_hosts: list[str]
     enable_system_connector: bool
     enable_outlook_connector: bool
+    local_protection_mode: str
+    history_retention_days: int
+    cli_token_ttl_seconds: int
     worker_lease_seconds: int
     worker_max_attempts: int

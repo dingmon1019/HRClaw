@@ -142,6 +142,9 @@ class ConnectorRunRecord(BaseModel):
     connector: str
     operation: str
     status: str
+    agent_id: str | None = None
+    agent_role: str | None = None
+    correlation_id: str | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] | None = None
     error_text: str | None = None

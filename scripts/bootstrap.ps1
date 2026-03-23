@@ -2,6 +2,12 @@ param(
     [string]$VenvPath = ".venv"
 )
 
+$runtimeRoot = Join-Path $env:LOCALAPPDATA "WinAgentRuntime"
+$dataDir = Join-Path $runtimeRoot "data"
+$logsDir = Join-Path $runtimeRoot "logs"
+$secretsDir = Join-Path $runtimeRoot "secrets"
+$workspaceDir = Join-Path $runtimeRoot "workspace"
+
 function Get-PythonLauncher {
     $venvPython = Join-Path $VenvPath "Scripts\python.exe"
     if (Test-Path $venvPython) {
@@ -31,24 +37,15 @@ if (-not (Test-Path ".env") -and (Test-Path ".env.example")) {
     Copy-Item ".env.example" ".env"
 }
 
-if (-not (Test-Path "runtime_workspace")) {
-    New-Item -ItemType Directory -Path "runtime_workspace" | Out-Null
-}
-
-if (-not (Test-Path "data")) {
-    New-Item -ItemType Directory -Path "data" | Out-Null
-}
-
-$adminTokenPath = "data\admin_token.txt"
-if (-not (Test-Path $adminTokenPath)) {
-    $bytes = New-Object byte[] 24
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    $token = [Convert]::ToBase64String($bytes)
-    Set-Content -Path $adminTokenPath -Value $token -NoNewline
+foreach ($path in @($runtimeRoot, $dataDir, $logsDir, $secretsDir, $workspaceDir)) {
+    if (-not (Test-Path $path)) {
+        New-Item -ItemType Directory -Path $path | Out-Null
+    }
 }
 
 Write-Host "Environment ready."
 Write-Host "Activate with $VenvPath\\Scripts\\Activate.ps1"
 Write-Host "Run app with .\\scripts\\run-local.ps1"
 Write-Host "Run worker with .\\scripts\\run-worker.ps1"
-Write-Host "CLI admin token stored at $adminTokenPath"
+Write-Host "Runtime state root: $runtimeRoot"
+Write-Host "Workspace: $workspaceDir"

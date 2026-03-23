@@ -49,6 +49,15 @@
             </select>
         </label>
         <label>
+            Provider
+            <select name="provider_filter">
+                <option value="">All</option>
+                {% for value in provider_options %}
+                <option value="{{ value }}" {% if provider_filter == value %}selected{% endif %}>{{ value }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>
             Risk
             <select name="risk_filter">
                 <option value="">All</option>
@@ -69,18 +78,19 @@
         <h2>Action History</h2>
         <table>
             <thead>
-                <tr><th>Action</th><th>Status</th><th>Started</th><th>Proposal</th></tr>
+                <tr><th>Action</th><th>Provider</th><th>Status</th><th>Started</th><th>Proposal</th></tr>
             </thead>
             <tbody>
                 {% for entry in history %}
                 <tr>
                     <td>{{ entry.action_type }}</td>
+                    <td>{{ entry.provider_name or "-" }}</td>
                     <td><span class="badge {{ entry.status }}">{{ entry.status }}</span></td>
                     <td>{{ entry.started_at }}</td>
                     <td><a href="/proposals/{{ entry.proposal_id }}">{{ entry.proposal_id }}</a></td>
                 </tr>
                 {% else %}
-                <tr><td colspan="4" class="muted">No action history matched the current filters.</td></tr>
+                <tr><td colspan="5" class="muted">No action history matched the current filters.</td></tr>
                 {% endfor %}
             </tbody>
         </table>
@@ -107,18 +117,19 @@
         <h2>Connector Runs</h2>
         <table>
             <thead>
-                <tr><th>Connector</th><th>Operation</th><th>Status</th><th>Created</th></tr>
+                <tr><th>Connector</th><th>Operation</th><th>Agent</th><th>Status</th><th>Created</th></tr>
             </thead>
             <tbody>
                 {% for run in connector_runs %}
                 <tr>
                     <td>{{ run.connector }}</td>
                     <td>{{ run.operation }}</td>
+                    <td>{{ run.agent_role or "-" }}</td>
                     <td><span class="badge {{ run.status }}">{{ run.status }}</span></td>
                     <td>{{ run.created_at }}</td>
                 </tr>
                 {% else %}
-                <tr><td colspan="4" class="muted">No connector runs matched the current filters.</td></tr>
+                <tr><td colspan="5" class="muted">No connector runs matched the current filters.</td></tr>
                 {% endfor %}
             </tbody>
         </table>

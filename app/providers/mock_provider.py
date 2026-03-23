@@ -11,6 +11,7 @@ class MockProvider(BaseProvider):
     profiles = ["fast", "cheap", "local-only"]
     supports_local = True
     supports_remote = False
+    capabilities = ["text", "planning", "review"]
 
     def complete(self, request: ProviderRequest, settings: EffectiveSettings) -> ProviderResponse:
         prompt = request.prompt.strip()

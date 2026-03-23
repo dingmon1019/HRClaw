@@ -23,6 +23,37 @@
 
             <div class="settings-group">
                 <h3>Safe Defaults</h3>
+                <div class="panel">
+                    <h4>Runtime State Layout</h4>
+                    <p class="small muted">Live runtime state stays outside the repository by default. These paths are informational and follow the current machine-local configuration.</p>
+                    <div class="grid two">
+                        <label>
+                            Runtime State Root
+                            <input type="text" value="{{ settings.runtime_state_root }}" readonly>
+                        </label>
+                        <label>
+                            Workspace Root
+                            <input type="text" value="{{ settings.workspace_root }}" readonly>
+                        </label>
+                    </div>
+                    <div class="grid two">
+                        <label>
+                            Data Directory
+                            <input type="text" value="{{ settings.data_dir }}" readonly>
+                        </label>
+                        <label>
+                            Secrets Directory
+                            <input type="text" value="{{ settings.secrets_dir }}" readonly>
+                        </label>
+                    </div>
+                    <div class="grid one">
+                        <label>
+                            Logs Directory
+                            <input type="text" value="{{ settings.logs_dir }}" readonly>
+                        </label>
+                    </div>
+                </div>
+
                 <div class="grid two">
                     <label>
                         Runtime Mode
@@ -250,6 +281,25 @@
                         <input type="number" min="1" name="worker_max_attempts" value="{{ settings.worker_max_attempts }}">
                     </label>
                 </div>
+
+                <div class="grid three">
+                    <label>
+                        Local Protection Mode
+                        <select name="local_protection_mode">
+                            {% for value in ["dpapi", "plain-local"] %}
+                            <option value="{{ value }}" {% if settings.local_protection_mode == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        History Retention Days
+                        <input type="number" min="1" max="3650" name="history_retention_days" value="{{ settings.history_retention_days }}">
+                    </label>
+                    <label>
+                        CLI Token TTL Seconds
+                        <input type="number" min="60" max="86400" name="cli_token_ttl_seconds" value="{{ settings.cli_token_ttl_seconds }}">
+                    </label>
+                </div>
             </div>
 
             <label>
@@ -276,7 +326,8 @@
             <div class="panel">
                 <h3>Configured Secret Envs</h3>
                 <p>{{ settings.configured_secret_envs | join(', ') if settings.configured_secret_envs else "No secret environment variables detected." }}</p>
-                <p class="small muted">CLI admin token: {{ "configured" if settings.admin_token_configured else "not initialized yet" }}</p>
+                <p class="small muted">CLI auth mode: {{ settings.cli_auth_mode }}</p>
+                <p class="small muted">Protected local storage mode: {{ protected_storage_mode }}</p>
             </div>
 
             <form method="post" action="/settings/test-provider" class="stack form-grid">

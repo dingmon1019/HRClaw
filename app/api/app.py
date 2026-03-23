@@ -19,20 +19,16 @@ from app.core.errors import (
     NotFoundError,
     RateLimitError,
 )
-from app.core.utils import ensure_parent_dir, random_token
 from app.security.middleware import LocalhostSecurityMiddleware
 
 
 def _load_session_secret(container: AppContainer) -> str:
     if container.base_settings.session_secret:
         return container.base_settings.session_secret
-    secret_path = container.base_settings.resolved_session_secret_path
-    ensure_parent_dir(secret_path)
-    if secret_path.exists():
-        return secret_path.read_text(encoding="utf-8").strip()
-    secret = random_token(32)
-    secret_path.write_text(secret, encoding="utf-8")
-    return secret
+    return container.protected_storage.ensure_secret_text(
+        container.base_settings.resolved_session_secret_path,
+        length=32,
+    ).strip()
 
 
 def create_app(settings=None) -> FastAPI:

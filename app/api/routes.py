@@ -32,9 +32,6 @@ from app.schemas.auth import SetupRequest
 from app.schemas.providers import ProviderTestRequest
 from app.schemas.settings import SanitizedSettingsExport, SettingsUpdate
 from app.security.auth import (
-    SESSION_AUTHENTICATED_AT,
-    SESSION_LAST_ACTIVITY_AT,
-    SESSION_RECENT_AUTH_AT,
     login_session,
     logout_session,
     mark_recent_auth,
@@ -63,20 +60,15 @@ def _client_key(request: Request) -> str:
 def _session_user(request: Request, container: AppContainer):
     if not container.auth_service.has_users():
         return None
-    settings = container.settings_service.get_effective_settings()
-    now = container.auth_service.now_epoch()
-    authenticated_at = int(request.session.get(SESSION_AUTHENTICATED_AT, 0) or 0)
-    if not authenticated_at or now - authenticated_at > settings.session_max_age_seconds:
-        logout_session(request)
+    record = container.session_service.get_active(request.session.get("session_id"))
+    if record is None:
+        logout_session(request, container.session_service)
         return None
-    last_activity_at = int(request.session.get(SESSION_LAST_ACTIVITY_AT, 0) or 0)
-    if last_activity_at and now - last_activity_at > settings.session_idle_timeout_seconds:
-        logout_session(request)
+    if container.session_service.is_idle_expired(record):
+        logout_session(request, container.session_service)
         return None
-    recent_auth_at = int(request.session.get(SESSION_RECENT_AUTH_AT, 0) or 0)
-    recent_auth = bool(recent_auth_at and now - recent_auth_at <= settings.recent_auth_window_seconds)
-    touch_session_activity(request, now)
-    return read_session_user(request, recent_auth)
+    record = touch_session_activity(request, container.session_service) or record
+    return read_session_user(record, recent_auth=container.session_service.has_recent_auth(record))
 
 
 def _page_user_or_redirect(request: Request, container: AppContainer):
@@ -112,7 +104,7 @@ def _require_recent_auth(
     if not current_password:
         raise AuthorizationError(f"Recent re-authentication is required to {purpose}.")
     container.auth_service.verify_current_password(user.id, current_password)
-    mark_recent_auth(request, container.auth_service.now_epoch())
+    mark_recent_auth(request, container.session_service)
     container.audit_service.emit("auth.reauth", {"username": user.username, "purpose": purpose})
 
 
@@ -175,6 +167,7 @@ def _filesystem_preview(container: AppContainer, proposal: ProposalRecord) -> di
     path_guard = container.policy_engine.path_guard
     action_type = proposal.action_type
     raw_path = proposal.payload.get("path")
+    runtime_payload = container.data_governance_service.materialize_action_payload(proposal.payload)
     if not raw_path:
         return {}
     try:
@@ -194,7 +187,7 @@ def _filesystem_preview(container: AppContainer, proposal: ProposalRecord) -> di
         preview["before_preview"] = json.dumps(entries, indent=2)
         return preview
     if action_type in {"filesystem.write_text", "filesystem.append_text"}:
-        incoming = proposal.payload.get("content", "")
+        incoming = runtime_payload.get("content", "")
         after_text = incoming if action_type == "filesystem.write_text" else before_text + incoming
         diff = "\n".join(
             difflib.unified_diff(
@@ -231,9 +224,10 @@ def _rollback_indicator(proposal: ProposalRecord) -> str:
 
 
 def _proposal_preview(container: AppContainer, proposal: ProposalRecord) -> dict[str, Any]:
+    runtime_payload = container.data_governance_service.materialize_action_payload(proposal.payload)
     preview: dict[str, Any] = {
         "affected_resources": _proposal_resources(proposal),
-        "execution_preview": proposal.payload,
+        "execution_preview": container.data_governance_service.sanitize_for_history(runtime_payload),
         "rollback": _rollback_indicator(proposal),
     }
     if proposal.connector == "filesystem":
@@ -243,7 +237,7 @@ def _proposal_preview(container: AppContainer, proposal: ProposalRecord) -> dict
             "method": proposal.action_type.split(".", 1)[1].upper(),
             "url": proposal.payload.get("url"),
             "headers": proposal.payload.get("headers") or {},
-            "body": proposal.payload.get("body"),
+            "body": runtime_payload.get("body"),
         }
     elif proposal.connector == "system":
         preview["system_preview"] = {
@@ -292,8 +286,12 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
 def _unsafe_warnings(container: AppContainer) -> list[str]:
     settings = container.settings_service.get_effective_settings()
     warnings: list[str] = []
+    project_root = container.base_settings.project_root.resolve()
+    runtime_root = container.base_settings.resolved_runtime_state_root
     if settings.runtime_mode.value == "relaxed":
         warnings.append("Runtime mode is relaxed. More actions can move through with lighter gating.")
+    if runtime_root == project_root or project_root in runtime_root.parents:
+        warnings.append("Runtime state root is still inside the repository tree. Move it under LocalAppData for safer release hygiene.")
     if settings.allow_http_private_network:
         warnings.append("HTTP private-network access is enabled. Localhost and private IP targets are reachable.")
     if settings.http_follow_redirects:
@@ -306,8 +304,8 @@ def _unsafe_warnings(container: AppContainer) -> list[str]:
         warnings.append("Provider private-network egress is enabled. Local LLM endpoints can receive prompts.")
     if settings.allow_restricted_provider_egress:
         warnings.append("Restricted data egress to remote providers is enabled. Review provider trust carefully.")
-    if not settings.admin_token_configured:
-        warnings.append("CLI admin token has not been initialized yet. Sensitive CLI paths are harder to operate safely.")
+    if container.protected_storage.storage_mode != "dpapi":
+        warnings.append("Sensitive local storage is using plain-local protection. Install pywin32 or choose a stronger host secret store.")
     return warnings
 
 
@@ -343,6 +341,7 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
     return {
         "title": "Settings",
         "settings": settings,
+        "protected_storage_mode": container.protected_storage.storage_mode,
         "providers": container.provider_service.list_statuses(),
         "unsafe_warnings": _unsafe_warnings(container),
         "audit_status": container.audit_service.verify_integrity(),
@@ -380,8 +379,13 @@ async def setup_submit(
     if payload.password != payload.confirm_password:
         return _redirect("/setup", error="Passwords do not match.")
     user = container.auth_service.create_initial_user(payload.username, payload.password)
-    authenticated_at = container.auth_service.now_epoch()
-    login_session(request, user, authenticated_at)
+    login_session(
+        request,
+        user,
+        session_service=container.session_service,
+        client_ip=_client_key(request),
+        user_agent=request.headers.get("user-agent"),
+    )
     container.audit_service.emit("auth.bootstrap_completed", {"username": user.username})
     return _redirect("/", message="Initial operator account created.")
 
@@ -422,8 +426,13 @@ async def login_submit(
         settings.login_rate_limit_window_seconds,
     )
     user = container.auth_service.authenticate(username, password)
-    authenticated_at = container.auth_service.now_epoch()
-    login_session(request, user, authenticated_at)
+    login_session(
+        request,
+        user,
+        session_service=container.session_service,
+        client_ip=_client_key(request),
+        user_agent=request.headers.get("user-agent"),
+    )
     container.audit_service.emit("auth.login", {"username": user.username, "client": _client_key(request)})
     safe_next = next_path if next_path.startswith("/") else "/"
     return _redirect(safe_next or "/", message="Authenticated.")
@@ -435,7 +444,7 @@ async def logout_submit(request: Request, container: AppContainer = Depends(get_
     user = _session_user(request, container)
     if user:
         container.audit_service.emit("auth.logout", {"username": user.username})
-    logout_session(request)
+    logout_session(request, container.session_service)
     return _redirect("/login", message="Signed out.")
 
 
@@ -720,12 +729,17 @@ async def reject_proposal(
         user = _page_user_or_redirect(request, container)
         if isinstance(user, RedirectResponse):
             return user
+        container.rate_limiter.check(
+            f"approval:{_client_key(request)}",
+            container.base_settings.approval_rate_limit_attempts,
+            container.base_settings.approval_rate_limit_window_seconds,
+        )
         container.runtime_service.reject(
             proposal_id,
             ApprovalDecisionRequest(actor=user.username, reason=reason),
         )
         return _redirect(f"/proposals/{proposal_id}", message="Proposal rejected.")
-    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError) as exc:
+    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError, RateLimitError) as exc:
         return _redirect(f"/proposals/{proposal_id}", error=str(exc))
 
 
@@ -773,12 +787,17 @@ async def reject_proposal_row(
         user = _page_user_or_redirect(request, container)
         if isinstance(user, RedirectResponse):
             return user
+        container.rate_limiter.check(
+            f"approval:{_client_key(request)}",
+            container.base_settings.approval_rate_limit_attempts,
+            container.base_settings.approval_rate_limit_window_seconds,
+        )
         container.runtime_service.reject(
             proposal_id,
             ApprovalDecisionRequest(actor=user.username, reason=reason),
         )
         return _redirect("/approvals", message="Proposal rejected.")
-    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError) as exc:
+    except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError, RateLimitError) as exc:
         return _redirect("/approvals", error=str(exc))
 
 
@@ -788,6 +807,7 @@ def history_page(
     agent_filter: str | None = None,
     actor_filter: str | None = None,
     connector_filter: str | None = None,
+    provider_filter: str | None = None,
     risk_filter: str | None = None,
     container: AppContainer = Depends(get_container),
     templates: Jinja2Templates = Depends(get_templates),
@@ -800,6 +820,12 @@ def history_page(
     history = all_history
     if connector_filter:
         history = [entry for entry in history if entry.connector == connector_filter]
+    if provider_filter:
+        history = [
+            entry
+            for entry in history
+            if proposals.get(entry.proposal_id) and proposals[entry.proposal_id].provider_name == provider_filter
+        ]
     if risk_filter:
         history = [entry for entry in history if proposals.get(entry.proposal_id) and proposals[entry.proposal_id].risk_level.value == risk_filter]
     audit_rows = container.database.fetch_all(
@@ -815,6 +841,12 @@ def history_page(
     if agent_filter:
         agent_runs = [run for run in agent_runs if run.agent_id == agent_filter or run.role.value == agent_filter]
     connector_runs = container.history_service.list_connector_runs(limit=50)
+    if agent_filter:
+        connector_runs = [
+            run
+            for run in connector_runs
+            if run.agent_id == agent_filter or run.agent_role == agent_filter
+        ]
     if connector_filter:
         connector_runs = [run for run in connector_runs if run.connector == connector_filter]
     context = {
@@ -828,9 +860,11 @@ def history_page(
         "agent_filter": agent_filter,
         "actor_filter": actor_filter,
         "connector_filter": connector_filter,
+        "provider_filter": provider_filter,
         "risk_filter": risk_filter,
         "agent_options": container.agent_service.list_agents(),
         "connector_options": sorted({proposal.connector for proposal in proposals.values()}),
+        "provider_options": sorted({proposal.provider_name for proposal in proposals.values() if proposal.provider_name}),
     }
     return _render(templates, request, "templates/history.html", container, **context)
 
@@ -909,6 +943,9 @@ async def settings_submit(
     allowed_http_hosts: str = Form(...),
     enable_system_connector: bool = Form(False),
     enable_outlook_connector: bool = Form(False),
+    local_protection_mode: str = Form(...),
+    history_retention_days: int = Form(...),
+    cli_token_ttl_seconds: int = Form(...),
     worker_lease_seconds: int = Form(...),
     worker_max_attempts: int = Form(...),
     current_password: str | None = Form(None),
@@ -959,6 +996,9 @@ async def settings_submit(
                 allowed_http_hosts=allowed_http_hosts,
                 enable_system_connector=enable_system_connector,
                 enable_outlook_connector=enable_outlook_connector,
+                local_protection_mode=local_protection_mode,
+                history_retention_days=history_retention_days,
+                cli_token_ttl_seconds=cli_token_ttl_seconds,
                 worker_lease_seconds=worker_lease_seconds,
                 worker_max_attempts=worker_max_attempts,
             ),
@@ -975,6 +1015,8 @@ async def settings_submit(
                 "enable_outlook_connector": enable_outlook_connector,
                 "allow_provider_private_network": allow_provider_private_network,
                 "allow_restricted_provider_egress": allow_restricted_provider_egress,
+                "local_protection_mode": local_protection_mode,
+                "cli_token_ttl_seconds": cli_token_ttl_seconds,
             },
         )
         return _redirect("/settings", message="Settings saved.")
@@ -1131,6 +1173,11 @@ async def api_approve_proposal(
 ):
     user = _api_user_or_401(request, container)
     await validate_csrf(request)
+    container.rate_limiter.check(
+        f"approval:{_client_key(request)}",
+        container.base_settings.approval_rate_limit_attempts,
+        container.base_settings.approval_rate_limit_window_seconds,
+    )
     proposal = container.proposal_service.get(proposal_id)
     if proposal.risk_level in HIGH_RISK_LEVELS:
         _require_recent_auth(
@@ -1159,12 +1206,17 @@ async def api_reject_proposal(
 ):
     user = _api_user_or_401(request, container)
     await validate_csrf(request)
+    container.rate_limiter.check(
+        f"approval:{_client_key(request)}",
+        container.base_settings.approval_rate_limit_attempts,
+        container.base_settings.approval_rate_limit_window_seconds,
+    )
     try:
         return container.runtime_service.reject(
             proposal_id,
             payload.model_copy(update={"actor": user.username}),
         )
-    except (InvalidStateError, NotFoundError) as exc:
+    except (InvalidStateError, NotFoundError, RateLimitError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

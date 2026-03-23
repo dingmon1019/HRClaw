@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from app.agents.service import AgentService
 from app.audit.service import AuditService
 from app.connectors.registry import ConnectorRegistry
 from app.policy.engine import PolicyEngine
 from app.schemas.actions import ProposalStatus
+from app.schemas.agents import AgentDefinition
+from app.services.data_governance_service import DataGovernanceService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.proposal_snapshot_service import ProposalSnapshotService
@@ -18,6 +21,8 @@ class ExecutionDispatcher:
         policy_engine: PolicyEngine,
         audit_service: AuditService,
         snapshot_service: ProposalSnapshotService,
+        agent_service: AgentService,
+        data_governance_service: DataGovernanceService,
     ):
         self.connector_registry = connector_registry
         self.proposal_service = proposal_service
@@ -25,9 +30,26 @@ class ExecutionDispatcher:
         self.policy_engine = policy_engine
         self.audit_service = audit_service
         self.snapshot_service = snapshot_service
+        self.agent_service = agent_service
+        self.data_governance_service = data_governance_service
 
-    def execute_approved(self, proposal_id: str) -> dict:
+    def execute_approved(
+        self,
+        proposal_id: str,
+        *,
+        approval_id: str | None,
+        executor_agent: AgentDefinition | None = None,
+    ) -> dict:
         proposal = self.proposal_service.get(proposal_id)
+        if executor_agent is not None:
+            self.agent_service.assert_capability(executor_agent, "execute-approved-action")
+            self.agent_service.assert_connector_allowed(executor_agent, proposal.connector)
+        if not approval_id:
+            raise ValueError("Execution job is missing an approval binding.")
+        approval = self.proposal_service.get_approval(approval_id)
+        if approval.proposal_id != proposal.id:
+            raise ValueError("Execution job approval binding does not match the queued proposal.")
+        runtime_payload = self.data_governance_service.materialize_action_payload(proposal.payload)
         history_id = self.history_service.log_action_start(
             proposal_id=proposal.id,
             run_id=proposal.run_id,
@@ -37,17 +59,24 @@ class ExecutionDispatcher:
             correlation_id=proposal.correlation_id,
         )
         try:
-            self.snapshot_service.verify_or_raise(proposal)
+            self.snapshot_service.verify_approval_or_raise(proposal, approval)
             self.policy_engine.validate_execution(proposal)
             result = self.connector_registry.get(proposal.connector).execute(
                 proposal.action_type,
-                proposal.payload,
+                runtime_payload,
             )
-            self.history_service.log_action_end(history_id, "executed", output=result)
+            safe_result = self.data_governance_service.sanitize_for_history(result)
+            self.history_service.log_action_end(history_id, "executed", output=safe_result)
             self.proposal_service.set_execution_status(proposal.id, ProposalStatus.EXECUTED)
             self.audit_service.emit(
                 "proposal.executed",
-                {"proposal_id": proposal.id, "action_type": proposal.action_type, "result": result},
+                {
+                    "proposal_id": proposal.id,
+                    "action_type": proposal.action_type,
+                    "result": safe_result,
+                    "approval_id": approval.id,
+                    "correlation_id": proposal.correlation_id,
+                },
             )
             return result
         except ValueError as exc:
@@ -60,6 +89,7 @@ class ExecutionDispatcher:
                     "proposal_id": proposal.id,
                     "action_type": proposal.action_type,
                     "error": str(exc),
+                    "approval_id": approval_id,
                     "correlation_id": proposal.correlation_id,
                 },
             )
@@ -73,6 +103,7 @@ class ExecutionDispatcher:
                     "proposal_id": proposal.id,
                     "action_type": proposal.action_type,
                     "error": str(exc),
+                    "approval_id": approval_id,
                     "correlation_id": proposal.correlation_id,
                 },
             )
