@@ -36,7 +36,7 @@ def dashboard(
         "connectors": container.connector_registry.list_health(),
         "message": request.query_params.get("message"),
     }
-    return templates.TemplateResponse("templates/dashboard.html", context)
+    return templates.TemplateResponse(request=request, name="templates/dashboard.html", context=context)
 
 
 @router.get("/run")
@@ -51,7 +51,7 @@ def run_agent_form(
         "settings": container.settings_service.get_effective_settings(),
         "message": request.query_params.get("message"),
     }
-    return templates.TemplateResponse("templates/run_agent.html", context)
+    return templates.TemplateResponse(request=request, name="templates/run_agent.html", context=context)
 
 
 @router.post("/run")
@@ -109,7 +109,7 @@ def proposals_page(
         "status_filter": status_filter,
         "message": request.query_params.get("message"),
     }
-    return templates.TemplateResponse("templates/proposals.html", context)
+    return templates.TemplateResponse(request=request, name="templates/proposals.html", context=context)
 
 
 @router.get("/approvals")
@@ -120,7 +120,7 @@ def approvals_page(
 ):
     proposals = container.proposal_service.list(ProposalStatus.PENDING.value)
     context = {"request": request, "proposals": proposals, "message": request.query_params.get("message")}
-    return templates.TemplateResponse("templates/approvals.html", context)
+    return templates.TemplateResponse(request=request, name="templates/approvals.html", context=context)
 
 
 @router.get("/proposals/{proposal_id}")
@@ -141,7 +141,7 @@ def proposal_detail_page(
         "message": request.query_params.get("message"),
         "error": request.query_params.get("error"),
     }
-    return templates.TemplateResponse("templates/proposal_detail.html", context)
+    return templates.TemplateResponse(request=request, name="templates/proposal_detail.html", context=context)
 
 
 @router.post("/proposals/{proposal_id}/approve")
@@ -202,8 +202,9 @@ def approve_proposal_row(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     proposal = container.proposal_service.get(proposal_id)
     return templates.TemplateResponse(
-        "partials/proposal_row.html",
-        {"request": request, "proposal": proposal, "compact": True},
+        request=request,
+        name="partials/proposal_row.html",
+        context={"request": request, "proposal": proposal, "compact": True},
     )
 
 
@@ -222,8 +223,9 @@ def reject_proposal_row(
     )
     proposal = container.proposal_service.get(proposal_id)
     return templates.TemplateResponse(
-        "partials/proposal_row.html",
-        {"request": request, "proposal": proposal, "compact": True},
+        request=request,
+        name="partials/proposal_row.html",
+        context={"request": request, "proposal": proposal, "compact": True},
     )
 
 
@@ -238,7 +240,7 @@ def history_page(
         "history": container.history_service.list_action_history(limit=100),
         "connector_runs": container.history_service.list_connector_runs(limit=50),
     }
-    return templates.TemplateResponse("templates/history.html", context)
+    return templates.TemplateResponse(request=request, name="templates/history.html", context=context)
 
 
 @router.get("/connectors")
@@ -248,8 +250,9 @@ def connectors_page(
     templates: Jinja2Templates = Depends(get_templates),
 ):
     return templates.TemplateResponse(
-        "templates/connectors.html",
-        {"request": request, "connectors": container.connector_registry.list_health()},
+        request=request,
+        name="templates/connectors.html",
+        context={"request": request, "connectors": container.connector_registry.list_health()},
     )
 
 
@@ -265,7 +268,7 @@ def settings_page(
         "providers": container.provider_service.list_statuses(),
         "message": request.query_params.get("message"),
     }
-    return templates.TemplateResponse("templates/settings.html", context)
+    return templates.TemplateResponse(request=request, name="templates/settings.html", context=context)
 
 
 @router.post("/settings")
@@ -320,7 +323,11 @@ def test_provider_partial(
     result = container.provider_service.test_provider(
         ProviderTestRequest(provider_name=provider_name, model_name=model_name, prompt=prompt)
     )
-    return templates.TemplateResponse("partials/provider_test_result.html", {"request": request, "result": result})
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/provider_test_result.html",
+        context={"request": request, "result": result},
+    )
 
 
 @router.post("/api/runs")
