@@ -45,9 +45,22 @@ class ProviderStatus(BaseModel):
     api_key_env: str | None = None
     default_model: str | None = None
     auth_source: str = "env"
+    credential_target: str | None = None
+    credential_available: bool = False
+    cost_tier: str = "standard"
+    latency_tier: str = "standard"
+    privacy_tier: str = "standard"
     privacy_posture: str = "external-egress"
     egress_posture: str = "inherits global allowlist"
     destination_summary: str = ""
+    success_count: int = 0
+    failure_count: int = 0
+    last_score: float = 0.0
+    last_routing_reason: str | None = None
+    latency_ewma_ms: float = 0.0
+    success_rate: float = 0.0
+    consecutive_failures: int = 0
+    last_error_category: str | None = None
 
 
 class ProviderConfigRecord(BaseModel):
@@ -59,6 +72,10 @@ class ProviderConfigRecord(BaseModel):
     default_model: str | None = None
     allowed_hosts: list[str] = Field(default_factory=list)
     auth_source: str = "env"
+    credential_target: str | None = None
+    cost_tier: str = "standard"
+    latency_tier: str = "standard"
+    privacy_tier: str = "standard"
     updated_at: str | None = None
 
 
@@ -71,6 +88,10 @@ class ProviderConfigUpdate(BaseModel):
     default_model: str | None = None
     allowed_hosts: list[str] = Field(default_factory=list)
     auth_source: str = "env"
+    credential_target: str | None = None
+    cost_tier: str = "standard"
+    latency_tier: str = "standard"
+    privacy_tier: str = "standard"
 
 
 class ProviderTestRequest(BaseModel):

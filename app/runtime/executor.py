@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from app.agents.service import AgentService
 from app.audit.service import AuditService
 from app.connectors.registry import ConnectorRegistry
 from app.policy.engine import PolicyEngine
 from app.schemas.actions import ProposalStatus
 from app.schemas.agents import AgentDefinition
+from app.schemas.actions import ExecutionBoundaryMetadata
 from app.services.data_governance_service import DataGovernanceService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.proposal_snapshot_service import ProposalSnapshotService
+from app.runtime.execution_boundary import ConstrainedExecutionRunner
 
 
 class ExecutionDispatcher:
@@ -23,6 +27,7 @@ class ExecutionDispatcher:
         snapshot_service: ProposalSnapshotService,
         agent_service: AgentService,
         data_governance_service: DataGovernanceService,
+        boundary_runner: ConstrainedExecutionRunner,
     ):
         self.connector_registry = connector_registry
         self.proposal_service = proposal_service
@@ -32,6 +37,7 @@ class ExecutionDispatcher:
         self.snapshot_service = snapshot_service
         self.agent_service = agent_service
         self.data_governance_service = data_governance_service
+        self.boundary_runner = boundary_runner
 
     def execute_approved(
         self,
@@ -40,7 +46,8 @@ class ExecutionDispatcher:
         approval_id: str | None,
         expected_manifest_hash: str | None = None,
         executor_agent: AgentDefinition | None = None,
-    ) -> dict:
+        heartbeat_callback: Callable[[], None] | None = None,
+    ) -> tuple[dict, ExecutionBoundaryMetadata, str]:
         proposal = self.proposal_service.get(proposal_id)
         if executor_agent is not None:
             self.agent_service.assert_capability(executor_agent, "execute-approved-action")
@@ -53,6 +60,17 @@ class ExecutionDispatcher:
         if expected_manifest_hash and approval.manifest_hash != expected_manifest_hash:
             raise ValueError("Execution job manifest binding does not match the approved manifest.")
         runtime_payload = self.data_governance_service.materialize_action_payload(proposal.payload)
+        effective_settings = self.policy_engine.settings_service.get_effective_settings()
+        bundle = self.boundary_runner.build_bundle(
+            proposal=proposal,
+            approval_id=approval.id,
+            manifest_hash=approval.manifest_hash or "",
+            runtime_payload=runtime_payload,
+            allowed_connectors=(executor_agent.allowed_connectors if executor_agent else [proposal.connector]),
+            capabilities=(executor_agent.capabilities if executor_agent else ["execute-approved-action"]),
+            effective_settings=effective_settings,
+        )
+        execution_bundle_hash = self.boundary_runner.bundle_hash(bundle)
         history_id = self.history_service.log_action_start(
             proposal_id=proposal.id,
             run_id=proposal.run_id,
@@ -67,13 +85,16 @@ class ExecutionDispatcher:
             provider_name=proposal.provider_name,
             manifest_hash=approval.manifest_hash,
             correlation_id=proposal.correlation_id,
+            execution_bundle_hash=execution_bundle_hash,
+            boundary_mode=bundle.boundary.mode,
+            boundary_metadata=bundle.boundary.model_dump(mode="json"),
         )
         try:
             self.snapshot_service.verify_approval_or_raise(proposal, approval)
             self.policy_engine.validate_execution(proposal)
-            result = self.connector_registry.get(proposal.connector).execute(
-                proposal.action_type,
-                runtime_payload,
+            result, boundary_metadata = self.boundary_runner.execute(
+                bundle,
+                heartbeat_callback=heartbeat_callback,
             )
             safe_result = self.data_governance_service.sanitize_for_history(
                 result,
@@ -91,10 +112,12 @@ class ExecutionDispatcher:
                     "result": safe_result,
                     "approval_id": approval.id,
                     "manifest_hash": approval.manifest_hash,
+                    "execution_bundle_hash": execution_bundle_hash,
+                    "boundary_mode": boundary_metadata.mode,
                     "correlation_id": proposal.correlation_id,
                 },
             )
-            return result
+            return result, boundary_metadata, execution_bundle_hash
         except ValueError as exc:
             self.history_service.log_action_end(history_id, "blocked", error_text=str(exc))
             status = ProposalStatus.STALE if "Snapshot drift detected" in str(exc) else ProposalStatus.BLOCKED
@@ -107,6 +130,8 @@ class ExecutionDispatcher:
                     "error": str(exc),
                     "approval_id": approval_id,
                     "manifest_hash": approval.manifest_hash,
+                    "execution_bundle_hash": execution_bundle_hash,
+                    "boundary_mode": bundle.boundary.mode,
                     "correlation_id": proposal.correlation_id,
                 },
             )
@@ -122,6 +147,8 @@ class ExecutionDispatcher:
                     "error": str(exc),
                     "approval_id": approval_id,
                     "manifest_hash": approval.manifest_hash,
+                    "execution_bundle_hash": execution_bundle_hash,
+                    "boundary_mode": bundle.boundary.mode,
                     "correlation_id": proposal.correlation_id,
                 },
             )

@@ -15,7 +15,7 @@ from app.config.settings import AppSettings
 from app.core.container import AppContainer
 from app.core.errors import AuthorizationError
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
-from app.schemas.providers import ProviderRequest
+from app.schemas.providers import ProviderRequest, ProviderResponse
 from app.schemas.settings import SettingsUpdate
 from tests.helpers import bootstrap_operator
 
@@ -285,6 +285,8 @@ def test_task_graph_nodes_are_persisted(container):
 
     assert any(node.node_type == "objective" for node in task_nodes)
     assert any(node.node_type == "proposal" for node in task_nodes)
+    assert any(node.node_type == "merge" for node in task_nodes)
+    assert any(node.role.value == "executor" for node in task_nodes)
     assert any(node.depends_on for node in task_nodes if node.node_type != "objective")
 
 
@@ -490,6 +492,106 @@ def test_directory_digest_detects_nested_same_size_content_change(container):
 
     updated = container.proposal_service.get(proposal.id)
     assert updated.status == ProposalStatus.STALE
+
+
+def test_remote_planning_prompt_redacts_local_task_snapshot(monkeypatch, tmp_path):
+    settings = AppSettings(
+        app_name="Remote Prompt Governance Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="openai",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+        allow_insecure_local_storage=True,
+    )
+    container = AppContainer(settings)
+    container.database.execute(
+        "INSERT INTO tasks(id, title, details, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("task_secret", "Secret task", "TOP SECRET TASK DETAILS", "open", "2026-03-24T00:00:00+00:00", "2026-03-24T00:00:00+00:00"),
+    )
+    captured: list[ProviderRequest] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        container.provider_registry.get("openai"),
+        "complete",
+        lambda request, provider_settings: (
+            captured.append(request)
+            or ProviderResponse(
+                provider_name="openai",
+                model_name=request.model_name or provider_settings.model,
+                content="remote summary",
+                raw_response={},
+            )
+        ),
+    )
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Plan a follow-up from the current local task backlog",
+            task_title="Follow up locally",
+            provider_name="openai",
+        )
+    )
+
+    assert result.summary.provider_name == "openai"
+    assert captured
+    planning_request = next(request for request in captured if request.task_type == "planning-summary")
+    assert "TOP SECRET TASK DETAILS" not in planning_request.prompt
+    assert '"details"' not in planning_request.prompt
+    assert "task_snapshot_present" in planning_request.prompt
+    assert planning_request.metadata["selected_prompt_variant"] == "remote"
+
+
+def test_remote_planning_prompt_redacts_filesystem_context(monkeypatch, tmp_path):
+    settings = AppSettings(
+        app_name="Remote Filesystem Prompt Governance Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="openai",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+        allow_insecure_local_storage=True,
+    )
+    workspace_file = Path(settings.workspace_root) / "notes.txt"
+    workspace_file.parent.mkdir(parents=True, exist_ok=True)
+    workspace_file.write_text("TOP SECRET FILE CONTENT", encoding="utf-8")
+    container = AppContainer(settings)
+    captured: list[ProviderRequest] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        container.provider_registry.get("openai"),
+        "complete",
+        lambda request, provider_settings: (
+            captured.append(request)
+            or ProviderResponse(
+                provider_name="openai",
+                model_name=request.model_name or provider_settings.model,
+                content="remote summary",
+                raw_response={},
+            )
+        ),
+    )
+
+    container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Inspect a local note and propose the next safe step",
+            filesystem_path="notes.txt",
+            provider_name="openai",
+        )
+    )
+
+    planning_request = next(request for request in captured if request.task_type == "planning-summary")
+    assert "TOP SECRET FILE CONTENT" not in planning_request.prompt
+    assert str(workspace_file) not in planning_request.prompt
+    assert "path_redacted" in planning_request.prompt
 
 
 def test_cli_token_issue_and_verify(container):

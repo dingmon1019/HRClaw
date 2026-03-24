@@ -45,3 +45,12 @@ class BaseProvider(ABC):
         if not value:
             raise ProviderError(f"Environment variable {env_name} is not set.")
         return value
+
+    @classmethod
+    def resolve_secret(cls, request: ProviderRequest, env_name: str | None) -> str:
+        override = request.metadata.get("resolved_secret") if request.metadata else None
+        if override:
+            return str(override)
+        if not env_name:
+            raise ProviderError("No provider secret source is configured.")
+        return cls.env_value(env_name)

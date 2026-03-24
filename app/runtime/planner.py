@@ -21,6 +21,7 @@ from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.provider_service import ProviderService
 from app.audit.service import AuditService
+from app.runtime.graph_scheduler import TaskGraphScheduler
 
 
 class RuntimePlanner:
@@ -140,33 +141,59 @@ class RuntimePlanner:
             correlation_id=correlation_id,
         )
         collected = self._collect(run_id, request, supervisor, planner, correlation_id)
-        planning_classification = self._planning_classification(request, collected)
-        summary_text, summary_provider_name = self._summarize(
+        request_payload = request.model_dump(mode="json")
+        local_collected_context, provider_collected_context, planning_governance = (
+            self.data_governance_service.build_planning_context_views(request_payload, collected)
+        )
+        planning_classification = DataClassification(planning_governance["local_context_classification"])
+        summary_text, summary_provider_name, summary_routing = self._summarize(
             request,
-            collected,
+            local_collected_context,
+            provider_collected_context,
             self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
             correlation_id,
             planning_classification,
+            planning_governance,
         )
         summary = self.summary_service.create(
             run_id=run_id,
             objective=request.objective,
-            collected=self.data_governance_service.sanitize_for_history(collected, object_type="summary_payload"),
+            collected=self.data_governance_service.sanitize_for_history(local_collected_context, object_type="summary_payload"),
             summary_text=summary_text,
             provider_name=summary_provider_name,
         )
-        raw_proposals = self._build_proposals(
+        planner_nodes = [node for node in subtask_nodes if node.role == AgentRole.PLANNER]
+        review_nodes = [
+            node
+            for node in subtask_nodes
+            if node.role == AgentRole.REVIEWER and node.node_type == "review"
+        ]
+        review_merge_node = next((node for node in subtask_nodes if node.node_type == "merge"), None)
+        raw_proposals, planner_branch_results = self._schedule_planner_branches(
             run_id=run_id,
             request=request,
-            summary_id=summary.id,
-            collected=collected,
-            summary_text=summary.summary_text,
-            planning_provider=request.provider_name or self.provider_service.resolve_profile_provider(
-                self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
-            ),
+            planner_run_id=planner_run.id,
             planner_agent=planner,
+            planner_nodes=planner_nodes,
+            collected=collected,
+            summary_id=summary.id,
+            summary_text=summary.summary_text,
+            effective_settings=effective_settings,
             correlation_id=correlation_id,
         )
+        if not raw_proposals:
+            raw_proposals = self._build_proposals(
+                run_id=run_id,
+                request=request,
+                summary_id=summary.id,
+                collected=collected,
+                summary_text=summary.summary_text,
+                planning_provider=request.provider_name or self.provider_service.resolve_profile_provider(
+                    self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+                ),
+                planner_agent=planner,
+                correlation_id=correlation_id,
+            )
         self.agent_service.complete_handoff(planner_handoff.id)
         self.agent_service.complete_run(
             planner_run.id,
@@ -178,21 +205,11 @@ class RuntimePlanner:
                     "collected_keys": list(collected),
                     "proposal_titles": [proposal.title for proposal in raw_proposals],
                     "proposal_count": len(raw_proposals),
+                    "provider_routing": summary_routing,
+                    "branch_count": len(planner_branch_results),
                 },
                 object_type="agent_output",
             ),
-        )
-        self._complete_role_nodes(
-            subtask_nodes,
-            role=AgentRole.PLANNER,
-            agent_run_id=planner_run.id,
-            handoff_id=planner_handoff.id,
-            provider_name=summary_provider_name,
-            details={
-                "summary_id": summary.id,
-                "proposal_titles": [proposal.title for proposal in raw_proposals],
-                "memory_namespace": planner.memory_namespace,
-            },
         )
 
         reviewer_handoff = self.agent_service.create_handoff(
@@ -216,7 +233,28 @@ class RuntimePlanner:
             provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings),
             correlation_id=correlation_id,
         )
-        reviewed = [self._review_proposal(proposal, reviewer) for proposal in raw_proposals]
+        has_branch_proposals = any(result.get("proposals") for result in planner_branch_results.values())
+        if has_branch_proposals:
+            reviewed = self._schedule_review_branches(
+                review_nodes=review_nodes,
+                merge_node=review_merge_node,
+                reviewer_agent=reviewer,
+                reviewer_run_id=reviewer_run.id,
+                planner_branch_results=planner_branch_results,
+                correlation_id=correlation_id,
+                effective_settings=effective_settings,
+            )
+        else:
+            reviewed = [self._review_proposal(proposal, reviewer) for proposal in raw_proposals]
+            if review_merge_node is not None:
+                self.agent_service.complete_task_node(
+                    review_merge_node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {"proposal_count": len(reviewed), "merge_key": review_merge_node.merge_key}
+                    ),
+                    agent_run_id=reviewer_run.id,
+                )
         created = self.proposal_service.create_many(reviewed)
         self.agent_service.complete_handoff(reviewer_handoff.id)
         self.agent_service.complete_run(
@@ -231,21 +269,13 @@ class RuntimePlanner:
                 object_type="agent_output",
             ),
         )
-        self._complete_role_nodes(
-            subtask_nodes,
-            role=AgentRole.REVIEWER,
-            agent_run_id=reviewer_run.id,
-            handoff_id=reviewer_handoff.id,
-            provider_name=None,
-            details={
-                "proposal_ids": [proposal.id for proposal in created],
-                "memory_namespace": reviewer.memory_namespace,
-            },
-        )
-        reviewer_dependency = [node.id for node in subtask_nodes if node.role == AgentRole.REVIEWER]
+        proposal_dependency = [review_merge_node.id] if review_merge_node else [
+            node.id for node in subtask_nodes if node.role == AgentRole.REVIEWER
+        ]
+        executor_agent = self.agent_service.get_by_role(AgentRole.EXECUTOR)
         for proposal in created:
             proposal_parent = self._proposal_parent_node(proposal.connector, subtask_nodes, objective_node.id)
-            self.agent_service.create_task_node(
+            proposal_node = self.agent_service.create_task_node(
                 run_id,
                 role=AgentRole.PLANNER,
                 node_type="proposal",
@@ -263,16 +293,47 @@ class RuntimePlanner:
                         "approval_wait": proposal.requires_approval and proposal.status.value in {"pending", "stale"},
                         "capabilities": planner.capabilities,
                         "allowed_connectors": planner.allowed_connectors,
+                        "branch_key": proposal.connector,
+                        "context_namespace": f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
                     }
                 ),
                 status="waiting_approval" if proposal.requires_approval and proposal.status.value in {"pending", "stale"} else proposal.status.value,
                 parent_task_node_id=proposal_parent,
+                proposal_id=proposal.id,
+                branch_key=proposal.connector,
+                context_namespace=f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
                 agent=planner,
                 agent_run_id=planner_run.id,
                 provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
                 provider_name=proposal.provider_name,
                 correlation_id=correlation_id,
-                depends_on=reviewer_dependency,
+                depends_on=proposal_dependency,
+            )
+            self.agent_service.create_task_node(
+                run_id,
+                role=AgentRole.EXECUTOR,
+                node_type="execute",
+                title=f"Execute approved action for {proposal.title}",
+                details=self._sanitize_task_node_details(
+                    {
+                        "proposal_id": proposal.id,
+                        "connector": proposal.connector,
+                        "action_type": proposal.action_type,
+                        "memory_namespace": executor_agent.memory_namespace,
+                        "capabilities": executor_agent.capabilities,
+                        "allowed_connectors": executor_agent.allowed_connectors,
+                        "approval_wait": proposal.requires_approval,
+                    }
+                ),
+                status="waiting_approval" if proposal.requires_approval else "ready",
+                parent_task_node_id=proposal_node.id,
+                proposal_id=proposal.id,
+                branch_key=proposal.connector,
+                context_namespace=f"{executor_agent.memory_namespace}:{run_id}:{proposal.connector}",
+                agent=executor_agent,
+                provider_profile=self._provider_profile_for_role(AgentRole.EXECUTOR, effective_settings),
+                correlation_id=correlation_id,
+                depends_on=[proposal_node.id],
             )
 
         reporter_handoff = self.agent_service.create_handoff(
@@ -294,13 +355,12 @@ class RuntimePlanner:
             provider_profile=self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
             correlation_id=correlation_id,
         )
-        operator_summary, reporter_provider = self._report_plan(
+        operator_summary, reporter_provider, reporter_routing = self._report_plan(
             request,
             created,
             summary.summary_text,
             self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
             correlation_id,
-            planning_classification,
         )
         self.agent_service.complete_handoff(reporter_handoff.id)
         self.agent_service.complete_run(
@@ -311,6 +371,7 @@ class RuntimePlanner:
                 {
                     "operator_summary": operator_summary,
                     "proposal_ids": [proposal.id for proposal in created],
+                    "provider_routing": reporter_routing,
                 },
                 object_type="agent_output",
             ),
@@ -324,6 +385,7 @@ class RuntimePlanner:
             details={
                 "operator_summary": operator_summary,
                 "memory_namespace": reporter.memory_namespace,
+                "provider_routing": reporter_routing,
             },
         )
 
@@ -428,43 +490,72 @@ class RuntimePlanner:
     def _summarize(
         self,
         request: AgentRunRequest,
-        collected: dict,
+        local_collected_context: dict,
+        provider_collected_context: dict,
         profile: str,
         correlation_id: str,
-        classification: DataClassification,
-    ) -> tuple[str, str]:
-        prompt = (
+        local_classification: DataClassification,
+        prompt_governance: dict,
+    ) -> tuple[str, str, dict]:
+        system_prompt = "Produce a concise operator summary for a local-first multi-agent runtime."
+        local_prompt = (
             "Summarize the collected local-agent context for a Windows operator. "
             "Highlight risks, side effects, egress implications, and approval-ready actions.\n\n"
-            f"Objective:\n{request.objective}\n\nCollected:\n{json_dumps(collected)}"
+            f"Objective:\n{request.objective}\n\nCollected:\n{json_dumps(local_collected_context)}"
+        )
+        remote_prompt = (
+            "Summarize the curated operator-safe context for a Windows operator. "
+            "Do not assume access to redacted local runtime, workspace, or system data. "
+            "Highlight risks, side effects, egress implications, and approval-ready actions.\n\n"
+            f"Objective:\n{request.objective}\n\nCurated context:\n{json_dumps(provider_collected_context)}"
         )
         provider_name = request.provider_name or self.provider_service.resolve_profile_provider(profile)
+        prompt_variants = self.data_governance_service.build_prompt_variants(
+            prompt_kind="planning-summary",
+            local_prompt=local_prompt,
+            remote_prompt=remote_prompt,
+            local_classification=local_classification,
+            outbound_classification=DataClassification.EXTERNAL_OK,
+            system_prompt=system_prompt,
+            governance=prompt_governance,
+        )
+        self.audit_service.emit(
+            "provider.prompt_prepared",
+            {
+                "correlation_id": correlation_id,
+                "task_type": "planning-summary",
+                "provider_name": request.provider_name,
+                "profile": profile,
+                "governance": prompt_variants["prompt_governance"],
+            },
+        )
         try:
             response = self.provider_service.complete(
                 ProviderRequest(
                     provider_name=request.provider_name,
                     model_name=request.model_name,
                     profile=profile,
-                    prompt=prompt,
-                    system_prompt="Produce a concise operator summary for a local-first multi-agent runtime.",
-                    data_classification=classification.value,
+                    prompt=local_prompt,
+                    system_prompt=system_prompt,
+                    data_classification=local_classification.value,
                     task_type="planning-summary",
                     correlation_id=correlation_id,
+                    metadata=prompt_variants,
                 )
             )
-            return response.content, response.provider_name
+            return response.content, response.provider_name, response.raw_response.get("_routing", {})
         except Exception:
             fragments = [f"Objective: {request.objective}"]
-            if "filesystem" in collected:
+            if "filesystem" in local_collected_context:
                 fragments.append("Filesystem context captured.")
-            if "http" in collected:
+            if "http" in local_collected_context:
                 fragments.append("HTTP context captured.")
-            if "system" in collected:
+            if "system" in local_collected_context:
                 fragments.append("Bounded system context captured.")
-            if collected.get("tasks"):
+            if local_collected_context.get("tasks"):
                 fragments.append("Task snapshot captured.")
             fragments.append("All actions remain approval-gated before execution.")
-            return " ".join(fragments), (provider_name or "offline-fallback")
+            return " ".join(fragments), (provider_name or "offline-fallback"), {"mode": "offline-fallback"}
 
     def _build_proposals(
         self,
@@ -582,6 +673,446 @@ class RuntimePlanner:
                 )
             )
         return proposals
+
+    def _schedule_planner_branches(
+        self,
+        *,
+        run_id: str,
+        request: AgentRunRequest,
+        planner_run_id: str,
+        planner_agent: AgentDefinition,
+        planner_nodes,
+        collected: dict,
+        summary_id: str,
+        summary_text: str,
+        effective_settings,
+        correlation_id: str,
+    ) -> tuple[list[ActionProposal], dict[str, dict]]:
+        if not planner_nodes:
+            return [], {}
+        scheduler = TaskGraphScheduler(max_workers=min(3, len(planner_nodes)))
+
+        def handler(node, dependency_results):
+            branch_key = node.branch_key or "general"
+            provider_profile = node.provider_profile or self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+            provider_name = request.provider_name or self.provider_service.resolve_profile_provider(provider_profile)
+            branch_context = self._branch_context(branch_key, request, collected)
+            branch_reasoning = self._branch_reasoning_summary(branch_key, branch_context)
+            self.agent_service.update_task_node(
+                node.id,
+                status="running",
+                details=self._sanitize_task_node_details(
+                    {
+                        "branch_key": branch_key,
+                        "context_namespace": node.context_namespace,
+                        "dependency_count": len(dependency_results),
+                        "branch_reasoning": branch_reasoning,
+                    }
+                ),
+                provider_name=provider_name,
+            )
+            self.audit_service.emit(
+                "planning.branch_routed",
+                {
+                    "run_id": run_id,
+                    "correlation_id": correlation_id,
+                    "branch_key": branch_key,
+                    "provider_profile": provider_profile,
+                    "provider_name": provider_name,
+                    "context_namespace": node.context_namespace,
+                },
+            )
+            branch_run = self.agent_service.start_run(
+                run_id,
+                planner_agent,
+                input_payload=self._sanitize_agent_payload(
+                    {
+                        "objective": request.objective,
+                        "branch_key": branch_key,
+                        "context_namespace": node.context_namespace,
+                        "branch_context": branch_context,
+                    },
+                    object_type="agent_input",
+                ),
+                provider_profile=provider_profile,
+                parent_agent_run_id=planner_run_id,
+                correlation_id=correlation_id,
+            )
+            try:
+                proposals = self._build_branch_proposals(
+                    branch_key=branch_key,
+                    run_id=run_id,
+                    request=request,
+                    summary_id=summary_id,
+                    collected=collected,
+                    summary_text=summary_text,
+                    planning_provider=provider_name,
+                    planner_agent=planner_agent,
+                    correlation_id=correlation_id,
+                )
+                self.agent_service.complete_run(
+                    branch_run.id,
+                    status="completed",
+                    provider_name=provider_name,
+                    output_payload=self._sanitize_agent_payload(
+                        {
+                            "branch_key": branch_key,
+                            "proposal_titles": [proposal.title for proposal in proposals],
+                            "proposal_count": len(proposals),
+                            "result": {"branch_reasoning": branch_reasoning},
+                        },
+                        object_type="agent_output",
+                    ),
+                )
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "branch_key": branch_key,
+                            "proposal_titles": [proposal.title for proposal in proposals],
+                            "proposal_count": len(proposals),
+                            "branch_reasoning": branch_reasoning,
+                            "context_namespace": node.context_namespace,
+                        }
+                    ),
+                    provider_name=provider_name,
+                    agent_run_id=branch_run.id,
+                )
+                return {
+                    "status": "completed",
+                    "branch_key": branch_key,
+                    "proposals": proposals,
+                    "provider_name": provider_name,
+                    "provider_profile": provider_profile,
+                    "agent_run_id": branch_run.id,
+                    "context_namespace": node.context_namespace,
+                    "branch_reasoning": branch_reasoning,
+                }
+            except Exception as exc:
+                self.agent_service.complete_run(
+                    branch_run.id,
+                    status="failed",
+                    provider_name=provider_name,
+                    output_payload=self._sanitize_agent_payload(
+                        {"error": str(exc), "branch_key": branch_key},
+                        object_type="agent_output",
+                    ),
+                )
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="failed",
+                    details=self._sanitize_task_node_details(
+                        {"error": str(exc), "branch_key": branch_key}
+                    ),
+                    provider_name=provider_name,
+                    agent_run_id=branch_run.id,
+                )
+                raise
+
+        scheduled = scheduler.execute(planner_nodes, handler)
+        proposals: list[ActionProposal] = []
+        results: dict[str, dict] = {}
+        for node in planner_nodes:
+            result = scheduled["results"].get(node.id, {})
+            results[node.id] = result
+            if result.get("status") == "completed":
+                proposals.extend(result.get("proposals", []))
+        return proposals, results
+
+    def _schedule_review_branches(
+        self,
+        *,
+        review_nodes,
+        merge_node,
+        reviewer_agent: AgentDefinition,
+        reviewer_run_id: str,
+        planner_branch_results: dict[str, dict],
+        correlation_id: str,
+        effective_settings,
+    ) -> list[ActionProposal]:
+        nodes = list(review_nodes)
+        if merge_node is not None:
+            nodes.append(merge_node)
+        if not nodes:
+            return []
+
+        initial_states = {
+            node_id: "completed"
+            for node_id, result in planner_branch_results.items()
+            if result.get("status") == "completed"
+        }
+        initial_results = {
+            node_id: result
+            for node_id, result in planner_branch_results.items()
+            if result.get("status") == "completed"
+        }
+        scheduler = TaskGraphScheduler(max_workers=min(3, max(1, len(review_nodes))))
+
+        def handler(node, dependency_results):
+            if node.node_type == "merge":
+                merged_proposals = []
+                branch_keys: list[str] = []
+                for result in dependency_results:
+                    merged_proposals.extend(result.get("reviewed_proposals", []))
+                    if result.get("branch_key"):
+                        branch_keys.append(result["branch_key"])
+                self.agent_service.update_task_node(
+                    node.id,
+                    status="running",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "merge_key": node.merge_key,
+                            "reviewed_branch_count": len(branch_keys),
+                        }
+                    ),
+                )
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "merge_key": node.merge_key,
+                            "reviewed_branch_count": len(branch_keys),
+                            "proposal_count": len(merged_proposals),
+                        }
+                    ),
+                    agent_run_id=reviewer_run_id,
+                )
+                return {
+                    "status": "completed",
+                    "branch_key": node.branch_key,
+                    "reviewed_proposals": merged_proposals,
+                    "merge_key": node.merge_key,
+                }
+
+            branch_result = dependency_results[0] if dependency_results else {}
+            branch_key = node.branch_key or branch_result.get("branch_key") or "general"
+            provider_profile = node.provider_profile or self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings)
+            self.agent_service.update_task_node(
+                node.id,
+                status="running",
+                details=self._sanitize_task_node_details(
+                    {
+                        "branch_key": branch_key,
+                        "review_target": branch_result.get("branch_key"),
+                        "context_namespace": node.context_namespace,
+                    }
+                ),
+            )
+            review_run = self.agent_service.start_run(
+                branch_result.get("proposals", [])[0].run_id if branch_result.get("proposals") else node.run_id,
+                reviewer_agent,
+                input_payload=self._sanitize_agent_payload(
+                    {
+                        "branch_key": branch_key,
+                        "proposal_titles": [proposal.title for proposal in branch_result.get("proposals", [])],
+                        "context_namespace": node.context_namespace,
+                    },
+                    object_type="agent_input",
+                ),
+                provider_profile=provider_profile,
+                parent_agent_run_id=reviewer_run_id,
+                correlation_id=correlation_id,
+            )
+            try:
+                reviewed_proposals = [
+                    self._review_proposal(proposal, reviewer_agent)
+                    for proposal in branch_result.get("proposals", [])
+                ]
+                self.agent_service.complete_run(
+                    review_run.id,
+                    status="completed",
+                    output_payload=self._sanitize_agent_payload(
+                        {
+                            "branch_key": branch_key,
+                            "proposal_ids": [proposal.id for proposal in reviewed_proposals if getattr(proposal, "id", None)],
+                            "proposal_titles": [proposal.title for proposal in reviewed_proposals],
+                        },
+                        object_type="agent_output",
+                    ),
+                )
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "branch_key": branch_key,
+                            "proposal_titles": [proposal.title for proposal in reviewed_proposals],
+                            "proposal_count": len(reviewed_proposals),
+                            "context_namespace": node.context_namespace,
+                        }
+                    ),
+                    agent_run_id=review_run.id,
+                )
+                return {
+                    "status": "completed",
+                    "branch_key": branch_key,
+                    "reviewed_proposals": reviewed_proposals,
+                    "agent_run_id": review_run.id,
+                }
+            except Exception as exc:
+                self.agent_service.complete_run(
+                    review_run.id,
+                    status="failed",
+                    output_payload=self._sanitize_agent_payload(
+                        {"error": str(exc), "branch_key": branch_key},
+                        object_type="agent_output",
+                    ),
+                )
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="failed",
+                    details=self._sanitize_task_node_details(
+                        {"error": str(exc), "branch_key": branch_key}
+                    ),
+                    agent_run_id=review_run.id,
+                )
+                raise
+
+        scheduled = scheduler.execute(
+            nodes,
+            handler,
+            initial_states=initial_states,
+            initial_results=initial_results,
+        )
+        if merge_node is not None:
+            merge_result = scheduled["results"].get(merge_node.id, {})
+            if merge_result.get("status") == "completed":
+                return merge_result.get("reviewed_proposals", [])
+        reviewed: list[ActionProposal] = []
+        for node in review_nodes:
+            result = scheduled["results"].get(node.id, {})
+            reviewed.extend(result.get("reviewed_proposals", []))
+        return reviewed
+
+    def _branch_context(self, branch_key: str, request: AgentRunRequest, collected: dict) -> dict:
+        context = {"objective": request.objective, "branch_key": branch_key}
+        if branch_key == "filesystem":
+            context["filesystem"] = collected.get("filesystem")
+            context["requested_path"] = request.filesystem_path
+        elif branch_key == "http":
+            context["http"] = collected.get("http")
+            context["requested_url"] = request.http_url
+            context["method"] = request.http_method.upper()
+        elif branch_key == "system":
+            context["system"] = collected.get("system")
+            context["system_action"] = request.system_action
+        elif branch_key == "task":
+            context["tasks"] = collected.get("tasks")
+            context["task_title"] = request.task_title
+            context["task_details_present"] = bool(request.task_details)
+        return self.data_governance_service.sanitize_for_history(context, object_type="agent_input")
+
+    def _branch_reasoning_summary(self, branch_key: str, branch_context: dict) -> str:
+        if branch_key == "filesystem":
+            return "Planner isolated the filesystem branch and kept local path context approval-gated."
+        if branch_key == "http":
+            return "Planner isolated the HTTP branch and kept request egress inside the bounded connector policy."
+        if branch_key == "system":
+            return "Planner isolated the bounded system branch and kept it read-only by action schema."
+        if branch_key == "task":
+            return "Planner isolated the local task branch and kept runtime task data local-first."
+        return f"Planner isolated branch {branch_key} for bounded orchestration."
+
+    def _build_branch_proposals(
+        self,
+        *,
+        branch_key: str,
+        run_id: str,
+        request: AgentRunRequest,
+        summary_id: str,
+        collected: dict,
+        summary_text: str,
+        planning_provider: str | None,
+        planner_agent: AgentDefinition,
+        correlation_id: str,
+    ) -> list[ActionProposal]:
+        if branch_key == "filesystem" and request.filesystem_path:
+            return self._filesystem_proposals(
+                run_id,
+                request,
+                summary_id,
+                collected,
+                planning_provider,
+                planner_agent,
+                correlation_id,
+            )
+        if branch_key == "http" and request.http_url:
+            return [
+                self._http_proposal(
+                    run_id,
+                    request,
+                    summary_id,
+                    planning_provider,
+                    planner_agent,
+                    correlation_id,
+                )
+            ]
+        if branch_key == "task":
+            proposals: list[ActionProposal] = []
+            if request.task_title:
+                self.agent_service.assert_connector_allowed(planner_agent, "task")
+                proposals.append(
+                    ActionProposal(
+                        run_id=run_id,
+                        objective=request.objective,
+                        connector="task",
+                        action_type="task.create",
+                        title=f"Create local task: {request.task_title}",
+                        description="Create a tracked local task in the runtime database.",
+                        payload={"title": request.task_title, "details": request.task_details or summary_text},
+                        rationale="The operator asked for a concrete follow-up item.",
+                        provider_name=planning_provider,
+                        summary_id=summary_id,
+                        created_by_agent_id=planner_agent.id,
+                        created_by_agent_role=AgentRole.PLANNER.value,
+                        correlation_id=correlation_id,
+                        data_classification=DataClassification.LOCAL_ONLY,
+                    )
+                )
+            elif "list task" in request.objective.lower():
+                self.agent_service.assert_connector_allowed(planner_agent, "task")
+                proposals.append(
+                    ActionProposal(
+                        run_id=run_id,
+                        objective=request.objective,
+                        connector="task",
+                        action_type="task.list",
+                        title="List local tasks",
+                        description="Read the current local task backlog from SQLite.",
+                        payload={"limit": 20},
+                        rationale="The objective explicitly asks for task visibility.",
+                        provider_name=planning_provider,
+                        summary_id=summary_id,
+                        created_by_agent_id=planner_agent.id,
+                        created_by_agent_role=AgentRole.PLANNER.value,
+                        correlation_id=correlation_id,
+                        data_classification=DataClassification.LOCAL_ONLY,
+                    )
+                )
+            return proposals
+        if branch_key == "system" and request.system_action:
+            self.agent_service.assert_connector_allowed(planner_agent, "system")
+            return [
+                ActionProposal(
+                    run_id=run_id,
+                    objective=request.objective,
+                    connector="system",
+                    action_type=request.system_action,
+                    title=f"Run bounded system action {request.system_action}",
+                    description="Execute a schema-driven read-only system action.",
+                    payload={"path": request.system_path},
+                    rationale="The operator selected a bounded system action.",
+                    provider_name=planning_provider,
+                    summary_id=summary_id,
+                    created_by_agent_id=planner_agent.id,
+                    created_by_agent_role=AgentRole.PLANNER.value,
+                    correlation_id=correlation_id,
+                    data_classification=DataClassification.LOCAL_ONLY,
+                )
+            ]
+        return []
 
     def _filesystem_proposals(
         self,
@@ -753,33 +1284,66 @@ class RuntimePlanner:
         summary_text: str,
         profile: str,
         correlation_id: str,
-        classification: DataClassification,
-    ) -> tuple[str, str]:
-        prompt = (
+    ) -> tuple[str, str, dict]:
+        proposal_payloads = [proposal.model_dump(mode="json") for proposal in proposals]
+        local_report_context, remote_report_context, report_governance = (
+            self.data_governance_service.build_report_context_views(
+                request.model_dump(mode="json"),
+                proposal_payloads,
+                summary_text,
+            )
+        )
+        system_prompt = "You are the reporter agent in a Windows-first local control console."
+        local_prompt = (
             "Summarize this local multi-agent plan for the operator. "
             "Explain why each action is proposed, what requires approval, and the most important risks.\n\n"
-            f"Objective:\n{request.objective}\n\nSummary:\n{summary_text}\n\n"
-            f"Reviewed proposals:\n{json_dumps([proposal.model_dump(mode='json') for proposal in proposals])}"
+            f"Objective:\n{request.objective}\n\nPlan context:\n{json_dumps(local_report_context)}"
+        )
+        remote_prompt = (
+            "Summarize this reviewed local multi-agent plan for the operator using only curated outbound-safe context. "
+            "Explain why each action is proposed, what requires approval, and the most important risks.\n\n"
+            f"Objective:\n{request.objective}\n\nPlan context:\n{json_dumps(remote_report_context)}"
         )
         provider_name = request.provider_name or self.provider_service.resolve_profile_provider(profile)
+        prompt_variants = self.data_governance_service.build_prompt_variants(
+            prompt_kind="report-plan",
+            local_prompt=local_prompt,
+            remote_prompt=remote_prompt,
+            local_classification=DataClassification.LOCAL_ONLY,
+            outbound_classification=DataClassification.EXTERNAL_OK,
+            system_prompt=system_prompt,
+            governance=report_governance,
+        )
+        self.audit_service.emit(
+            "provider.prompt_prepared",
+            {
+                "correlation_id": correlation_id,
+                "task_type": "report-plan",
+                "provider_name": request.provider_name,
+                "profile": profile,
+                "governance": prompt_variants["prompt_governance"],
+            },
+        )
         try:
             response = self.provider_service.complete(
                 ProviderRequest(
                     provider_name=request.provider_name,
                     model_name=request.model_name,
                     profile=profile,
-                    prompt=prompt,
-                    system_prompt="You are the reporter agent in a Windows-first local control console.",
-                    data_classification=classification.value,
+                    prompt=local_prompt,
+                    system_prompt=system_prompt,
+                    data_classification=DataClassification.LOCAL_ONLY.value,
                     task_type="report-plan",
                     correlation_id=correlation_id,
+                    metadata=prompt_variants,
                 )
             )
-            return response.content, response.provider_name
+            return response.content, response.provider_name, response.raw_response.get("_routing", {})
         except Exception:
             return (
                 "Plan ready. Review the proposed steps, inspect high-risk actions, and approve only the bounded actions you want executed.",
                 provider_name or "offline-fallback",
+                {"mode": "offline-fallback"},
             )
 
     @staticmethod
@@ -807,6 +1371,7 @@ class RuntimePlanner:
                     "role": AgentRole.PLANNER.value,
                     "title": f"Inspect filesystem target {request.filesystem_path}",
                     "node_type": "collect",
+                    "branch_key": "filesystem",
                 }
             )
         if request.http_url:
@@ -815,6 +1380,7 @@ class RuntimePlanner:
                     "role": AgentRole.PLANNER.value,
                     "title": f"Prepare HTTP action for {request.http_url}",
                     "node_type": "plan",
+                    "branch_key": "http",
                 }
             )
         if request.system_action:
@@ -823,6 +1389,7 @@ class RuntimePlanner:
                     "role": AgentRole.PLANNER.value,
                     "title": f"Prepare bounded system action {request.system_action}",
                     "node_type": "plan",
+                    "branch_key": "system",
                 }
             )
         if request.task_title:
@@ -831,6 +1398,7 @@ class RuntimePlanner:
                     "role": AgentRole.PLANNER.value,
                     "title": f"Create local task {request.task_title}",
                     "node_type": "plan",
+                    "branch_key": "task",
                 }
             )
         subtasks.append(
@@ -860,7 +1428,7 @@ class RuntimePlanner:
     def _planning_classification(request: AgentRunRequest, collected: dict) -> DataClassification:
         if request.file_content or request.http_body:
             return DataClassification.RESTRICTED
-        if request.filesystem_path or request.system_action or "filesystem" in collected:
+        if request.filesystem_path or request.system_action or "filesystem" in collected or "system" in collected or "tasks" in collected:
             return DataClassification.LOCAL_ONLY
         return DataClassification.EXTERNAL_OK
 
@@ -887,6 +1455,8 @@ class RuntimePlanner:
             role = AgentRole(subtask["role"])
             agent = self.agent_service.get_by_role(role)
             if role == AgentRole.PLANNER:
+                branch_key = subtask.get("branch_key") or subtask["title"].split(" ", 1)[0].lower()
+                context_namespace = f"{agent.memory_namespace}:{run_id}:{sequence}"
                 node = self.agent_service.create_task_node(
                     run_id,
                     role=role,
@@ -901,10 +1471,15 @@ class RuntimePlanner:
                             "capabilities": agent.capabilities,
                             "allowed_connectors": agent.allowed_connectors,
                             "input_source": "supervisor-decomposition",
+                            "branch_key": branch_key,
+                            "context_namespace": context_namespace,
+                            "connector_hint": branch_key,
                         }
                     ),
                     status="ready",
                     parent_task_node_id=parent_node_id,
+                    branch_key=branch_key,
+                    context_namespace=context_namespace,
                     agent=agent,
                     provider_profile=self._provider_profile_for_role(role, settings),
                     correlation_id=correlation_id,
@@ -914,39 +1489,69 @@ class RuntimePlanner:
                 nodes.append(node)
                 sequence += 1
 
-        reviewer_dependencies = [node.id for node in planner_nodes] or [parent_node_id]
-        for subtask in subtasks:
-            role = AgentRole(subtask["role"])
-            if role != AgentRole.REVIEWER:
-                continue
-            agent = self.agent_service.get_by_role(role)
+        reviewer_agent = self.agent_service.get_by_role(AgentRole.REVIEWER)
+        for planner_node in planner_nodes:
+            branch_key = planner_node.branch_key or planner_node.details.get("branch_key") or planner_node.node_type
             node = self.agent_service.create_task_node(
                 run_id,
-                role=role,
-                node_type=subtask.get("node_type", "subtask"),
-                title=subtask["title"],
+                role=AgentRole.REVIEWER,
+                node_type="review",
+                title=f"Review branch: {planner_node.title}",
                 details=self._sanitize_task_node_details(
                     {
                         "sequence": sequence,
                         "phase": "review",
-                        "memory_namespace": agent.memory_namespace,
-                        "planned_provider_profile": self._provider_profile_for_role(role, settings),
-                        "capabilities": agent.capabilities,
-                        "allowed_connectors": agent.allowed_connectors,
+                        "memory_namespace": f"{reviewer_agent.memory_namespace}:{run_id}:{branch_key}",
+                        "planned_provider_profile": self._provider_profile_for_role(AgentRole.REVIEWER, settings),
+                        "capabilities": reviewer_agent.capabilities,
+                        "allowed_connectors": reviewer_agent.allowed_connectors,
+                        "branch_key": branch_key,
+                        "connector_hint": planner_node.details.get("connector_hint"),
+                        "review_target": planner_node.title,
                     }
                 ),
                 status="blocked",
-                parent_task_node_id=parent_node_id,
-                agent=agent,
-                provider_profile=self._provider_profile_for_role(role, settings),
+                parent_task_node_id=planner_node.id,
+                branch_key=branch_key,
+                context_namespace=f"{reviewer_agent.memory_namespace}:{run_id}:{branch_key}",
+                agent=reviewer_agent,
+                provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, settings),
                 correlation_id=correlation_id,
-                depends_on=reviewer_dependencies,
+                depends_on=[planner_node.id],
             )
             review_nodes.append(node)
             nodes.append(node)
             sequence += 1
 
-        reporter_dependencies = [node.id for node in review_nodes] or reviewer_dependencies
+        reviewer_dependencies = [node.id for node in review_nodes] or [parent_node_id]
+        merge_node = self.agent_service.create_task_node(
+            run_id,
+            role=AgentRole.REVIEWER,
+            node_type="merge",
+            title="Merge reviewed branches",
+            details=self._sanitize_task_node_details(
+                {
+                    "sequence": sequence,
+                    "phase": "review-merge",
+                    "memory_namespace": f"{reviewer_agent.memory_namespace}:{run_id}:merge",
+                    "planned_provider_profile": self._provider_profile_for_role(AgentRole.REVIEWER, settings),
+                    "branch_count": len(review_nodes),
+                }
+            ),
+            status="blocked",
+            parent_task_node_id=parent_node_id,
+            branch_key="review-merge",
+            context_namespace=f"{reviewer_agent.memory_namespace}:{run_id}:merge",
+            merge_key="review-merge",
+            agent=reviewer_agent,
+            provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, settings),
+            correlation_id=correlation_id,
+            depends_on=reviewer_dependencies,
+        )
+        nodes.append(merge_node)
+        sequence += 1
+
+        reporter_dependencies = [merge_node.id]
         for subtask in subtasks:
             role = AgentRole(subtask["role"])
             if role != AgentRole.REPORTER:
@@ -965,10 +1570,14 @@ class RuntimePlanner:
                         "planned_provider_profile": self._provider_profile_for_role(role, settings),
                         "capabilities": agent.capabilities,
                         "allowed_connectors": agent.allowed_connectors,
+                        "depends_on_merge": merge_node.id,
                     }
                 ),
                 status="blocked",
                 parent_task_node_id=parent_node_id,
+                branch_key="reporting",
+                context_namespace=f"{agent.memory_namespace}:{run_id}:reporting",
+                merge_key="review-merge",
                 agent=agent,
                 provider_profile=self._provider_profile_for_role(role, settings),
                 correlation_id=correlation_id,
@@ -1003,14 +1612,14 @@ class RuntimePlanner:
     @staticmethod
     def _proposal_parent_node(connector: str, nodes, fallback_id: str) -> str:
         connector_map = {
-            "filesystem": "filesystem target",
-            "http": "HTTP action",
-            "task": "local task",
-            "system": "system action",
+            "filesystem": "filesystem",
+            "http": "http",
+            "task": "local",
+            "system": "bounded",
         }
         needle = connector_map.get(connector, connector).lower()
         for node in nodes:
-            if node.role == AgentRole.PLANNER and needle in node.title.lower():
+            if node.role == AgentRole.REVIEWER and node.node_type == "review" and needle in node.title.lower():
                 return node.id
         for node in nodes:
             if node.role == AgentRole.PLANNER:

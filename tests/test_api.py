@@ -96,6 +96,9 @@ def test_settings_page_shows_provider_catalog_and_windows_ops(authenticated_clie
     assert "Windows Operations" in response.text
     assert "Privacy Posture" in response.text
     assert "Storage posture" in response.text
+    assert "windows-credential-manager" in response.text
+    assert "Observed Metrics" in response.text
+    assert "Credential Secret" in response.text
 
 
 def test_run_detail_renders_task_graph_summary(authenticated_client, auth_headers):
@@ -112,3 +115,7 @@ def test_run_detail_renders_task_graph_summary(authenticated_client, auth_header
     assert "Task Graph" in response.text
     assert "Stored node details" in response.text
     assert "approval required" in response.text
+    assert "Execution Boundary" in response.text
+    assert "Merge reviewed branches" in response.text
+    assert "Agent Swimlanes" in response.text
+    assert "Dependency Edges" in response.text

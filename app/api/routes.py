@@ -283,6 +283,8 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
     handoffs = container.agent_service.list_handoffs(run_id)
     task_nodes = container.agent_service.list_task_nodes(run_id)
     connector_runs = [entry for entry in container.history_service.list_connector_runs(limit=200) if entry.run_id == run_id]
+    execution_jobs = [job for job in container.execution_queue_service.list_recent(limit=200) if job.run_id == run_id]
+    execution_attempts = {job.id: container.execution_queue_service.list_attempts(job.id) for job in execution_jobs}
     return {
         "summary": summary,
         "proposals": proposals,
@@ -290,7 +292,11 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
         "handoffs": handoffs,
         "task_nodes": task_nodes,
         "task_tree": _build_task_tree(task_nodes, proposals),
+        "task_swimlanes": _build_task_swimlanes(task_nodes),
+        "task_edges": _build_task_edges(task_nodes),
         "connector_runs": connector_runs,
+        "execution_jobs": execution_jobs,
+        "execution_attempts": execution_attempts,
     }
 
 
@@ -304,6 +310,7 @@ def _build_task_tree(task_nodes, proposals) -> list[dict[str, Any]]:
             "summary_lines": [],
             "status_note": _task_status_note(node),
             "proposal": None,
+            "graph_hint": "",
         }
         for node in task_nodes
     }
@@ -317,6 +324,7 @@ def _build_task_tree(task_nodes, proposals) -> list[dict[str, Any]]:
         proposal_id = item["node"].details.get("proposal_id")
         if proposal_id and proposal_id in proposal_lookup:
             item["proposal"] = proposal_lookup[proposal_id]
+        item["graph_hint"] = _task_graph_hint(item["node"], item["dependency_titles"])
     roots: list[dict[str, Any]] = []
     for item in nodes.values():
         parent_id = item["node"].parent_task_node_id
@@ -325,6 +333,39 @@ def _build_task_tree(task_nodes, proposals) -> list[dict[str, Any]]:
         else:
             roots.append(item)
     return roots
+
+
+def _build_task_swimlanes(task_nodes) -> list[dict[str, Any]]:
+    lanes: dict[str, list] = {}
+    for node in task_nodes:
+        lanes.setdefault(node.role.value, []).append(node)
+    ordered_roles = ["supervisor", "planner", "reviewer", "executor", "reporter"]
+    return [
+        {"role": role, "nodes": lanes.get(role, [])}
+        for role in ordered_roles
+        if lanes.get(role)
+    ]
+
+
+def _build_task_edges(task_nodes) -> list[dict[str, str]]:
+    lookup = {node.id: node for node in task_nodes}
+    edges: list[dict[str, str]] = []
+    for node in task_nodes:
+        for dependency_id in node.depends_on:
+            upstream = lookup.get(dependency_id)
+            if upstream is None:
+                continue
+            edges.append(
+                {
+                    "from_id": upstream.id,
+                    "from_title": upstream.title,
+                    "from_role": upstream.role.value,
+                    "to_id": node.id,
+                    "to_title": node.title,
+                    "to_role": node.role.value,
+                }
+            )
+    return edges
 
 
 def _provider_profile_usage(settings, provider_name: str) -> list[str]:
@@ -359,6 +400,8 @@ def _humanize_drift_field(field: str) -> str:
 
 
 def _task_status_note(node) -> str:
+    if node.status == "queued":
+        return "This node has been approved and is queued for worker execution."
     if node.status == "waiting_approval":
         return "This node will not execute until an operator approves it."
     if node.status == "blocked":
@@ -372,6 +415,16 @@ def _task_status_note(node) -> str:
     if node.status == "failed":
         return "This node failed. Inspect the stored error or output summary."
     return "This node follows the persisted runtime state."
+
+
+def _task_graph_hint(node, dependency_titles: list[str]) -> str:
+    if node.node_type == "merge":
+        return f"Merge point waiting on {len(dependency_titles)} upstream branch review nodes."
+    if node.role.value == "executor":
+        return "Executor node tracks the approved action through queue, worker, and final status."
+    if dependency_titles:
+        return f"Depends on: {', '.join(dependency_titles)}."
+    return "No upstream dependency is recorded for this node."
 
 
 def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> list[str]:
@@ -391,8 +444,31 @@ def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> lis
         lines.append(f"risk: {proposal.risk_level.value}")
         if proposal.requires_approval:
             lines.append("approval: required")
+    if node.proposal_id:
+        lines.append(f"proposal id: {node.proposal_id}")
+    if node.branch_key:
+        lines.append(f"branch: {node.branch_key}")
+    if node.context_namespace:
+        lines.append(f"context: {node.context_namespace}")
+    if node.merge_key:
+        lines.append(f"merge: {node.merge_key}")
     if details.get("planned_provider_profile"):
         lines.append(f"planned profile: {details['planned_provider_profile']}")
+    if details.get("provider_routing"):
+        routing = details["provider_routing"]
+        if isinstance(routing, dict):
+            provider = routing.get("selected_provider")
+            reason = routing.get("reason")
+            if provider:
+                lines.append(f"routing provider: {provider}")
+            if reason:
+                lines.append(f"routing reason: {str(reason)[:140]}")
+    if details.get("job_id"):
+        lines.append(f"job: {details['job_id']}")
+    if details.get("boundary_mode"):
+        lines.append(f"boundary: {details['boundary_mode']}")
+    if details.get("execution_bundle_hash"):
+        lines.append(f"bundle: {str(details['execution_bundle_hash'])[:18]}...")
     if details.get("proposal_count") is not None:
         lines.append(f"proposal count: {details['proposal_count']}")
     if details.get("subtask_count") is not None:
@@ -409,8 +485,9 @@ def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> lis
 def _storage_posture_context(container: AppContainer) -> dict[str, Any]:
     posture = container.protected_storage.feature_posture()
     posture["secret_env_override_available"] = bool(container.base_settings.session_secret)
-    posture["provider_secret_handling"] = "environment variables only"
+    posture["provider_secret_handling"] = "environment variables or Windows Credential Manager"
     posture["provider_secret_supports_local_storage"] = False
+    posture["windows_credential_manager_available"] = container.windows_credential_store.available
     return posture
 
 
@@ -442,6 +519,11 @@ def _provider_posture_summary(status, config, settings) -> dict[str, str]:
         "privacy_posture": privacy_posture,
         "egress_posture": egress_posture,
         "destination_summary": destination_summary,
+        "routing_summary": (
+            f"cost={getattr(config, 'cost_tier', 'standard')}, "
+            f"latency={getattr(config, 'latency_tier', 'standard')}, "
+            f"privacy={getattr(config, 'privacy_tier', 'standard')}"
+        ),
     }
 
 
@@ -559,6 +641,31 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
                 "detail": "Launches Explorer for the LocalAppData runtime root, workspace, logs, or secrets locations.",
             },
             {
+                "title": "Pick workspace file",
+                "command": r".\scripts\pick-workspace-file.ps1",
+                "detail": "Opens a native Windows file picker rooted in the managed workspace and prints the selected path.",
+            },
+            {
+                "title": "Install worker startup task",
+                "command": r".\scripts\install-worker-startup-task.ps1",
+                "detail": "Registers a current-user startup task for the execution worker so approvals can drain without opening an interactive shell.",
+            },
+            {
+                "title": "Start worker task",
+                "command": r".\scripts\start-worker-startup-task.ps1",
+                "detail": "Starts the registered worker scheduled task on demand for background execution.",
+            },
+            {
+                "title": "Stop worker task",
+                "command": r".\scripts\stop-worker-startup-task.ps1",
+                "detail": "Stops the running worker scheduled task without removing its registration.",
+            },
+            {
+                "title": "Worker task status",
+                "command": r".\scripts\worker-startup-task-status.ps1",
+                "detail": "Shows the worker scheduled task state, last run result, and next trigger time.",
+            },
+            {
                 "title": "Show runtime posture",
                 "command": r".\scripts\show-runtime-posture.ps1",
                 "detail": "Prints the Windows runtime root, LocalAppData paths, and whether strong local protection is active.",
@@ -567,6 +674,11 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
                 "title": "Remove startup task",
                 "command": r".\scripts\remove-console-startup-task.ps1",
                 "detail": "Removes the Windows Scheduled Task created for operator startup mode.",
+            },
+            {
+                "title": "Remove worker startup task",
+                "command": r".\scripts\remove-worker-startup-task.ps1",
+                "detail": "Removes the current-user startup task used for background worker mode.",
             },
         ],
         "result": result,
@@ -738,6 +850,18 @@ def run_agent_form(
             "system.read_text_file",
             "system.test_path",
             "system.get_time",
+        ],
+        "windows_helpers": [
+            {
+                "title": "Pick workspace file",
+                "command": r".\scripts\pick-workspace-file.ps1",
+                "detail": "Use the native Windows picker to capture a workspace path, then paste the returned path into Filesystem Target.",
+            },
+            {
+                "title": "Open runtime folders",
+                "command": r".\scripts\open-runtime-folders.ps1",
+                "detail": "Open the managed runtime workspace, logs, or secrets folder in Explorer while preparing an action.",
+            },
         ],
         "unsafe_warnings": _unsafe_warnings(container),
     }
@@ -1262,6 +1386,11 @@ async def provider_config_submit(
     api_key_env: str | None = Form(None),
     allowed_hosts: str = Form(""),
     auth_source: str = Form("env"),
+    credential_target: str | None = Form(None),
+    credential_secret: str | None = Form(None),
+    cost_tier: str = Form("standard"),
+    latency_tier: str = Form("standard"),
+    privacy_tier: str = Form("standard"),
     current_password: str | None = Form(None),
     container: AppContainer = Depends(get_container),
 ):
@@ -1270,6 +1399,10 @@ async def provider_config_submit(
         user = _page_user_or_redirect(request, container)
         if isinstance(user, RedirectResponse):
             return user
+        if auth_source == "credential-manager" and not container.windows_credential_store.available:
+            raise ValueError("Windows Credential Manager integration is not available on this host.")
+        if auth_source == "credential-manager" and not (credential_target or "").strip():
+            raise ValueError("Credential target is required when auth source is windows-credential-manager.")
         _require_recent_auth(request, container, user, current_password, "change provider configuration")
         record = container.settings_service.save_provider_config(
             ProviderConfigUpdate(
@@ -1281,10 +1414,20 @@ async def provider_config_submit(
                 api_key_env=api_key_env or None,
                 allowed_hosts=[host.strip() for host in allowed_hosts.split(",") if host.strip()],
                 auth_source=auth_source,
+                credential_target=credential_target or None,
+                cost_tier=cost_tier,
+                latency_tier=latency_tier,
+                privacy_tier=privacy_tier,
             ),
             actor=user.username,
             reason=f"provider-config:{provider_name}",
         )
+        if auth_source == "credential-manager" and credential_secret:
+            container.windows_credential_store.write_secret(
+                record.credential_target,
+                credential_secret,
+                username=user.username,
+            )
         container.audit_service.emit(
             "settings.provider_config_updated",
             {
@@ -1293,6 +1436,11 @@ async def provider_config_submit(
                 "enabled": record.enabled,
                 "allowed_hosts": record.allowed_hosts,
                 "auth_source": record.auth_source,
+                "credential_target": record.credential_target,
+                "credential_updated": bool(credential_secret),
+                "cost_tier": record.cost_tier,
+                "latency_tier": record.latency_tier,
+                "privacy_tier": record.privacy_tier,
             },
         )
         return _redirect("/settings", message=f"Provider catalog entry for {provider_name} saved.")
@@ -1324,6 +1472,40 @@ async def provider_config_reset(
         )
         return _redirect("/settings", message=f"Provider catalog entry for {provider_name} reset to defaults.")
     except (AuthenticationError, AuthorizationError, CsrfError, ValueError, KeyError) as exc:
+        return _redirect("/settings", error=str(exc))
+
+
+@router.post("/settings/provider-config/delete-credential")
+async def provider_credential_delete(
+    request: Request,
+    provider_name: str = Form(...),
+    credential_target: str = Form(...),
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(
+            request,
+            container,
+            user,
+            current_password,
+            f"delete provider credential for {provider_name}",
+        )
+        container.windows_credential_store.delete_secret(credential_target)
+        container.audit_service.emit(
+            "settings.provider_credential_deleted",
+            {
+                "actor": user.username,
+                "provider_name": provider_name,
+                "credential_target": credential_target,
+            },
+        )
+        return _redirect("/settings", message=f"Deleted stored credential for {provider_name}.")
+    except (AuthenticationError, AuthorizationError, CsrfError, ValueError) as exc:
         return _redirect("/settings", error=str(exc))
 
 

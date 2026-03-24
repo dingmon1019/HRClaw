@@ -60,6 +60,10 @@ class TaskNodeRecord(BaseModel):
     id: str
     run_id: str
     parent_task_node_id: str | None = None
+    proposal_id: str | None = None
+    branch_key: str | None = None
+    context_namespace: str | None = None
+    merge_key: str | None = None
     agent_id: str | None = None
     agent_run_id: str | None = None
     handoff_id: str | None = None

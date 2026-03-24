@@ -19,6 +19,7 @@
         {% if branch.dependency_titles %} / depends on {{ branch.dependency_titles | join(", ") }}{% endif %}
     </small>
     <p class="muted small">{{ branch.status_note }}</p>
+    <p class="muted small">{{ branch.graph_hint }}</p>
     <ul class="flat-list">
         {% for line in branch.summary_lines %}
         <li>{{ line }}</li>
@@ -86,7 +87,39 @@
             <h3>Task Graph</h3>
             <span class="badge ok">{{ task_nodes|length }} nodes</span>
         </div>
-        <p class="muted">Supervisor objective 아래에 planner branches가 준비되고, reviewer/reporter가 의존 관계를 따라 이어집니다. proposal node는 승인 대기 여부와 risk를 함께 표시합니다.</p>
+        <p class="muted">Supervisor decomposition creates planner branches, reviewer nodes gate each branch, merge points unblock downstream reporting, and executor nodes track approval-gated work until the worker finishes.</p>
+        <div class="grid two mt-16">
+            <div class="panel">
+                <h4>Agent Swimlanes</h4>
+                <div class="stack">
+                    {% for lane in task_swimlanes %}
+                    <div class="list-item">
+                        <strong>{{ lane.role }}</strong>
+                        <ul class="flat-list small">
+                            {% for node in lane.nodes %}
+                            <li>{{ node.title }} <span class="badge {{ node.status }}">{{ node.status }}</span></li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% else %}
+                    <p class="muted">No swimlanes available.</p>
+                    {% endfor %}
+                </div>
+            </div>
+            <div class="panel">
+                <h4>Dependency Edges</h4>
+                <div class="stack">
+                    {% for edge in task_edges %}
+                    <div class="list-item">
+                        <strong>{{ edge.from_role }} -> {{ edge.to_role }}</strong>
+                        <p>{{ edge.from_title }} -> {{ edge.to_title }}</p>
+                    </div>
+                    {% else %}
+                    <p class="muted">No dependency edges were stored for this run.</p>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
         <div class="stack">
             {% for branch in task_tree %}
             {{ render_task_branch(branch) }}
@@ -141,6 +174,50 @@
             {% endfor %}
         </div>
     </article>
+</section>
+
+<section class="card">
+    <div class="card-header">
+        <h3>Execution Boundary</h3>
+        <span class="badge ok">{{ execution_jobs|length }} jobs</span>
+    </div>
+    <div class="stack">
+        {% for job in execution_jobs %}
+        <div class="list-item">
+            <strong>{{ job.id }}</strong>
+            <p>{{ job.status.value }} / proposal {{ job.proposal_id }} / worker {{ job.worker_id or "-" }}</p>
+            <small>manifest {{ job.manifest_hash or "-" }}{% if job.execution_bundle_hash %} / bundle {{ job.execution_bundle_hash }}{% endif %}</small>
+            {% if job.boundary_mode %}
+            <p class="small muted">{{ job.boundary_mode }}</p>
+            {% endif %}
+            {% if job.boundary_metadata %}
+            <details class="mt-16">
+                <summary>Boundary metadata</summary>
+                <pre>{{ job.boundary_metadata | tojson(indent=2) }}</pre>
+            </details>
+            {% endif %}
+            {% if execution_attempts[job.id] %}
+            <details class="mt-16">
+                <summary>Attempts ({{ execution_attempts[job.id]|length }})</summary>
+                <div class="stack mt-16">
+                    {% for attempt in execution_attempts[job.id] %}
+                    <div class="panel">
+                        <strong>{{ attempt.id }}</strong>
+                        <p>{{ attempt.status }} / worker {{ attempt.worker_id }} / attempt {{ attempt.attempt_number }}</p>
+                        <small>{{ attempt.started_at }}{% if attempt.finished_at %} -> {{ attempt.finished_at }}{% endif %}</small>
+                        {% if attempt.boundary_metadata %}
+                        <pre>{{ attempt.boundary_metadata | tojson(indent=2) }}</pre>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+            </details>
+            {% endif %}
+        </div>
+        {% else %}
+        <p class="muted">No execution jobs have been queued for this run yet.</p>
+        {% endfor %}
+    </div>
 </section>
 
 <section class="card">

@@ -73,6 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
     issue_cli.add_argument("--token-file")
     issue_cli.add_argument("--emit-token", action="store_true")
 
+    set_credential = subparsers.add_parser("set-credential", help="Store or update a Windows Credential Manager secret.")
+    set_credential.add_argument("--target", required=True)
+    set_credential.add_argument("--username", default=None)
+
+    delete_credential = subparsers.add_parser("delete-credential", help="Delete a Windows Credential Manager secret.")
+    delete_credential.add_argument("--target", required=True)
+
+    test_credential = subparsers.add_parser("test-credential", help="Check whether a Windows Credential Manager target exists.")
+    test_credential.add_argument("--target", required=True)
+
     subparsers.add_parser("verify-audit", help="Verify tamper-evident audit chain integrity.")
     return parser
 
@@ -227,6 +237,23 @@ def main() -> None:
         if args.emit_token:
             response["token"] = token
         print(json.dumps(response, indent=2))
+        return
+
+    if args.command == "set-credential":
+        secret = getpass("Credential secret: ")
+        if not secret:
+            raise SystemExit("Credential secret input was empty.")
+        container.windows_credential_store.write_secret(args.target, secret, username=args.username)
+        print(json.dumps(container.windows_credential_store.describe(args.target), indent=2))
+        return
+
+    if args.command == "delete-credential":
+        container.windows_credential_store.delete_secret(args.target)
+        print(json.dumps({"target": args.target, "deleted": True}, indent=2))
+        return
+
+    if args.command == "test-credential":
+        print(json.dumps(container.windows_credential_store.describe(args.target), indent=2))
         return
 
     if args.command == "list-jobs":

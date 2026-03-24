@@ -196,6 +196,10 @@ class AgentService:
         details: dict,
         status: str,
         parent_task_node_id: str | None = None,
+        proposal_id: str | None = None,
+        branch_key: str | None = None,
+        context_namespace: str | None = None,
+        merge_key: str | None = None,
         agent: AgentDefinition | None = None,
         agent_run_id: str | None = None,
         handoff_id: str | None = None,
@@ -208,6 +212,10 @@ class AgentService:
             id=new_id("tasknode"),
             run_id=run_id,
             parent_task_node_id=parent_task_node_id,
+            proposal_id=proposal_id,
+            branch_key=branch_key,
+            context_namespace=context_namespace,
+            merge_key=merge_key,
             agent_id=agent.id if agent else None,
             agent_run_id=agent_run_id,
             handoff_id=handoff_id,
@@ -226,16 +234,21 @@ class AgentService:
         self.database.execute(
             """
             INSERT INTO task_nodes(
-                id, run_id, parent_task_node_id, agent_id, agent_run_id, handoff_id, role, node_type,
+                id, run_id, parent_task_node_id, proposal_id, branch_key, context_namespace, merge_key,
+                agent_id, agent_run_id, handoff_id, role, node_type,
                 title, details_json, status, provider_profile, provider_name, correlation_id,
                 depends_on_json, created_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
                 record.run_id,
                 record.parent_task_node_id,
+                record.proposal_id,
+                record.branch_key,
+                record.context_namespace,
+                record.merge_key,
                 record.agent_id,
                 record.agent_run_id,
                 record.handoff_id,
@@ -264,19 +277,40 @@ class AgentService:
         agent_run_id: str | None = None,
         handoff_id: str | None = None,
     ) -> TaskNodeRecord:
+        return self.update_task_node(
+            task_node_id,
+            status=status,
+            details=details,
+            provider_name=provider_name,
+            agent_run_id=agent_run_id,
+            handoff_id=handoff_id,
+            finalize=True,
+        )
+
+    def update_task_node(
+        self,
+        task_node_id: str,
+        *,
+        status: str,
+        details: dict | None = None,
+        provider_name: str | None = None,
+        agent_run_id: str | None = None,
+        handoff_id: str | None = None,
+        finalize: bool = False,
+    ) -> TaskNodeRecord:
         current = self.database.fetch_one("SELECT * FROM task_nodes WHERE id = ?", (task_node_id,))
         if current is None:
             raise NotFoundError(f"Task node {task_node_id} was not found.")
         merged_details = json_loads(current["details_json"], {})
         if details:
             merged_details.update(details)
-        completed_at = utcnow_iso()
+        completed_at = utcnow_iso() if finalize else None
         self.database.execute(
             """
             UPDATE task_nodes
             SET status = ?, details_json = ?, provider_name = COALESCE(?, provider_name),
                 agent_run_id = COALESCE(?, agent_run_id), handoff_id = COALESCE(?, handoff_id),
-                completed_at = ?
+                completed_at = CASE WHEN ? IS NULL THEN completed_at ELSE ? END
             WHERE id = ?
             """,
             (
@@ -286,11 +320,41 @@ class AgentService:
                 agent_run_id,
                 handoff_id,
                 completed_at,
+                completed_at,
                 task_node_id,
             ),
         )
         row = self.database.fetch_one("SELECT * FROM task_nodes WHERE id = ?", (task_node_id,))
         return self._row_to_task_node(row)
+
+    def update_nodes_for_proposal(
+        self,
+        proposal_id: str,
+        *,
+        status: str,
+        details: dict | None = None,
+        role: AgentRole | None = None,
+        provider_name: str | None = None,
+        agent_run_id: str | None = None,
+    ) -> list[TaskNodeRecord]:
+        params: list[object] = [proposal_id]
+        query = "SELECT id FROM task_nodes WHERE proposal_id = ?"
+        if role is not None:
+            query += " AND role = ?"
+            params.append(role.value)
+        rows = self.database.fetch_all(query, tuple(params))
+        updated: list[TaskNodeRecord] = []
+        for row in rows:
+            updated.append(
+                self.complete_task_node(
+                    row["id"],
+                    status=status,
+                    details=details,
+                    provider_name=provider_name,
+                    agent_run_id=agent_run_id,
+                )
+            )
+        return updated
 
     def list_task_nodes(self, run_id: str) -> list[TaskNodeRecord]:
         rows = self.database.fetch_all(
@@ -398,6 +462,10 @@ class AgentService:
             id=row["id"],
             run_id=row["run_id"],
             parent_task_node_id=row["parent_task_node_id"],
+            proposal_id=row["proposal_id"],
+            branch_key=row["branch_key"],
+            context_namespace=row["context_namespace"],
+            merge_key=row["merge_key"],
             agent_id=row["agent_id"],
             agent_run_id=row["agent_run_id"],
             handoff_id=row["handoff_id"],

@@ -84,6 +84,18 @@
         <details class="panel">
             <summary><strong>Expert Inputs</strong> <span class="muted small">Optional structured hints for the planner</span></summary>
             <div class="stack form-grid mt-16">
+                <div class="panel">
+                    <h4>Windows Helpers</h4>
+                    <div class="stack tight">
+                        {% for helper in windows_helpers %}
+                        <div class="list-item">
+                            <strong>{{ helper.title }}</strong>
+                            <p>{{ helper.detail }}</p>
+                            <small><code>{{ helper.command }}</code></small>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
                 <div class="grid two">
                     <label>
                         Filesystem Target

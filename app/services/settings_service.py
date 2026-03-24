@@ -440,6 +440,10 @@ class SettingsService:
             default_model=row["default_model"] or defaults.default_model,
             allowed_hosts=json_loads(row["allowed_hosts_json"], defaults.allowed_hosts),
             auth_source=row["auth_source"] or defaults.auth_source,
+            credential_target=row["credential_target"] or defaults.credential_target,
+            cost_tier=row["cost_tier"] or defaults.cost_tier,
+            latency_tier=row["latency_tier"] or defaults.latency_tier,
+            privacy_tier=row["privacy_tier"] or defaults.privacy_tier,
             updated_at=row["updated_at"],
         )
 
@@ -506,6 +510,10 @@ class SettingsService:
             default_model=merged.get("default_model"),
             allowed_hosts=list(merged.get("allowed_hosts", shared_hosts)),
             auth_source=str(merged.get("auth_source", "env")),
+            credential_target=merged.get("credential_target"),
+            cost_tier=str(merged.get("cost_tier", "standard")),
+            latency_tier=str(merged.get("latency_tier", "standard")),
+            privacy_tier=str(merged.get("privacy_tier", "standard")),
             updated_at=None,
         )
 
@@ -522,9 +530,9 @@ class SettingsService:
             """
             INSERT INTO provider_configs(
                 provider_name, enabled, base_url, generic_http_endpoint, api_key_env, default_model,
-                allowed_hosts_json, auth_source, updated_at
+                allowed_hosts_json, auth_source, credential_target, cost_tier, latency_tier, privacy_tier, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_name) DO UPDATE SET
                 enabled = excluded.enabled,
                 base_url = excluded.base_url,
@@ -533,6 +541,10 @@ class SettingsService:
                 default_model = excluded.default_model,
                 allowed_hosts_json = excluded.allowed_hosts_json,
                 auth_source = excluded.auth_source,
+                credential_target = excluded.credential_target,
+                cost_tier = excluded.cost_tier,
+                latency_tier = excluded.latency_tier,
+                privacy_tier = excluded.privacy_tier,
                 updated_at = excluded.updated_at
             """,
             (
@@ -544,6 +556,10 @@ class SettingsService:
                 update.default_model,
                 json_dumps(update.allowed_hosts),
                 update.auth_source,
+                update.credential_target,
+                update.cost_tier,
+                update.latency_tier,
+                update.privacy_tier,
                 updated_at,
             ),
         )

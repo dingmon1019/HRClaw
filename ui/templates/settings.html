@@ -344,6 +344,7 @@
                     <p class="small muted">Protected local storage mode: {{ protected_storage_mode }}</p>
                     <p class="small muted">Storage posture: {{ protected_storage_posture }}</p>
                     <p class="small muted">Provider secret handling: {{ storage_posture.provider_secret_handling }}</p>
+                    <p class="small muted">Windows Credential Manager: {{ "available" if storage_posture.windows_credential_manager_available else "not available" }}</p>
                     {% if storage_posture.disabled_features %}
                     <ul class="flat-list small mt-16">
                         {% for feature in storage_posture.disabled_features %}
@@ -479,9 +480,31 @@
                         <strong>{{ entry.posture.destination_summary }}</strong>
                     </div>
                     <div class="metric-row">
+                        <span>Routing Posture</span>
+                        <strong>{{ entry.posture.routing_summary }}</strong>
+                    </div>
+                    <div class="metric-row">
                         <span>Recent Usage</span>
                         <strong>{{ entry.runtime_usage.agent_steps }} agent steps / {{ entry.runtime_usage.executions }} executions</strong>
                     </div>
+                    {% if status %}
+                    <div class="metric-row">
+                        <span>Reliability</span>
+                        <strong>{{ status.success_count }} success / {{ status.failure_count }} failure</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Observed Metrics</span>
+                        <strong>{{ "%.0f"|format(status.latency_ewma_ms) }} ms ewma / {{ "%.0f"|format(status.success_rate * 100) }}% success</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Failure Streak</span>
+                        <strong>{{ status.consecutive_failures }}{% if status.last_error_category %} / {{ status.last_error_category }}{% endif %}</strong>
+                    </div>
+                    <div class="metric-row">
+                        <span>Last Routing Reason</span>
+                        <strong>{{ status.last_routing_reason or "No routing decision recorded yet." }}</strong>
+                    </div>
+                    {% endif %}
                 </div>
 
             <form method="post" action="/settings/provider-config" class="stack form-grid mt-16">
@@ -496,6 +519,7 @@
                         Auth Source
                         <select name="auth_source">
                             <option value="env" {% if config.auth_source == "env" %}selected{% endif %}>env</option>
+                            <option value="credential-manager" {% if config.auth_source == "credential-manager" %}selected{% endif %}>windows-credential-manager</option>
                         </select>
                     </label>
                 </div>
@@ -507,6 +531,26 @@
                     <label>
                         API Key Env
                         <input type="text" name="api_key_env" value="{{ config.api_key_env or '' }}">
+                    </label>
+                </div>
+                <div class="grid two">
+                    <label>
+                        Credential Target
+                        <input type="text" name="credential_target" value="{{ config.credential_target or '' }}" placeholder="WinAgentRuntime/provider/openai">
+                    </label>
+                    <label>
+                        Credential Secret
+                        <input type="password" name="credential_secret" value="" placeholder="Leave blank to keep the current stored secret">
+                    </label>
+                </div>
+                <div class="grid two">
+                    <label>
+                        Privacy Tier
+                        <select name="privacy_tier">
+                            {% for value in ["local","standard","external"] %}
+                            <option value="{{ value }}" {% if config.privacy_tier == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
                     </label>
                 </div>
                 <div class="grid two">
@@ -523,6 +567,27 @@
                     Allowed Hosts
                     <input type="text" name="allowed_hosts" value="{{ config.allowed_hosts | join(',') }}">
                 </label>
+                <div class="grid two">
+                    <label>
+                        Cost Tier
+                        <select name="cost_tier">
+                            {% for value in ["low","standard","high"] %}
+                            <option value="{{ value }}" {% if config.cost_tier == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                    <label>
+                        Latency Tier
+                        <select name="latency_tier">
+                            {% for value in ["low","standard","high"] %}
+                            <option value="{{ value }}" {% if config.latency_tier == value %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </label>
+                </div>
+                {% if status %}
+                <p class="small muted">Credential available: {{ "yes" if status.credential_available else "no" }}{% if status.credential_target %} / target {{ status.credential_target }}{% endif %}</p>
+                {% endif %}
                 <label>
                     Current Password
                     <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
@@ -531,6 +596,20 @@
                     <button type="submit" class="button ghost">Save Provider Entry</button>
                 </div>
             </form>
+            {% if config.auth_source == "credential-manager" and config.credential_target %}
+            <form method="post" action="/settings/provider-config/delete-credential" class="stack form-grid mt-16" data-confirm="Delete the stored Windows credential for this provider?">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="provider_name" value="{{ config.provider_name }}">
+                <input type="hidden" name="credential_target" value="{{ config.credential_target }}">
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                </label>
+                <div class="actions">
+                    <button type="submit" class="button danger">Delete Stored Credential</button>
+                </div>
+            </form>
+            {% endif %}
 
             <form method="post" action="/settings/provider-config/reset" class="stack form-grid mt-16" data-confirm="Reset this provider entry to defaults?">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

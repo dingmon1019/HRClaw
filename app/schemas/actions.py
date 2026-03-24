@@ -139,6 +139,9 @@ class ActionHistoryRecord(BaseModel):
     provider_name: str | None = None
     manifest_hash: str | None = None
     correlation_id: str | None = None
+    execution_bundle_hash: str | None = None
+    boundary_mode: str | None = None
+    boundary_metadata: dict[str, Any] | None = None
 
 
 class ConnectorRunRecord(BaseModel):
@@ -199,6 +202,9 @@ class ExecutionJobRecord(BaseModel):
     correlation_id: str | None = None
     approval_id: str | None = None
     manifest_hash: str | None = None
+    execution_bundle_hash: str | None = None
+    boundary_mode: str | None = None
+    boundary_metadata: dict[str, Any] | None = None
 
 
 class ExecutionAttemptRecord(BaseModel):
@@ -214,3 +220,40 @@ class ExecutionAttemptRecord(BaseModel):
     result: dict[str, Any] | None = None
     error_text: str | None = None
     correlation_id: str | None = None
+    execution_bundle_hash: str | None = None
+    boundary_mode: str | None = None
+    boundary_metadata: dict[str, Any] | None = None
+
+
+class ExecutionBoundaryMetadata(BaseModel):
+    mode: str
+    isolation_level: str
+    backend: str | None = None
+    environment_scrubbed: bool = True
+    allowed_environment_keys: list[str] = Field(default_factory=list)
+    secrets_access: str = "denied"
+    database_access: str = "none"
+    filesystem_scope: list[str] = Field(default_factory=list)
+    network_scope: list[str] = Field(default_factory=list)
+    granted_file_paths: list[str] = Field(default_factory=list)
+    granted_http_targets: list[str] = Field(default_factory=list)
+    capability_tokens: list[str] = Field(default_factory=list)
+    scope_strategy: str = "connector-bounded"
+    cwd: str | None = None
+    python_executable: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+class ExecutionBundle(BaseModel):
+    proposal_id: str
+    run_id: str
+    connector: str
+    action_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    manifest_hash: str
+    approval_id: str
+    correlation_id: str | None = None
+    allowed_connectors: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    execution_settings: dict[str, Any] = Field(default_factory=dict)
+    boundary: ExecutionBoundaryMetadata

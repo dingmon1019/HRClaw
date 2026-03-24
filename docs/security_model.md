@@ -11,7 +11,8 @@ The runtime tries to reduce accidental or invisible side effects through:
 - immutable snapshot binding
 - bounded connectors
 - egress controls
-- separate worker execution
+- separate worker execution with task-scoped child-process bundles
+- provider prompt governance that separates local-only collected context from outbound-safe provider context
 - tamper-evident audit logs
 
 ## Authentication
@@ -61,6 +62,8 @@ Approvals are bound to a stored snapshot containing:
 
 Before execution, the worker verifies the exact approval record attached to the queued job, then recalculates a live snapshot. If the live state no longer matches the queued approval hashes, the proposal becomes `stale` and execution is blocked.
 
+The queue job and execution attempt also carry the execution bundle hash and boundary mode, so the operator can verify which constrained child-process bundle actually ran.
+
 ## Connector Safety
 
 ### Filesystem
@@ -100,6 +103,8 @@ There is no raw PowerShell execution path.
 - private-network provider egress block by default
 - restricted-data egress refusal by default
 - retry and fallback still stay inside policy
+- remote providers receive curated prompt variants instead of raw collected runtime context by default
+- provider prompt posture is recorded in audit metadata so operators can verify what class of prompt left the machine
 
 ## Audit
 
@@ -115,6 +120,22 @@ Each entry stores:
 
 DB audit remains enabled even when JSON file mirroring is disabled.
 
+## Execution Boundary
+
+Approved actions do not execute directly inside the web request or control-plane path.
+
+Instead, the worker:
+
+- claims the queued job
+- rebuilds the approved execution bundle
+- scrubs the child-process environment
+- launches a dedicated child Python process for the bounded connector action
+- narrows file and HTTP scope to exact task resources when the action schema allows it
+- brokers task-connector actions through the parent process instead of handing the child a general runtime DB path
+- records boundary metadata on the queue job and execution attempt
+
+This is a meaningful process boundary, but it is still not an OS sandbox.
+
 ## Sensitive Local Storage
 
 When a proposal payload includes sensitive fields such as file content, HTTP bodies, headers, or task details, the runtime stores only digests and metadata in the main proposal row. Full raw values are externalized into protected local blob storage under the secrets runtime directory.
@@ -123,10 +144,13 @@ On Windows with `pywin32` available, DPAPI protection is used. Without it, the r
 
 Session secrets, provider auth env references, and protected token files all live under the runtime secrets directory outside the repository by default.
 
+When `pywin32` exposes `win32cred`, provider auth material can be stored in and resolved from Windows Credential Manager. Without strong local protection, new secret writes fail closed unless an explicit insecure development override is enabled.
+
 ## Remaining Limits
 
 - no kernel isolation
-- no process sandboxing beyond role separation and worker boundary
+- no process sandboxing beyond role separation and the child-process worker boundary
+- no restricted-token or AppContainer backend yet
 - no hardware-backed secret storage yet
 - no RBAC yet
 - no signed audit export bundle yet

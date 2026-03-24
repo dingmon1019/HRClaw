@@ -3,6 +3,8 @@ from __future__ import annotations
 from app.audit.service import AuditService
 from app.runtime.planner import RuntimePlanner
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
+from app.schemas.agents import AgentRole
+from app.agents.service import AgentService
 from app.services.execution_queue_service import ExecutionQueueService
 from app.services.proposal_service import ProposalService
 
@@ -14,11 +16,13 @@ class AgentRuntimeService:
         queue_service: ExecutionQueueService,
         proposal_service: ProposalService,
         audit_service: AuditService,
+        agent_service: AgentService,
     ):
         self.planner = planner
         self.queue_service = queue_service
         self.proposal_service = proposal_service
         self.audit_service = audit_service
+        self.agent_service = agent_service
 
     def run_agent(self, request: AgentRunRequest):
         return self.planner.run(request)
@@ -35,6 +39,16 @@ class AgentRuntimeService:
             correlation_id=proposal.correlation_id,
         )
         self.proposal_service.set_execution_status(proposal_id, ProposalStatus.QUEUED)
+        self.agent_service.update_nodes_for_proposal(
+            proposal_id,
+            role=AgentRole.EXECUTOR,
+            status="queued",
+            details={
+                "approval_id": approval.id,
+                "job_id": job.id,
+                "manifest_hash": approval.manifest_hash,
+            },
+        )
         self.audit_service.emit(
             "proposal.approved",
             {
@@ -65,6 +79,15 @@ class AgentRuntimeService:
 
     def reject(self, proposal_id: str, decision: ApprovalDecisionRequest):
         record = self.proposal_service.reject(proposal_id, decision.actor, decision.reason)
+        self.agent_service.update_nodes_for_proposal(
+            proposal_id,
+            role=AgentRole.EXECUTOR,
+            status="blocked",
+            details={
+                "rejected_by": decision.actor,
+                "rejection_reason": decision.reason,
+            },
+        )
         self.audit_service.emit(
             "proposal.rejected",
             {

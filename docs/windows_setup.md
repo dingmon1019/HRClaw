@@ -97,6 +97,12 @@ Optional Explorer/runtime helpers:
 ```powershell
 .\scripts\open-runtime-folders.ps1
 .\scripts\show-runtime-posture.ps1
+.\scripts\pick-workspace-file.ps1
+.\scripts\install-worker-startup-task.ps1
+.\scripts\remove-worker-startup-task.ps1
+.\scripts\start-worker-startup-task.ps1
+.\scripts\stop-worker-startup-task.ps1
+.\scripts\worker-startup-task-status.ps1
 ```
 
 ## Windows Notes
@@ -104,9 +110,12 @@ Optional Explorer/runtime helpers:
 - the UI is loopback-bound by default
 - worker CLI actions use a Python-side secure password prompt or a protected short-lived token file
 - protected token-file mode is only available when strong local protection is active, or when an explicit insecure development override is enabled
+- provider catalog entries can use Windows Credential Manager targets when `pywin32` exposes `win32cred`
+- provider credentials can be created, tested, rotated, and deleted from the UI or CLI when Windows Credential Manager support is available
 - if `python` is not on PATH, use `py -3.13`
 - `pywin32` is optional; the Outlook connector fails gracefully when unavailable
 - when `pywin32` is installed, DPAPI-backed local secret protection is used automatically
+- when `pywin32` exposes `win32cred`, provider credentials can also be resolved from Windows Credential Manager
 - without DPAPI, generated session secrets, token-file mode, and sensitive blob storage fail closed unless `allow_insecure_local_storage` is explicitly enabled
 - provider-specific catalog records let you keep local-model URLs and remote API settings separate inside the UI
 
@@ -131,6 +140,18 @@ If `run-worker.ps1` reports an authentication issue, run:
 ```
 
 The script asks for the operator username in PowerShell and the Python CLI prompts for the password securely, so the password does not travel on the command line or stay in a long-lived PowerShell variable.
+
+For unattended worker startup, use a strongly protected token file and the worker startup task:
+
+```powershell
+.\scripts\install-worker-startup-task.ps1 -TokenFile worker.token
+```
+
+If strong protection is unavailable, token-file mode remains disabled unless you explicitly enable insecure local storage for development.
+
+### Windows Credential Manager unavailable
+
+If provider credential creation or lookup fails, confirm that `pywin32` is installed and that `win32cred` can be imported. Without it, the runtime falls back to environment-variable-based provider credentials and refuses protected credential-manager writes.
 
 ### Release packaging fails on local repo artifacts
 

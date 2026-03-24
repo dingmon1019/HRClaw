@@ -8,6 +8,7 @@ from app.core.database import Database
 from app.memory.service import SummaryService
 from app.policy.engine import PolicyEngine
 from app.providers.registry import ProviderRegistry
+from app.runtime.execution_boundary import ConstrainedExecutionRunner
 from app.runtime.executor import ExecutionDispatcher
 from app.runtime.planner import RuntimePlanner
 from app.runtime.service import AgentRuntimeService
@@ -15,6 +16,7 @@ from app.runtime.worker import ExecutionWorker
 from app.security.admin_token import AdminTokenService
 from app.security.protected_storage import ProtectedStorageService
 from app.security.rate_limit import RateLimiter
+from app.security.windows_credential_store import WindowsCredentialStore
 from app.services.auth_service import AuthService
 from app.services.cli_token_service import CliTokenService
 from app.services.data_governance_service import DataGovernanceService
@@ -42,6 +44,7 @@ class AppContainer:
         self.settings_service = SettingsService(self.base_settings, self.database)
         self.auth_service = AuthService(self.database)
         self.protected_storage = ProtectedStorageService(self.base_settings)
+        self.windows_credential_store = WindowsCredentialStore()
         self.session_service = SessionService(self.database, self.base_settings)
         self.admin_token_service = AdminTokenService(self.database, self.auth_service, self.base_settings)
         self.data_governance_service = DataGovernanceService(self.protected_storage)
@@ -76,6 +79,7 @@ class AppContainer:
             self.settings_service,
             self.database,
             self.audit_service,
+            self.windows_credential_store,
         )
         self.connector_registry = ConnectorRegistry(self.base_settings, self.database, self.settings_service)
 
@@ -91,6 +95,7 @@ class AppContainer:
             agent_service=self.agent_service,
             data_governance_service=self.data_governance_service,
         )
+        self.execution_boundary_runner = ConstrainedExecutionRunner(self.base_settings)
         self.executor = ExecutionDispatcher(
             connector_registry=self.connector_registry,
             proposal_service=self.proposal_service,
@@ -100,6 +105,7 @@ class AppContainer:
             snapshot_service=self.proposal_snapshot_service,
             agent_service=self.agent_service,
             data_governance_service=self.data_governance_service,
+            boundary_runner=self.execution_boundary_runner,
         )
         self.worker = ExecutionWorker(
             worker_id="local-worker",
@@ -116,4 +122,5 @@ class AppContainer:
             queue_service=self.execution_queue_service,
             proposal_service=self.proposal_service,
             audit_service=self.audit_service,
+            agent_service=self.agent_service,
         )

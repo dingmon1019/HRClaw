@@ -19,15 +19,19 @@ class HistoryService:
         provider_name: str | None = None,
         manifest_hash: str | None = None,
         correlation_id: str | None = None,
+        execution_bundle_hash: str | None = None,
+        boundary_mode: str | None = None,
+        boundary_metadata: dict | None = None,
     ) -> str:
         history_id = new_id("history")
         self.database.execute(
             """
             INSERT INTO action_history(
                 id, proposal_id, run_id, connector, action_type, status,
-                started_at, completed_at, input_json, output_json, error_text, provider_name, manifest_hash, correlation_id
+                started_at, completed_at, input_json, output_json, error_text, provider_name, manifest_hash, correlation_id,
+                execution_bundle_hash, boundary_mode, boundary_metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 history_id,
@@ -44,6 +48,9 @@ class HistoryService:
                 provider_name,
                 manifest_hash,
                 correlation_id,
+                execution_bundle_hash,
+                boundary_mode,
+                json_dumps(boundary_metadata) if boundary_metadata is not None else None,
             ),
         )
         return history_id
@@ -85,6 +92,9 @@ class HistoryService:
                 provider_name=row["provider_name"],
                 manifest_hash=row["manifest_hash"],
                 correlation_id=row["correlation_id"],
+                execution_bundle_hash=row["execution_bundle_hash"],
+                boundary_mode=row["boundary_mode"],
+                boundary_metadata=json_loads(row["boundary_metadata_json"], None),
             )
             for row in rows
         ]

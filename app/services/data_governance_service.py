@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 from app.core.utils import json_dumps, sha256_hex
 from app.schemas.actions import DataClassification
@@ -146,6 +147,17 @@ class DataGovernanceService:
             "prompt": SENSITIVE_LOCAL,
             "system_prompt": PREVIEW_ONLY,
             "summary": PREVIEW_ONLY,
+        },
+        "provider_prompt_governance": {
+            "prompt_kind": NON_SENSITIVE,
+            "selected_variant": NON_SENSITIVE,
+            "local_context_classification": NON_SENSITIVE,
+            "outbound_classification": NON_SENSITIVE,
+            "blocked_sections": PREVIEW_ONLY,
+            "sendable_sections": PREVIEW_ONLY,
+            "local_prompt_digest": NON_SENSITIVE,
+            "remote_prompt_digest": NON_SENSITIVE,
+            "routing_mode": NON_SENSITIVE,
         },
     }
     GENERIC_FIELD_CLASSES = {
@@ -359,6 +371,133 @@ class DataGovernanceService:
             )
         return overview
 
+    def classify_collected_runtime_context(
+        self,
+        request_payload: dict[str, Any],
+        collected: dict[str, Any],
+    ) -> tuple[DataClassification, list[str]]:
+        reasons: list[str] = []
+        restricted = False
+        local_only = False
+
+        if request_payload.get("file_content"):
+            restricted = True
+            reasons.append("explicit file content was supplied")
+        if request_payload.get("http_body"):
+            restricted = True
+            reasons.append("explicit HTTP body content was supplied")
+        if request_payload.get("http_headers_text"):
+            local_only = True
+            reasons.append("operator-supplied HTTP headers may contain local secrets")
+        if collected.get("tasks") is not None:
+            local_only = True
+            reasons.append("runtime task snapshot was collected from the local database")
+        if collected.get("filesystem") is not None:
+            local_only = True
+            reasons.append("local filesystem context was collected")
+        if collected.get("system") is not None:
+            local_only = True
+            reasons.append("bounded system context was collected")
+
+        if restricted:
+            return DataClassification.RESTRICTED, reasons
+        if local_only:
+            return DataClassification.LOCAL_ONLY, reasons
+        return DataClassification.EXTERNAL_OK, reasons
+
+    def build_planning_context_views(
+        self,
+        request_payload: dict[str, Any],
+        collected: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        local_classification, reasons = self.classify_collected_runtime_context(request_payload, collected)
+        local_context = deepcopy(collected)
+        remote_context = {
+            "objective": request_payload.get("objective"),
+            "request_summary": self._remote_request_summary(request_payload),
+            "collected_summary": self._remote_collected_summary(collected),
+            "governance_notes": reasons,
+        }
+        blocked_sections = [
+            key for key in ("tasks", "filesystem", "system")
+            if key in collected
+        ]
+        sendable_sections = [
+            key for key in remote_context.get("collected_summary", {})
+            if remote_context["collected_summary"].get(key) is not None
+        ]
+        governance = {
+            "local_context_classification": local_classification.value,
+            "outbound_classification": DataClassification.EXTERNAL_OK.value,
+            "blocked_sections": blocked_sections,
+            "sendable_sections": sendable_sections,
+            "reasons": reasons,
+        }
+        return local_context, remote_context, governance
+
+    def build_report_context_views(
+        self,
+        request_payload: dict[str, Any],
+        proposals: list[dict[str, Any]],
+        summary_text: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        local_context = {
+            "objective": request_payload.get("objective"),
+            "summary_text": summary_text,
+            "reviewed_proposals": proposals,
+        }
+        remote_context = {
+            "objective": request_payload.get("objective"),
+            "summary_text": self._preview_value(summary_text),
+            "reviewed_proposals": [self._proposal_prompt_view(proposal) for proposal in proposals],
+        }
+        governance = {
+            "local_context_classification": DataClassification.LOCAL_ONLY.value,
+            "outbound_classification": DataClassification.EXTERNAL_OK.value,
+            "blocked_sections": ["raw_proposal_payloads"],
+            "sendable_sections": ["summary_text", "reviewed_proposals"],
+            "reasons": ["review output was curated before provider egress"],
+        }
+        return local_context, remote_context, governance
+
+    def build_prompt_variants(
+        self,
+        *,
+        prompt_kind: str,
+        local_prompt: str,
+        remote_prompt: str,
+        local_classification: DataClassification,
+        outbound_classification: DataClassification,
+        system_prompt: str | None,
+        governance: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "prompt_variants": {
+                "local": {
+                    "prompt": local_prompt,
+                    "system_prompt": system_prompt,
+                    "data_classification": local_classification.value,
+                    "routing_mode": "local-context",
+                },
+                "remote": {
+                    "prompt": remote_prompt,
+                    "system_prompt": system_prompt,
+                    "data_classification": outbound_classification.value,
+                    "routing_mode": "curated-egress",
+                },
+            },
+            "prompt_governance": {
+                "prompt_kind": prompt_kind,
+                "local_context_classification": local_classification.value,
+                "outbound_classification": outbound_classification.value,
+                "blocked_sections": governance.get("blocked_sections", []),
+                "sendable_sections": governance.get("sendable_sections", []),
+                "reasons": governance.get("reasons", []),
+                "local_prompt_digest": sha256_hex(local_prompt),
+                "remote_prompt_digest": sha256_hex(remote_prompt),
+            },
+        }
+
     def classify_field(
         self,
         field_name: str,
@@ -452,3 +591,124 @@ class DataGovernanceService:
             else:
                 sanitized[key] = self._preview_value(str(value))
         return sanitized
+
+    def _remote_request_summary(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        if request_payload.get("filesystem_path"):
+            summary["filesystem_requested"] = True
+        if request_payload.get("http_url"):
+            summary["http_request"] = {
+                "method": (request_payload.get("http_method") or "GET").upper(),
+                "target": self._safe_url_summary(request_payload.get("http_url")),
+                "body_present": bool(request_payload.get("http_body")),
+                "headers_present": bool(request_payload.get("http_headers_text")),
+            }
+        if request_payload.get("task_title"):
+            summary["task_request"] = {
+                "title_preview": self._preview_value(request_payload.get("task_title") or ""),
+                "details_present": bool(request_payload.get("task_details")),
+            }
+        if request_payload.get("system_action"):
+            summary["system_request"] = {
+                "action": request_payload.get("system_action"),
+                "path_redacted": bool(request_payload.get("system_path")),
+            }
+        return summary
+
+    def _remote_collected_summary(self, collected: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        if "tasks" in collected:
+            summary["tasks"] = self._summarize_tasks_context(collected.get("tasks") or {})
+        if "filesystem" in collected:
+            summary["filesystem"] = self._summarize_filesystem_context(collected.get("filesystem") or {})
+        if "system" in collected:
+            summary["system"] = self._summarize_system_context(collected.get("system") or {})
+        if "http" in collected:
+            summary["http"] = self._summarize_http_context(collected.get("http") or {})
+        return summary
+
+    def _proposal_prompt_view(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        payload = proposal.get("payload") or {}
+        connector = proposal.get("connector")
+        action_type = proposal.get("action_type")
+        return {
+            "id": proposal.get("id"),
+            "title": proposal.get("title"),
+            "connector": connector,
+            "action_type": action_type,
+            "description": proposal.get("description"),
+            "risk_level": proposal.get("risk_level"),
+            "status": proposal.get("status"),
+            "requires_approval": proposal.get("requires_approval"),
+            "rationale": self._preview_value(proposal.get("rationale")),
+            "policy_notes": [self._preview_value(note) for note in proposal.get("policy_notes") or []],
+            "data_classification": proposal.get("data_classification"),
+            "payload_preview": self.sanitize_for_history(
+                payload,
+                action_type=action_type,
+                connector=connector,
+                object_type="proposal_payload",
+            ),
+        }
+
+    def _summarize_tasks_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        tasks = payload.get("tasks") or []
+        status_counts: dict[str, int] = {}
+        for item in tasks:
+            status = str((item or {}).get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+        return {
+            "task_snapshot_present": True,
+            "task_count": len(tasks),
+            "status_counts": status_counts,
+            "details_redacted": True,
+        }
+
+    def _summarize_filesystem_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        kind = payload.get("kind") or "unknown"
+        summary = {
+            "present": True,
+            "kind": kind,
+            "path_redacted": bool(payload.get("path")),
+        }
+        if kind == "directory":
+            summary["entry_count"] = payload.get("entry_count", len(payload.get("entries") or []))
+        if kind == "file":
+            summary["size_bytes"] = payload.get("size_bytes")
+            summary["preview_redacted"] = True
+        if payload.get("error"):
+            summary["error"] = self._preview_value(payload.get("error"))
+        return summary
+
+    def _summarize_system_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "present": True,
+            "path_redacted": bool(payload.get("path")),
+            "entries_count": len(payload.get("entries") or []),
+            "preview_redacted": "preview" in payload,
+            "exists": payload.get("exists"),
+            "is_file": payload.get("is_file"),
+            "is_dir": payload.get("is_dir"),
+        }
+
+    def _summarize_http_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = payload.get("headers") or {}
+        content_type = headers.get("content-type") or headers.get("Content-Type")
+        return {
+            "present": True,
+            "target": self._safe_url_summary(payload.get("url")),
+            "status_code": payload.get("status_code"),
+            "content_type": self._preview_value(str(content_type or "")),
+            "body_preview": self._preview_value(payload.get("body_preview") or ""),
+        }
+
+    @staticmethod
+    def _safe_url_summary(url: str | None) -> dict[str, str] | None:
+        if not url:
+            return None
+        parsed = urlsplit(url)
+        return {
+            "scheme": parsed.scheme,
+            "host": parsed.hostname or "",
+            "path": parsed.path[:128],
+        }

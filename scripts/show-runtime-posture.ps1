@@ -38,6 +38,19 @@ else {
     Write-Host "Protection   : unknown"
 }
 
+if (Get-Command py -ErrorAction SilentlyContinue) {
+    try {
+        $credManager = & py -c "import importlib.util; print('credential-manager-available' if importlib.util.find_spec('win32cred') else 'credential-manager-unavailable')" 2>$null
+        Write-Host "Cred Store   : $credManager"
+    }
+    catch {
+        Write-Host "Cred Store   : unknown"
+    }
+}
+else {
+    Write-Host "Cred Store   : unknown"
+}
+
 if (Test-Path $sessionSecret) {
     Write-Host "Session File : present"
 }

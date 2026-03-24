@@ -23,7 +23,7 @@ class OpenAIProvider(BaseProvider):
             return False
 
     def complete(self, request: ProviderRequest, settings: EffectiveSettings) -> ProviderResponse:
-        api_key = self.env_value(settings.api_key_env)
+        api_key = self.resolve_secret(request, settings.api_key_env)
         base_url = (settings.base_url or "https://api.openai.com/v1").rstrip("/")
         response = self._post_chat_completion(
             url=f"{base_url}/chat/completions",
@@ -88,7 +88,7 @@ class OpenAICompatibleProvider(OpenAIProvider):
             raise ProviderError("base_url is required for the openai-compatible provider.")
         headers: dict[str, str] = {}
         try:
-            headers["Authorization"] = f"Bearer {self.env_value(settings.api_key_env)}"
+            headers["Authorization"] = f"Bearer {self.resolve_secret(request, settings.api_key_env)}"
         except ProviderError:
             headers = {}
         response = self._post_chat_completion(
@@ -128,7 +128,7 @@ class GenericHTTPProvider(BaseProvider):
         }
         headers = {"Content-Type": "application/json"}
         try:
-            headers["Authorization"] = f"Bearer {self.env_value(settings.api_key_env)}"
+            headers["Authorization"] = f"Bearer {self.resolve_secret(request, settings.api_key_env)}"
         except ProviderError:
             pass
         data = post_json(url=endpoint, headers=headers, payload=payload, settings=settings)
@@ -171,7 +171,7 @@ class AnthropicProvider(BaseProvider):
             return False
 
     def complete(self, request: ProviderRequest, settings: EffectiveSettings) -> ProviderResponse:
-        api_key = self.env_value(self.base_settings.anthropic_api_key_env)
+        api_key = self.resolve_secret(request, self.base_settings.anthropic_api_key_env)
         payload = {
             "model": request.model_name or settings.model,
             "max_tokens": 512,
@@ -217,7 +217,7 @@ class GeminiProvider(BaseProvider):
             return False
 
     def complete(self, request: ProviderRequest, settings: EffectiveSettings) -> ProviderResponse:
-        api_key = self.env_value(self.base_settings.gemini_api_key_env)
+        api_key = self.resolve_secret(request, self.base_settings.gemini_api_key_env)
         model_name = request.model_name or settings.model
         payload = {
             "system_instruction": {

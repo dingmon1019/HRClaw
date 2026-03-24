@@ -66,19 +66,56 @@ class ExecutionWorker:
             },
         )
         try:
+            self.agent_service.update_nodes_for_proposal(
+                job.proposal_id,
+                role=AgentRole.EXECUTOR,
+                status="running",
+                details={"job_id": job.id, "worker_id": self.worker_id},
+                agent_run_id=executor_run.id,
+            )
             self.queue_service.heartbeat(job.id, self.worker_id, self.base_settings.worker_lease_seconds)
-            result = self.dispatcher.execute_approved(
+            result, boundary_metadata, execution_bundle_hash = self.dispatcher.execute_approved(
                 job.proposal_id,
                 approval_id=job.approval_id,
                 expected_manifest_hash=job.manifest_hash,
                 executor_agent=executor_agent,
+                heartbeat_callback=lambda: self.queue_service.heartbeat(
+                    job.id,
+                    self.worker_id,
+                    self.base_settings.worker_lease_seconds,
+                ),
+            )
+            self.queue_service.record_boundary(
+                job.id,
+                self.worker_id,
+                execution_bundle_hash=execution_bundle_hash,
+                boundary_mode=boundary_metadata.mode,
+                boundary_metadata=boundary_metadata.model_dump(mode="json"),
             )
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.EXECUTED, result=result)
+            self.agent_service.update_nodes_for_proposal(
+                job.proposal_id,
+                role=AgentRole.EXECUTOR,
+                status="completed",
+                details={
+                    "job_id": job.id,
+                    "worker_id": self.worker_id,
+                    "execution_bundle_hash": execution_bundle_hash,
+                    "boundary_mode": boundary_metadata.mode,
+                },
+                provider_name="local-worker",
+                agent_run_id=executor_run.id,
+            )
             self.agent_service.complete_run(
                 executor_run.id,
                 status="completed",
                 output_payload=self.data_governance_service.sanitize_for_history(
-                    {"result": result, "job_id": job.id},
+                    {
+                        "result": result,
+                        "job_id": job.id,
+                        "execution_bundle_hash": execution_bundle_hash,
+                        "boundary_mode": boundary_metadata.mode,
+                    },
                     object_type="agent_output",
                     action_type=proposal.action_type,
                     connector=proposal.connector,
@@ -93,12 +130,22 @@ class ExecutionWorker:
                     "proposal_id": job.proposal_id,
                     "worker_id": self.worker_id,
                     "manifest_hash": job.manifest_hash,
+                    "execution_bundle_hash": execution_bundle_hash,
+                    "boundary_mode": boundary_metadata.mode,
                     "correlation_id": job.correlation_id,
                 },
             )
             return result
         except ValueError as exc:
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.BLOCKED, error_text=str(exc))
+            self.agent_service.update_nodes_for_proposal(
+                job.proposal_id,
+                role=AgentRole.EXECUTOR,
+                status="blocked",
+                details={"job_id": job.id, "worker_id": self.worker_id, "error": str(exc)},
+                provider_name="local-worker",
+                agent_run_id=executor_run.id,
+            )
             self.agent_service.complete_run(
                 executor_run.id,
                 status="blocked",
@@ -122,6 +169,14 @@ class ExecutionWorker:
             raise
         except Exception as exc:
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.FAILED, error_text=str(exc))
+            self.agent_service.update_nodes_for_proposal(
+                job.proposal_id,
+                role=AgentRole.EXECUTOR,
+                status="failed",
+                details={"job_id": job.id, "worker_id": self.worker_id, "error": str(exc)},
+                provider_name="local-worker",
+                agent_run_id=executor_run.id,
+            )
             self.agent_service.complete_run(
                 executor_run.id,
                 status="failed",

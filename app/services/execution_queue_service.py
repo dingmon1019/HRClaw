@@ -39,6 +39,7 @@ class ExecutionQueueService:
                 SET status = ?, queued_by = ?, queued_at = ?, started_at = NULL, finished_at = NULL,
                     worker_id = NULL, result_json = NULL, error_text = NULL, lease_expires_at = NULL,
                     last_heartbeat_at = NULL, approval_id = ?, manifest_hash = ?, correlation_id = ?, dead_letter_reason = NULL,
+                    execution_bundle_hash = NULL, boundary_mode = NULL, boundary_metadata_json = NULL,
                     attempt_count = 0
                 WHERE proposal_id = ?
                 """,
@@ -53,9 +54,10 @@ class ExecutionQueueService:
             INSERT INTO execution_jobs(
                 id, proposal_id, run_id, status, queued_by, queued_at, started_at, finished_at,
                 worker_id, result_json, error_text, lease_expires_at, last_heartbeat_at,
-                attempt_count, correlation_id, approval_id, manifest_hash, dead_letter_reason
+                attempt_count, correlation_id, approval_id, manifest_hash, execution_bundle_hash,
+                boundary_mode, boundary_metadata_json, dead_letter_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -75,6 +77,9 @@ class ExecutionQueueService:
                 correlation_id,
                 approval_id,
                 manifest_hash,
+                None,
+                None,
+                None,
                 None,
             ),
         )
@@ -164,6 +169,34 @@ class ExecutionQueueService:
         )
         return self.get(job_id)
 
+    def record_boundary(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        execution_bundle_hash: str,
+        boundary_mode: str,
+        boundary_metadata: dict,
+    ) -> ExecutionJobRecord:
+        metadata_json = json_dumps(boundary_metadata)
+        self.database.execute(
+            """
+            UPDATE execution_jobs
+            SET execution_bundle_hash = ?, boundary_mode = ?, boundary_metadata_json = ?
+            WHERE id = ? AND worker_id = ?
+            """,
+            (execution_bundle_hash, boundary_mode, metadata_json, job_id, worker_id),
+        )
+        self.database.execute(
+            """
+            UPDATE execution_attempts
+            SET execution_bundle_hash = ?, boundary_mode = ?, boundary_metadata_json = ?
+            WHERE job_id = ? AND worker_id = ? AND status = 'running'
+            """,
+            (execution_bundle_hash, boundary_mode, metadata_json, job_id, worker_id),
+        )
+        return self.get(job_id)
+
     def mark_finished(
         self,
         job_id: str,
@@ -240,9 +273,10 @@ class ExecutionQueueService:
             """
             INSERT INTO execution_attempts(
                 id, job_id, attempt_number, status, worker_id, started_at, finished_at,
-                lease_expires_at, heartbeat_at, result_json, error_text, correlation_id
+                lease_expires_at, heartbeat_at, result_json, error_text, correlation_id,
+                execution_bundle_hash, boundary_mode, boundary_metadata_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 attempt_id,
@@ -257,6 +291,9 @@ class ExecutionQueueService:
                 None,
                 None,
                 correlation_id,
+                None,
+                None,
+                None,
             ),
         )
         row = conn.execute("SELECT * FROM execution_attempts WHERE id = ?", (attempt_id,)).fetchone()
@@ -282,6 +319,9 @@ class ExecutionQueueService:
             correlation_id=row["correlation_id"],
             approval_id=row["approval_id"],
             manifest_hash=row["manifest_hash"],
+            execution_bundle_hash=row["execution_bundle_hash"],
+            boundary_mode=row["boundary_mode"],
+            boundary_metadata=json_loads(row["boundary_metadata_json"], None),
         )
 
     @staticmethod
@@ -299,4 +339,7 @@ class ExecutionQueueService:
             result=json_loads(row["result_json"], None),
             error_text=row["error_text"],
             correlation_id=row["correlation_id"],
+            execution_bundle_hash=row["execution_bundle_hash"],
+            boundary_mode=row["boundary_mode"],
+            boundary_metadata=json_loads(row["boundary_metadata_json"], None),
         )

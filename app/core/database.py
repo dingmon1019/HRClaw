@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS action_history (
     provider_name TEXT,
     manifest_hash TEXT,
     correlation_id TEXT,
+    execution_bundle_hash TEXT,
+    boundary_mode TEXT,
+    boundary_metadata_json TEXT,
     FOREIGN KEY(proposal_id) REFERENCES proposals(id)
 );
 
@@ -168,6 +171,9 @@ CREATE TABLE IF NOT EXISTS execution_jobs (
     correlation_id TEXT,
     approval_id TEXT,
     manifest_hash TEXT,
+    execution_bundle_hash TEXT,
+    boundary_mode TEXT,
+    boundary_metadata_json TEXT,
     dead_letter_reason TEXT,
     FOREIGN KEY(proposal_id) REFERENCES proposals(id)
 );
@@ -256,6 +262,10 @@ CREATE TABLE IF NOT EXISTS task_nodes (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL,
     parent_task_node_id TEXT,
+    proposal_id TEXT,
+    branch_key TEXT,
+    context_namespace TEXT,
+    merge_key TEXT,
     agent_id TEXT,
     agent_run_id TEXT,
     handoff_id TEXT,
@@ -285,6 +295,9 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     result_json TEXT,
     error_text TEXT,
     correlation_id TEXT,
+    execution_bundle_hash TEXT,
+    boundary_mode TEXT,
+    boundary_metadata_json TEXT,
     FOREIGN KEY(job_id) REFERENCES execution_jobs(id)
 );
 
@@ -306,6 +319,10 @@ CREATE TABLE IF NOT EXISTS provider_configs (
     default_model TEXT,
     allowed_hosts_json TEXT NOT NULL DEFAULT '[]',
     auth_source TEXT NOT NULL DEFAULT 'env',
+    credential_target TEXT,
+    cost_tier TEXT NOT NULL DEFAULT 'standard',
+    latency_tier TEXT NOT NULL DEFAULT 'standard',
+    privacy_tier TEXT NOT NULL DEFAULT 'standard',
     updated_at TEXT NOT NULL
 );
 
@@ -326,6 +343,7 @@ CREATE INDEX IF NOT EXISTS idx_proposal_snapshots_proposal ON proposal_snapshots
 CREATE INDEX IF NOT EXISTS idx_agent_runs_run_id ON agent_runs(run_id, started_at ASC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_task_nodes_run_id ON task_nodes(run_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_task_nodes_proposal_id ON task_nodes(proposal_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_execution_attempts_job_id ON execution_attempts(job_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id, expires_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cli_tokens_user_id ON cli_tokens(user_id, expires_at DESC);
@@ -395,6 +413,9 @@ class Database:
                 "provider_name": "TEXT",
                 "manifest_hash": "TEXT",
                 "correlation_id": "TEXT",
+                "execution_bundle_hash": "TEXT",
+                "boundary_mode": "TEXT",
+                "boundary_metadata_json": "TEXT",
             },
             "connector_runs": {
                 "agent_id": "TEXT",
@@ -408,11 +429,31 @@ class Database:
                 "correlation_id": "TEXT",
                 "approval_id": "TEXT",
                 "manifest_hash": "TEXT",
+                "execution_bundle_hash": "TEXT",
+                "boundary_mode": "TEXT",
+                "boundary_metadata_json": "TEXT",
                 "dead_letter_reason": "TEXT",
             },
             "proposal_snapshots": {
                 "manifest_hash": "TEXT NOT NULL DEFAULT ''",
                 "manifest_json": "TEXT NOT NULL DEFAULT '{}'",
+            },
+            "execution_attempts": {
+                "execution_bundle_hash": "TEXT",
+                "boundary_mode": "TEXT",
+                "boundary_metadata_json": "TEXT",
+            },
+            "task_nodes": {
+                "proposal_id": "TEXT",
+                "branch_key": "TEXT",
+                "context_namespace": "TEXT",
+                "merge_key": "TEXT",
+            },
+            "provider_configs": {
+                "credential_target": "TEXT",
+                "cost_tier": "TEXT NOT NULL DEFAULT 'standard'",
+                "latency_tier": "TEXT NOT NULL DEFAULT 'standard'",
+                "privacy_tier": "TEXT NOT NULL DEFAULT 'standard'",
             },
         }
         for table_name, columns in migrations.items():

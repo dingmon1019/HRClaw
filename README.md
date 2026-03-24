@@ -11,9 +11,10 @@ The project is designed to be safer and more usable for Windows localhost operat
 - assistant-style natural language workbench
 - operator control console for approvals and audit
 - proposal-first execution with approval snapshot binding
-- separate worker execution boundary
+- separate worker execution boundary with task-scoped child-process bundles
 - bounded local connectors only, no raw shell execution
-- multi-provider routing with egress controls
+- multi-provider routing with egress controls, scoring, and provider-specific governance records
+- provider prompt governance that keeps raw local runtime context local by default and sends only curated outbound-safe summaries to remote providers
 - SQLite-backed persistence, audit, task graph history, and clean release packaging
 
 ## Why This Exists
@@ -24,6 +25,7 @@ Many local agent stacks either optimize for raw autonomy or assume Linux-first t
 - localhost apps still need authentication, CSRF protection, and auditability
 - approvals only matter if they are bound to what actually runs
 - provider routing is part of the egress threat model
+- provider governance should explain why a provider was chosen, not just which provider happened to answer
 - an assistant UX should not force the operator to think in connector schemas first
 
 ## What This Project Is
@@ -82,13 +84,13 @@ Major layers:
 
 More detail:
 
-- [architecture](D:/User_Data/Documents/Playground/win-agent-runtime/docs/architecture.md)
-- [multi-agent model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/multi_agent.md)
-- [provider model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/provider_model.md)
-- [security model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/security_model.md)
-- [threat model](D:/User_Data/Documents/Playground/win-agent-runtime/docs/threat_model.md)
-- [Windows setup](D:/User_Data/Documents/Playground/win-agent-runtime/docs/windows_setup.md)
-- [release hygiene](D:/User_Data/Documents/Playground/win-agent-runtime/docs/release_hygiene.md)
+- [architecture](docs/architecture.md)
+- [multi-agent model](docs/multi_agent.md)
+- [provider model](docs/provider_model.md)
+- [security model](docs/security_model.md)
+- [threat model](docs/threat_model.md)
+- [Windows setup](docs/windows_setup.md)
+- [release hygiene](docs/release_hygiene.md)
 
 ## Multi-Agent Model
 
@@ -143,6 +145,7 @@ Implemented controls:
 - provider egress policy on host allowlists and restricted-data handling
 - protected local blob storage for sensitive payload fields with DPAPI when available
 - fail-closed blob and secret-text storage unless strong protection exists or an explicit insecure override is enabled
+- provider prompt curation so remote planning and reporting prompts receive sanitized summaries instead of raw local task or filesystem context by default
 - hash-chained audit trail with verification
 
 Important limit:
@@ -221,12 +224,15 @@ Provider orchestration features:
 - summary/planning profile selection
 - provider egress allowlist
 - restricted-data refusal unless explicitly overridden
+- all enabled providers can enter the candidate pool when policy and capability checks allow it
+- observed latency EWMA, success rate, failure streak, and last error category influence routing
 
 Auth model:
 
-- environment variables only
+- environment variables or optional Windows Credential Manager targets
 - no hardcoded secrets
 - no fake subscription-token reuse
+- remote providers receive curated outbound-safe prompt variants when local-only data is present
 
 ## Execution Worker Model
 
@@ -248,6 +254,17 @@ Worker safety improvements:
 - lease and heartbeat fields
 - stale running job recovery
 - dead-letter handling after repeated failures
+- task-scoped execution bundles executed in a scrubbed child process
+- exact granted file paths and HTTP targets recorded in boundary metadata when the action schema allows it
+- brokered task actions so the child process does not receive a generic runtime DB path for task-connector work
+- boundary metadata persisted on queue jobs, execution attempts, run history, and audit events
+
+Important execution-boundary limit:
+
+- this is process isolation only
+- the child worker is not an OS sandbox
+- the child worker still runs as the same local user account
+- future Windows restricted-token or AppContainer style backends are not implemented yet
 
 ## Windows-First Setup
 
@@ -285,6 +302,18 @@ Run worker:
 .\scripts\run-worker.ps1
 ```
 
+Optional Windows worker/background helpers:
+
+```powershell
+.\scripts\install-worker-startup-task.ps1
+.\scripts\remove-worker-startup-task.ps1
+.\scripts\start-worker-startup-task.ps1
+.\scripts\stop-worker-startup-task.ps1
+.\scripts\worker-startup-task-status.ps1
+.\scripts\pick-workspace-file.ps1
+.\scripts\show-runtime-posture.ps1
+```
+
 Optional Windows startup task for the localhost console:
 
 ```powershell
@@ -303,7 +332,7 @@ Suggested first-run flow:
 2. Create the first operator account
 3. Open the Assistant Workbench
 4. Enter a natural language goal
-5. Review the task graph and proposals
+5. Review the task graph, dependency edges, and proposals
 6. Approve or reject specific steps
 7. Let the worker execute approved work
 8. Inspect history, audit verification, and snapshot status
@@ -336,6 +365,8 @@ python -m app.cli run-worker --once --token-file worker.token
 
 `.\scripts\run-worker.ps1` asks only for the operator username in PowerShell and lets the Python CLI prompt for the password securely, so the password does not live in PowerShell argv or a long-lived shell variable. Protected token-file mode remains an advanced path only and now fails closed when strong local protection is unavailable unless an explicit insecure development override is enabled.
 
+Provider secrets can also be created, tested, rotated, and deleted through Windows Credential Manager when `pywin32` exposes `win32cred`.
+
 ## Testing
 
 Run the test suite:
@@ -355,10 +386,11 @@ Current automated coverage includes:
 - filesystem allowlist and symlink blocking
 - bounded system action policy
 - provider fallback and restricted egress behavior
+- provider prompt governance and routing explanations
 - protected storage fail-closed behavior
 - release packaging allowlist verification
 - audit integrity verification
-- multi-agent run, handoff, and task-node persistence
+- multi-agent run, handoff, task-node persistence, and graph scheduling
 
 ## Release Hygiene
 
@@ -411,7 +443,7 @@ Before publishing a release, verify:
 
 Planned next steps:
 
-- stronger Windows secret storage, including optional Credential Manager support
+- stronger Windows worker isolation beyond the current same-user child-process boundary
 - richer Windows notifications and true service-mode worker isolation
 - per-user RBAC and approval scopes
 - stronger worker isolation options
@@ -430,4 +462,4 @@ Contributions should preserve the trust model:
 
 ## License
 
-MIT. See [LICENSE](D:/User_Data/Documents/Playground/win-agent-runtime/LICENSE).
+MIT. See [LICENSE](LICENSE).
