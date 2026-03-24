@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from app.core.errors import ConnectorError
+from app.policy.network_guard import validate_url
 from app.schemas.actions import ActionProposal, ProposalStatus
 
 
@@ -96,3 +100,29 @@ def test_policy_blocks_unknown_system_action(container):
 
     assert evaluated.status == ProposalStatus.BLOCKED
     assert any("not allowed" in note for note in evaluated.policy_notes)
+
+
+def test_validate_url_allows_public_hostname_without_dns_dependency():
+    host, port = validate_url(
+        "https://example.com/api",
+        allowed_schemes=["https"],
+        allowed_ports=[443],
+        allowed_hosts=["example.com"],
+        allow_private_network=False,
+        purpose="http connector",
+    )
+
+    assert host == "example.com"
+    assert port == 443
+
+
+def test_validate_url_blocks_localhost_literal_without_dns():
+    with pytest.raises(ConnectorError, match="blocked"):
+        validate_url(
+            "http://localhost:8000/health",
+            allowed_schemes=["http"],
+            allowed_ports=[8000],
+            allowed_hosts=["localhost"],
+            allow_private_network=False,
+            purpose="http connector",
+        )

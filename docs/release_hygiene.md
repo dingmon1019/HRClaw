@@ -48,6 +48,14 @@ CI-oriented packaging is supported:
 .\scripts\package-release.ps1 -Version <tag> -CI
 ```
 
+Safe collaborator handoff uses a separate artifact mode:
+
+```powershell
+.\scripts\export-handoff.ps1 -Version handoff -Clean
+```
+
+Handoff bundles exclude the same forbidden runtime artifacts as release zips and also fail preflight when stale `dist/` outputs are still present in the working tree.
+
 Existing archives can be re-verified:
 
 ```powershell
@@ -75,6 +83,7 @@ Forbidden content for release archives includes:
 - `data/`
 - `runtime_workspace/`
 - `workspace/`
+- `dist/` for handoff exports
 - runtime DBs, audit logs, session secrets, and protected blob files
 
 This project is safer than a basic localhost agent wrapper, but it is still not an OS-level sandbox release. Release notes should stay honest about that boundary.

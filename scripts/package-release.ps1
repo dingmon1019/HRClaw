@@ -1,5 +1,7 @@
 param(
     [string]$Version = "local",
+    [ValidateSet("release", "handoff")]
+    [string]$Mode = "release",
     [switch]$VerifyWorkingTree,
     [switch]$AllowDirtyWorkingTree,
     [switch]$Clean,
@@ -12,7 +14,7 @@ if (-not (Test-Path $python)) {
     throw "Virtual environment not found. Run .\scripts\bootstrap.ps1 first."
 }
 
-$args = @(".\scripts\package_release.py", "--version", $Version)
+$args = @(".\scripts\package_release.py", "--version", $Version, "--mode", $Mode)
 if ($VerifyArchive) {
     $args = @(".\scripts\package_release.py", "--verify-archive", $VerifyArchive)
 }

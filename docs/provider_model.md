@@ -17,13 +17,15 @@ Core rules:
 - provider base URLs are still subject to outbound policy checks
 - each provider has its own persisted config record
 - each provider can be enabled or disabled independently
-- each provider can carry its own model default, auth source, credential target, base URL, allowed-host list, and routing posture
+- each provider can carry its own model default, auth source, credential target, base URL, allowed-host list, budget ceiling, and routing posture
 - provider requests can be routed by profile: `fast`, `cheap`, `strong`, `local-only`, `privacy-preferred`
 - provider fallback is allowed only across configured candidates
 - circuit breaker state is tracked, persisted in SQLite provider health rows, and surfaced in the UI
 - provider scoring considers capability fit, privacy, cost, latency, and recent success/failure history
 - provider routing considers every enabled configured provider that satisfies policy and capability requirements, not only a narrow fallback chain
 - remote provider requests use curated outbound-safe prompt variants when local-only data was collected during planning or reporting
+- provider status distinguishes actual endpoint locality such as `local-native`, `local-gateway`, and `remote-endpoint`
+- model inventory metadata records planning, review, report, and structured-output fit
 
 Egress controls apply to providers the same way they apply to HTTP connector usage:
 
@@ -39,10 +41,11 @@ Egress controls apply to providers the same way they apply to HTTP connector usa
 Operator visibility:
 
 - the Settings page exposes a provider catalog instead of a single global provider form
-- the catalog shows enabled state, capabilities, auth source, configured destinations, routing posture, reliability counters, and which runtime profiles point at that provider
+- the catalog shows enabled state, capabilities, auth source, configured destinations, endpoint locality, model inventory, budget posture, reliability counters, and which runtime profiles point at that provider
 - run history and task graph views show which provider each agent role used
 - routing decisions are emitted into audit/log flows so operators can see why a provider was selected
 - observed latency EWMA, success rate, failure streak, and last error category are shown in the provider catalog
+- provider credential checks can be performed from the provider catalog when Windows Credential Manager is available
 
 Data classes:
 
@@ -65,5 +68,8 @@ Routing inputs include:
 - cost tier
 - observed latency
 - recent failure history
+- endpoint locality
+- model fit
+- budget ceiling / usage
 
 This project does not support fake credential reuse models. Chat UI session cookies or subscription tokens are not treated as general API credentials.

@@ -444,6 +444,7 @@ class SettingsService:
             cost_tier=row["cost_tier"] or defaults.cost_tier,
             latency_tier=row["latency_tier"] or defaults.latency_tier,
             privacy_tier=row["privacy_tier"] or defaults.privacy_tier,
+            budget_limit_units=row["budget_limit_units"] if row["budget_limit_units"] is not None else defaults.budget_limit_units,
             updated_at=row["updated_at"],
         )
 
@@ -514,6 +515,7 @@ class SettingsService:
             cost_tier=str(merged.get("cost_tier", "standard")),
             latency_tier=str(merged.get("latency_tier", "standard")),
             privacy_tier=str(merged.get("privacy_tier", "standard")),
+            budget_limit_units=merged.get("budget_limit_units"),
             updated_at=None,
         )
 
@@ -530,9 +532,9 @@ class SettingsService:
             """
             INSERT INTO provider_configs(
                 provider_name, enabled, base_url, generic_http_endpoint, api_key_env, default_model,
-                allowed_hosts_json, auth_source, credential_target, cost_tier, latency_tier, privacy_tier, updated_at
+                allowed_hosts_json, auth_source, credential_target, cost_tier, latency_tier, privacy_tier, budget_limit_units, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_name) DO UPDATE SET
                 enabled = excluded.enabled,
                 base_url = excluded.base_url,
@@ -545,6 +547,7 @@ class SettingsService:
                 cost_tier = excluded.cost_tier,
                 latency_tier = excluded.latency_tier,
                 privacy_tier = excluded.privacy_tier,
+                budget_limit_units = excluded.budget_limit_units,
                 updated_at = excluded.updated_at
             """,
             (
@@ -560,6 +563,7 @@ class SettingsService:
                 update.cost_tier,
                 update.latency_tier,
                 update.privacy_tier,
+                update.budget_limit_units,
                 updated_at,
             ),
         )

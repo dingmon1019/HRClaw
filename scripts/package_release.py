@@ -12,6 +12,7 @@ import zipfile
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DIST_DIR = ROOT_DIR / "dist"
 ARCHIVE_PREFIX = "win-agent-runtime"
+HANDOFF_ARCHIVE_PREFIX = "win-agent-runtime-handoff"
 ALLOWED_PATHS = (
     ".env.example",
     ".gitignore",
@@ -112,9 +113,9 @@ def _validate_relative(relative: Path) -> None:
             raise ValueError(f"Forbidden file suffix detected in release manifest: {relative.as_posix()}")
 
 
-def verify_working_tree(root: Path) -> list[str]:
+def verify_working_tree(root: Path, *, include_dist: bool = False) -> list[str]:
     findings: list[str] = []
-    for name in [
+    names = [
         ".venv",
         ".codex-pkgs",
         ".codex-venv",
@@ -122,16 +123,25 @@ def verify_working_tree(root: Path) -> list[str]:
         "data",
         "runtime_workspace",
         "workspace",
-    ]:
+    ]
+    if include_dist:
+        names.append("dist")
+    for name in names:
         if (root / name).exists():
             findings.append(name)
     return findings
 
 
-def build_archive(root: Path, *, version: str | None = None) -> PackageResult:
+def build_archive(
+    root: Path,
+    *,
+    version: str | None = None,
+    archive_prefix: str = ARCHIVE_PREFIX,
+    artifact_kind: str = "release",
+) -> PackageResult:
     DIST_DIR.mkdir(parents=True, exist_ok=True)
     suffix = version or "local"
-    archive_path = DIST_DIR / f"{ARCHIVE_PREFIX}-{suffix}.zip"
+    archive_path = DIST_DIR / f"{archive_prefix}-{suffix}.zip"
     if archive_path.exists():
         archive_path.unlink()
 
@@ -139,7 +149,8 @@ def build_archive(root: Path, *, version: str | None = None) -> PackageResult:
     included_paths: list[str] = []
     revision = _git_revision(root)
     manifest = {
-        "archive_prefix": ARCHIVE_PREFIX,
+        "archive_prefix": archive_prefix,
+        "artifact_kind": artifact_kind,
         "version": suffix,
         "build_time_utc": datetime.now(timezone.utc).isoformat(),
         "git_revision": revision,
@@ -159,11 +170,11 @@ def build_archive(root: Path, *, version: str | None = None) -> PackageResult:
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as handle:
         for absolute, relative in _iter_allowed_files(root):
             _validate_relative(relative)
-            archive_relative = Path(f"{ARCHIVE_PREFIX}-{suffix}") / relative
+            archive_relative = Path(f"{archive_prefix}-{suffix}") / relative
             handle.write(absolute, archive_relative.as_posix())
             file_count += 1
             included_paths.append(relative.as_posix())
-        manifest_relative = Path(f"{ARCHIVE_PREFIX}-{suffix}") / "release_manifest.json"
+        manifest_relative = Path(f"{archive_prefix}-{suffix}") / "release_manifest.json"
         manifest["included_paths"] = sorted(included_paths)
         handle.writestr(
             manifest_relative.as_posix(),
@@ -179,6 +190,15 @@ def build_archive(root: Path, *, version: str | None = None) -> PackageResult:
         revision=revision,
         archive_sha256=archive_sha256,
         sha256_path=sha256_path,
+    )
+
+
+def build_handoff_archive(root: Path, *, version: str | None = None) -> PackageResult:
+    return build_archive(
+        root,
+        version=version,
+        archive_prefix=HANDOFF_ARCHIVE_PREFIX,
+        artifact_kind="handoff-source",
     )
 
 
@@ -233,6 +253,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Create a clean release archive from an allowlist.")
     parser.add_argument("--version", default=None, help="Optional version label used in the archive name.")
     parser.add_argument(
+        "--mode",
+        choices=("release", "handoff"),
+        default="release",
+        help="Choose whether to build a release artifact or a collaboration handoff bundle.",
+    )
+    parser.add_argument(
         "--verify-working-tree",
         action="store_true",
         help="Fail if common local runtime/development artifacts still exist in the working tree.",
@@ -271,11 +297,14 @@ def main() -> None:
     if args.clean:
         clean_dist()
     if args.verify_working_tree or verify_working_tree_by_default:
-        findings = verify_working_tree(ROOT_DIR)
+        findings = verify_working_tree(ROOT_DIR, include_dist=args.mode == "handoff")
         if findings:
             joined = ", ".join(findings)
             raise SystemExit(f"Working tree still contains ignored local artifacts: {joined}")
-    result = build_archive(ROOT_DIR, version=args.version)
+    if args.mode == "handoff":
+        result = build_handoff_archive(ROOT_DIR, version=args.version)
+    else:
+        result = build_archive(ROOT_DIR, version=args.version)
     revision = f" @ {result.revision}" if result.revision else ""
     print(
         f"Created {result.archive_path} with {result.file_count} files{revision}. "

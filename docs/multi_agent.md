@@ -12,6 +12,7 @@ Each shipped role has:
 - a capability set
 - an allowed connector set
 - a memory namespace
+- an agent-scoped scratch work area under the runtime state root
 - persisted run history
 
 ## Roles
@@ -74,6 +75,15 @@ Today the orchestration is bounded, explicit, and graph-shaped rather than a fla
 7. executor nodes are created per proposal and sit in `waiting_approval`, `queued`, `running`, `completed`, or `failed` states
 8. executor work later runs inside the worker child-process boundary after approval
 
+The persisted graph is now reconciled against durable runtime state:
+
+- proposal approval moves the related executor node into `queued`
+- worker claim moves the executor node into `running`
+- worker success moves the node into `executed`
+- rejection, cancellation, or stale detection moves the node into the matching terminal state
+- startup reconciliation can recover expired running jobs and re-mark executor nodes after a restart
+- merge nodes remain blocked until their reviewed branch dependencies are complete
+
 Persisted task nodes track:
 
 - node type
@@ -84,6 +94,7 @@ Persisted task nodes track:
 - dependency edges
 - lifecycle state
 - reasoning summary
+- agent work-area metadata (shared workspace root, scratch root, promotion root)
 
 This is a practical local-first orchestration layer. It is not a distributed agent mesh.
 
@@ -92,7 +103,7 @@ This is a practical local-first orchestration layer. It is not a distributed age
 - agent memory is namespaced by role and branch, but not yet a full long-term memory subsystem
 - agent prompts are mostly role-specific heuristics, not full autonomous loops
 - the scheduler is a bounded in-process graph scheduler, not a distributed orchestration mesh
-- executor work is still approval-gated and worker-bound, not branch-parallelized by default
+- executor work is still approval-gated and worker-bound, not a fully parallel branch executor
 - there is no per-user RBAC on agent capabilities yet
 
 ## Why This Still Matters
@@ -105,3 +116,4 @@ Even with a bounded sequential runtime, explicit multi-agent persistence gives o
 - what task node dependencies led to this step?
 - which provider profile was used for this role?
 - what changed between planning and execution?
+- which files are still agent-local scratch data and what would need explicit promotion into the shared workspace?

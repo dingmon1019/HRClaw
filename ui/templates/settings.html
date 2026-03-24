@@ -354,6 +354,60 @@
                     {% endif %}
                 </div>
 
+                <div class="panel">
+                    <h3>Worker Task Control</h3>
+                    <p class="small muted">Manage the current-user Windows Scheduled Task used for background worker execution without leaving the operator console.</p>
+                    <form method="post" action="/settings/windows/worker-task" class="stack form-grid mt-16">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <div class="grid three">
+                            <label>
+                                Task Name
+                                <input type="text" name="task_name" value="WinAgentRuntime.Worker">
+                            </label>
+                            <label>
+                                Protected Token File
+                                <input type="text" name="token_file" value="worker.token">
+                            </label>
+                            <label>
+                                Worker Interval Seconds
+                                <input type="number" step="0.5" min="0.5" name="interval" value="2">
+                            </label>
+                        </div>
+                        <div class="grid two">
+                            <label>
+                                Worker Limit
+                                <input type="number" min="0" name="limit" value="0">
+                            </label>
+                            <label>
+                                Current Password
+                                <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                            </label>
+                        </div>
+                        <div class="actions">
+                            <button type="submit" class="button ghost" name="action" value="install">Install Task</button>
+                            <button type="submit" class="button ghost" name="action" value="start">Start Task</button>
+                            <button type="submit" class="button ghost" name="action" value="stop">Stop Task</button>
+                            <button type="submit" class="button ghost" name="action" value="status">Refresh Status</button>
+                            <button type="submit" class="button danger" name="action" value="remove">Remove Task</button>
+                        </div>
+                    </form>
+                    {% if worker_task_result %}
+                    <div class="panel mt-16">
+                        <h4>Worker Task Status</h4>
+                        <p class="small muted">Action: {{ worker_task_result.action }} / task {{ worker_task_result.task_name }}</p>
+                        {% if worker_task_result.status %}
+                        <div class="stack tight">
+                            <div class="metric-row"><span>State</span><strong>{{ worker_task_result.status.State }}</strong></div>
+                            <div class="metric-row"><span>Last Run</span><strong>{{ worker_task_result.status.LastRunTime }}</strong></div>
+                            <div class="metric-row"><span>Next Run</span><strong>{{ worker_task_result.status.NextRunTime }}</strong></div>
+                            <div class="metric-row"><span>Last Result</span><strong>{{ worker_task_result.status.LastTaskResult }}</strong></div>
+                        </div>
+                        {% endif %}
+                        <pre>{{ worker_task_result.output }}</pre>
+                    </div>
+                    {% endif %}
+                </div>
+
             <form method="post" action="/settings/test-provider" class="stack form-grid">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <label>
@@ -484,6 +538,10 @@
                         <strong>{{ entry.posture.routing_summary }}</strong>
                     </div>
                     <div class="metric-row">
+                        <span>Endpoint Locality</span>
+                        <strong>{{ status.endpoint_locality if status else "-" }}</strong>
+                    </div>
+                    <div class="metric-row">
                         <span>Recent Usage</span>
                         <strong>{{ entry.runtime_usage.agent_steps }} agent steps / {{ entry.runtime_usage.executions }} executions</strong>
                     </div>
@@ -497,6 +555,17 @@
                         <strong>{{ "%.0f"|format(status.latency_ewma_ms) }} ms ewma / {{ "%.0f"|format(status.success_rate * 100) }}% success</strong>
                     </div>
                     <div class="metric-row">
+                        <span>Budget</span>
+                        <strong>
+                            {% if status.budget_limit_units is not none %}
+                                {{ "%.3f"|format(status.budget_used_units) }} / {{ "%.3f"|format(status.budget_limit_units) }} units
+                                {% if status.budget_exhausted %}(exhausted){% endif %}
+                            {% else %}
+                                {{ "%.3f"|format(status.budget_used_units) }} units / no ceiling
+                            {% endif %}
+                        </strong>
+                    </div>
+                    <div class="metric-row">
                         <span>Failure Streak</span>
                         <strong>{{ status.consecutive_failures }}{% if status.last_error_category %} / {{ status.last_error_category }}{% endif %}</strong>
                     </div>
@@ -504,6 +573,17 @@
                         <span>Last Routing Reason</span>
                         <strong>{{ status.last_routing_reason or "No routing decision recorded yet." }}</strong>
                     </div>
+                    {% if status.model_inventory %}
+                    <div class="stack tight">
+                        <span class="small muted">Model Inventory</span>
+                        {% for model in status.model_inventory %}
+                        <div class="list-item">
+                            <strong>{{ model.name }}</strong>
+                            <p>{{ model.context_window_class }} context / planning {{ model.planning_fit }} / review {{ model.review_fit }} / report {{ model.report_fit }}</p>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
                     {% endif %}
                 </div>
 
@@ -585,6 +665,16 @@
                         </select>
                     </label>
                 </div>
+                <div class="grid two">
+                    <label>
+                        Budget Ceiling Units
+                        <input type="number" step="0.001" min="0" name="budget_limit_units" value="{{ '' if config.budget_limit_units is none else config.budget_limit_units }}">
+                    </label>
+                    <label>
+                        Endpoint Locality
+                        <input type="text" value="{{ status.endpoint_locality if status else 'unknown' }}" readonly>
+                    </label>
+                </div>
                 {% if status %}
                 <p class="small muted">Credential available: {{ "yes" if status.credential_available else "no" }}{% if status.credential_target %} / target {{ status.credential_target }}{% endif %}</p>
                 {% endif %}
@@ -596,6 +686,30 @@
                     <button type="submit" class="button ghost">Save Provider Entry</button>
                 </div>
             </form>
+            {% if config.auth_source == "credential-manager" and config.credential_target %}
+            <form method="post" action="/settings/provider-config/test-credential" class="stack form-grid mt-16">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="provider_name" value="{{ config.provider_name }}">
+                <input type="hidden" name="credential_target" value="{{ config.credential_target }}">
+                <label>
+                    Current Password
+                    <input type="password" name="current_password" autocomplete="current-password" {% if requires_recent_auth %}required{% endif %}>
+                </label>
+                <div class="actions">
+                    <button type="submit" class="button ghost">Check Stored Credential</button>
+                </div>
+            </form>
+            {% endif %}
+            {% if credential_result and credential_result.provider_name == config.provider_name %}
+            <div class="panel mt-16">
+                <h4>Credential Check</h4>
+                <div class="stack tight">
+                    <div class="metric-row"><span>Target</span><strong>{{ credential_result.credential_target }}</strong></div>
+                    <div class="metric-row"><span>Available</span><strong>{{ "yes" if credential_result.status.available else "no" }}</strong></div>
+                    <div class="metric-row"><span>Configured</span><strong>{{ "yes" if credential_result.status.configured else "no" }}</strong></div>
+                </div>
+            </div>
+            {% endif %}
             {% if config.auth_source == "credential-manager" and config.credential_target %}
             <form method="post" action="/settings/provider-config/delete-credential" class="stack form-grid mt-16" data-confirm="Delete the stored Windows credential for this provider?">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

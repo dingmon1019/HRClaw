@@ -21,6 +21,7 @@ from app.core.utils import json_dumps, sha256_hex
 from app.policy.path_guard import PathGuard
 from app.schemas.actions import ExecutionBoundaryMetadata, ExecutionBundle
 from app.schemas.settings import EffectiveSettings
+from app.services.agent_workspace_service import AgentWorkspaceService
 
 
 class _StaticSettingsService:
@@ -77,11 +78,14 @@ class ConstrainedExecutionRunner:
         "TMP",
         "WINDIR",
     ]
+    MIN_CHILD_HARD_TIMEOUT_SECONDS = 60
+    CHILD_HARD_TIMEOUT_MULTIPLIER = 4
 
     def __init__(self, base_settings: AppSettings, backend: ExecutionBoundaryBackend | None = None):
         self.base_settings = base_settings
         self.backend = backend or SubprocessExecutionBackend()
         self.task_broker = TaskActionBroker(base_settings)
+        self.agent_workspace_service = AgentWorkspaceService(base_settings)
 
     def build_bundle(
         self,
@@ -105,6 +109,18 @@ class ConstrainedExecutionRunner:
             action_type=proposal.action_type,
             runtime_payload=runtime_payload,
         )
+        child_http_scope = self._narrow_http_settings(
+            exact_http_targets=exact_http_targets,
+            effective_settings=effective_settings,
+        )
+        executor_layout = self.agent_workspace_service.layout_for(
+            run_id=proposal.run_id,
+            agent_role="executor",
+            memory_namespace="executor",
+            context_namespace=f"executor:{proposal.run_id}:{proposal.connector}",
+            branch_key=proposal.connector,
+        )
+        child_filesystem_roots = exact_file_paths or list(effective_settings.allowed_filesystem_roots)
         database_access = "brokered-task-actions" if proposal.connector == "task" else "none"
         boundary = ExecutionBoundaryMetadata(
             mode=self.backend.name,
@@ -114,18 +130,24 @@ class ConstrainedExecutionRunner:
             allowed_environment_keys=self._allowed_environment_keys(),
             secrets_access="denied",
             database_access=database_access,
-            filesystem_scope=exact_file_paths or list(effective_settings.allowed_filesystem_roots),
-            network_scope=exact_http_targets or list(effective_settings.allowed_http_hosts),
+            filesystem_scope=child_filesystem_roots,
+            network_scope=exact_http_targets or child_http_scope["allowed_http_hosts"],
             granted_file_paths=exact_file_paths,
             granted_http_targets=exact_http_targets,
             capability_tokens=sorted(set(capabilities)),
             scope_strategy="exact-task-scope" if (exact_file_paths or exact_http_targets) else "connector-bounded",
-            cwd=str(self.base_settings.project_root),
+            cwd=str(executor_layout.scratch_root),
             python_executable=sys.executable,
+            shared_workspace_root=str(executor_layout.shared_workspace_root),
+            agent_work_root=str(executor_layout.agent_root),
+            agent_scratch_root=str(executor_layout.scratch_root),
+            promotion_root=str(executor_layout.promotion_root),
             notes=[
                 "Approved actions execute in a dedicated child Python process with a scrubbed environment.",
+                "The child interpreter runs with explicit import bootstrap instead of inheriting ambient PYTHONPATH.",
                 "This boundary reduces control-plane coupling but is not an OS or kernel sandbox.",
                 "Connector access is restricted to the single approved action bundle and brokered task actions.",
+                "The child process starts inside an executor-specific scratch area and does not share a writable scratch directory with planner, reviewer, or reporter agents.",
             ],
         )
         return ExecutionBundle(
@@ -144,10 +166,10 @@ class ConstrainedExecutionRunner:
                 "runtime_state_root": effective_settings.runtime_state_root,
                 "workspace_root": effective_settings.workspace_root,
                 "database_path": str(self.base_settings.resolved_runtime_state_root / "data" / "child_boundary_unused.db"),
-                "allowed_filesystem_roots": effective_settings.allowed_filesystem_roots,
-                "allowed_http_hosts": effective_settings.allowed_http_hosts,
-                "allowed_http_schemes": effective_settings.allowed_http_schemes,
-                "allowed_http_ports": effective_settings.allowed_http_ports,
+                "allowed_filesystem_roots": child_filesystem_roots,
+                "allowed_http_hosts": child_http_scope["allowed_http_hosts"],
+                "allowed_http_schemes": child_http_scope["allowed_http_schemes"],
+                "allowed_http_ports": child_http_scope["allowed_http_ports"],
                 "allow_http_private_network": effective_settings.allow_http_private_network,
                 "http_follow_redirects": effective_settings.http_follow_redirects,
                 "http_timeout_seconds": effective_settings.http_timeout_seconds,
@@ -158,6 +180,12 @@ class ConstrainedExecutionRunner:
                 "allowed_file_paths": exact_file_paths,
                 "allowed_http_targets": exact_http_targets,
                 "boundary_backend": self.backend.name,
+                "agent_work_root": str(executor_layout.agent_root),
+                "agent_scratch_root": str(executor_layout.scratch_root),
+                "agent_reports_root": str(executor_layout.reports_root),
+                "promotion_root": str(executor_layout.promotion_root),
+                "shared_workspace_root": str(executor_layout.shared_workspace_root),
+                "child_cwd": str(executor_layout.scratch_root),
             },
             boundary=boundary,
         )
@@ -188,17 +216,18 @@ class ConstrainedExecutionRunner:
         *,
         heartbeat_callback: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        soft_timeout_seconds, hard_timeout_seconds = self._child_timeout_limits()
         process = subprocess.Popen(
-            [sys.executable, "-m", "app.runtime.child_process"],
-            cwd=str(self.base_settings.project_root),
+            self._child_command(),
+            cwd=str(bundle.execution_settings.get("child_cwd") or self.base_settings.resolved_runtime_state_root),
             env=self._scrubbed_environment(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
-        timeout_seconds = max(5, int(self.base_settings.worker_lease_seconds))
-        heartbeat_interval = max(1, min(5, timeout_seconds // 3 or 1))
+        heartbeat_interval = max(1, min(5, soft_timeout_seconds // 3 or 1))
         start = time.monotonic()
         stdout = ""
         stderr = ""
@@ -212,11 +241,11 @@ class ConstrainedExecutionRunner:
                 pending_input = None
                 if heartbeat_callback is not None:
                     heartbeat_callback()
-                if time.monotonic() - start > timeout_seconds:
+                if time.monotonic() - start > hard_timeout_seconds:
                     process.kill()
                     stdout, stderr = process.communicate()
                     raise ConnectorError(
-                        "Execution boundary timed out."
+                        f"Execution boundary timed out after {hard_timeout_seconds} seconds."
                         + (f" stderr={(stderr or '').strip()}" if stderr else "")
                     )
         stdout = (stdout or "").strip()
@@ -237,20 +266,106 @@ class ConstrainedExecutionRunner:
             for key in self.SAFE_ENV_KEYS
             if (value := os.environ.get(key))
         }
-        env["PYTHONIOENCODING"] = "utf-8"
-        python_paths = [str(self.base_settings.project_root)]
-        codex_packages = self.base_settings.project_root / ".codex-pkgs"
-        if codex_packages.exists():
-            python_paths.append(str(codex_packages))
-        if os.environ.get("PYTHONPATH"):
-            python_paths.append(os.environ["PYTHONPATH"])
-        env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(python_paths))
         return env
 
     def _allowed_environment_keys(self) -> list[str]:
-        keys = [key for key in self.SAFE_ENV_KEYS if os.environ.get(key)]
-        keys.extend(["PYTHONIOENCODING", "PYTHONPATH"])
-        return sorted(set(keys))
+        return sorted(key for key in self.SAFE_ENV_KEYS if os.environ.get(key))
+
+    def _child_timeout_limits(self) -> tuple[int, int]:
+        soft_timeout = max(5, int(self.base_settings.worker_lease_seconds))
+        hard_timeout = max(
+            self.MIN_CHILD_HARD_TIMEOUT_SECONDS,
+            soft_timeout * self.CHILD_HARD_TIMEOUT_MULTIPLIER,
+        )
+        return soft_timeout, hard_timeout
+
+    def _child_command(self) -> list[str]:
+        bootstrap = self._child_bootstrap_code()
+        return [sys.executable, "-I", "-S", "-c", bootstrap]
+
+    def _child_bootstrap_code(self) -> str:
+        project_root = json.dumps(str(self.base_settings.project_root))
+        import_paths = json.dumps(self._child_import_paths())
+        return "\n".join(
+            [
+                "import runpy",
+                "import sys",
+                f"project_root = {project_root}",
+                f"paths = {import_paths}",
+                "for path in reversed(paths):",
+                "    if path not in sys.path:",
+                "        sys.path.insert(0, path)",
+                "if project_root not in sys.path:",
+                "    sys.path.insert(0, project_root)",
+                "runpy.run_module('app.runtime.child_process', run_name='__main__')",
+            ]
+        )
+
+    def _child_import_paths(self) -> list[str]:
+        project_root = self.base_settings.project_root.resolve()
+        dependency_roots: list[str] = []
+        executable = Path(sys.executable).resolve()
+        candidates = [
+            executable.parent.parent / "Lib" / "site-packages",
+            executable.parent.parent / "lib" / "site-packages",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                resolved = str(candidate.resolve())
+                if resolved not in dependency_roots:
+                    dependency_roots.append(resolved)
+
+        for entry in sys.path:
+            if not entry:
+                continue
+            try:
+                resolved_path = Path(entry).resolve()
+            except OSError:
+                continue
+            if not resolved_path.exists() or not resolved_path.is_dir():
+                continue
+            if resolved_path == project_root:
+                continue
+            normalized = resolved_path.as_posix().lower()
+            if "site-packages" not in normalized and not normalized.endswith("/.codex-pkgs"):
+                continue
+            resolved = str(resolved_path)
+            if resolved not in dependency_roots:
+                dependency_roots.append(resolved)
+        return dependency_roots
+
+    @staticmethod
+    def _narrow_http_settings(
+        *,
+        exact_http_targets: list[str],
+        effective_settings: EffectiveSettings,
+    ) -> dict[str, list[Any]]:
+        if not exact_http_targets:
+            return {
+                "allowed_http_hosts": list(effective_settings.allowed_http_hosts),
+                "allowed_http_schemes": list(effective_settings.allowed_http_schemes),
+                "allowed_http_ports": list(effective_settings.allowed_http_ports),
+            }
+        hosts: list[str] = []
+        schemes: list[str] = []
+        ports: list[int] = []
+        for target in exact_http_targets:
+            _, _, raw_url = target.partition(" ")
+            parsed = urlsplit(raw_url)
+            if parsed.hostname and parsed.hostname not in hosts:
+                hosts.append(parsed.hostname)
+            if parsed.scheme and parsed.scheme not in schemes:
+                schemes.append(parsed.scheme)
+            port = parsed.port
+            if port is None:
+                port = 443 if parsed.scheme == "https" else 80
+            if port not in ports:
+                ports.append(port)
+        return {
+            "allowed_http_hosts": hosts,
+            "allowed_http_schemes": schemes,
+            "allowed_http_ports": ports,
+        }
 
     def _execute_broker_request(self, broker_request: dict[str, Any]) -> dict[str, Any]:
         connector = broker_request.get("connector")
@@ -371,17 +486,15 @@ def _build_child_connector(bundle: ExecutionBundle):
     settings = _settings_from_bundle(bundle)
     static_settings = _StaticSettingsService(settings)
     base_settings = _base_settings_from_bundle(bundle)
-    connectors = {
-        "filesystem": FilesystemConnector(base_settings, static_settings),
-        "http": HttpConnector(static_settings),
-        "system": SystemConnector(base_settings, static_settings),
-    }
-    if settings.enable_outlook_connector:
-        connectors["outlook"] = OutlookConnector()
-    connector = connectors.get(bundle.connector)
-    if connector is None:
-        raise ConnectorError(f"Connector {bundle.connector} is not available inside the child execution boundary.")
-    return connector
+    if bundle.connector == "filesystem":
+        return FilesystemConnector(base_settings, static_settings)
+    if bundle.connector == "http":
+        return HttpConnector(static_settings)
+    if bundle.connector == "system":
+        return SystemConnector(base_settings, static_settings)
+    if bundle.connector == "outlook" and settings.enable_outlook_connector:
+        return OutlookConnector()
+    raise ConnectorError(f"Connector {bundle.connector} is not available inside the child execution boundary.")
 
 
 def _enforce_exact_scope(bundle: ExecutionBundle) -> None:

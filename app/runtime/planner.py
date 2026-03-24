@@ -17,6 +17,7 @@ from app.schemas.actions import (
 from app.schemas.agents import AgentDefinition, AgentRole
 from app.schemas.providers import ProviderRequest
 from app.services.data_governance_service import DataGovernanceService
+from app.services.agent_workspace_service import AgentWorkspaceService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.provider_service import ProviderService
@@ -37,6 +38,7 @@ class RuntimePlanner:
         audit_service: AuditService,
         agent_service: AgentService,
         data_governance_service: DataGovernanceService,
+        agent_workspace_service: AgentWorkspaceService,
     ):
         self.base_settings = base_settings
         self.connector_registry = connector_registry
@@ -48,6 +50,7 @@ class RuntimePlanner:
         self.audit_service = audit_service
         self.agent_service = agent_service
         self.data_governance_service = data_governance_service
+        self.agent_workspace_service = agent_workspace_service
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         run_id = new_id("run")
@@ -58,6 +61,7 @@ class RuntimePlanner:
         planner = self.agent_service.get_by_role(AgentRole.PLANNER)
         reviewer = self.agent_service.get_by_role(AgentRole.REVIEWER)
         reporter = self.agent_service.get_by_role(AgentRole.REPORTER)
+        objective_namespace = f"{supervisor.memory_namespace}:{run_id}:objective"
         self.agent_service.assert_capability(supervisor, "decompose-objective")
         self.agent_service.assert_capability(supervisor, "create-handoffs")
         self.agent_service.assert_capability(planner, "summarize-context")
@@ -78,9 +82,17 @@ class RuntimePlanner:
                     "capabilities": supervisor.capabilities,
                     "allowed_connectors": supervisor.allowed_connectors,
                 }
+                | self._agent_work_area_details(
+                    run_id=run_id,
+                    agent=supervisor,
+                    context_namespace=objective_namespace,
+                    branch_key="objective",
+                )
             ),
             status="running",
             parent_task_node_id=None,
+            branch_key="objective",
+            context_namespace=objective_namespace,
             agent=supervisor,
             provider_profile=self._provider_profile_for_role(AgentRole.SUPERVISOR, effective_settings),
             correlation_id=correlation_id,
@@ -155,12 +167,27 @@ class RuntimePlanner:
             planning_classification,
             planning_governance,
         )
+        summary_lineage = self.data_governance_service.build_derived_lineage(
+            source_kind="planning-summary",
+            source_classification=planning_classification,
+            blocked_sections=planning_governance.get("blocked_sections", []),
+            sendable_sections=planning_governance.get("sendable_sections", []),
+            reasons=planning_governance.get("reasons", []),
+        )
+        outbound_summary_text = self.data_governance_service.curate_derived_summary_for_outbound(
+            summary_text,
+            source_classification=planning_classification,
+            lineage=summary_lineage,
+        )
         summary = self.summary_service.create(
             run_id=run_id,
             objective=request.objective,
             collected=self.data_governance_service.sanitize_for_history(local_collected_context, object_type="summary_payload"),
             summary_text=summary_text,
             provider_name=summary_provider_name,
+            data_classification=planning_classification,
+            lineage=summary_lineage,
+            outbound_summary_text=outbound_summary_text,
         )
         planner_nodes = [node for node in subtask_nodes if node.role == AgentRole.PLANNER]
         review_nodes = [
@@ -194,6 +221,48 @@ class RuntimePlanner:
                 planner_agent=planner,
                 correlation_id=correlation_id,
             )
+            for node in planner_nodes:
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "fallback_planning": True,
+                            "proposal_count": len(raw_proposals),
+                            "proposal_titles": [proposal.title for proposal in raw_proposals],
+                            "branch_reasoning": "Planner used the persisted fallback branch builder because no branch-specific execution result was stored.",
+                            "context_namespace": node.context_namespace,
+                        }
+                    ),
+                    agent_run_id=planner_run.id,
+                )
+            for node in review_nodes:
+                self.agent_service.complete_task_node(
+                    node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "fallback_review": True,
+                            "proposal_count": len(raw_proposals),
+                            "proposal_titles": [proposal.title for proposal in raw_proposals],
+                            "review_target": node.details.get("review_target"),
+                        }
+                    ),
+                    agent_run_id=reviewer_run.id if 'reviewer_run' in locals() else None,
+                )
+            if review_merge_node is not None:
+                self.agent_service.complete_task_node(
+                    review_merge_node.id,
+                    status="completed",
+                    details=self._sanitize_task_node_details(
+                        {
+                            "fallback_merge": True,
+                            "proposal_count": len(raw_proposals),
+                            "merge_key": review_merge_node.merge_key,
+                        }
+                    ),
+                    agent_run_id=reviewer_run.id if 'reviewer_run' in locals() else None,
+                )
         self.agent_service.complete_handoff(planner_handoff.id)
         self.agent_service.complete_run(
             planner_run.id,
@@ -296,6 +365,15 @@ class RuntimePlanner:
                         "branch_key": proposal.connector,
                         "context_namespace": f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
                     }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=planner,
+                        context_namespace=f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
+                        branch_key=proposal.connector,
+                        promotion_target_hint=proposal.payload.get("path")
+                        or proposal.payload.get("destination_path")
+                        or proposal.payload.get("url"),
+                    )
                 ),
                 status="waiting_approval" if proposal.requires_approval and proposal.status.value in {"pending", "stale"} else proposal.status.value,
                 parent_task_node_id=proposal_parent,
@@ -324,6 +402,15 @@ class RuntimePlanner:
                         "allowed_connectors": executor_agent.allowed_connectors,
                         "approval_wait": proposal.requires_approval,
                     }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=executor_agent,
+                        context_namespace=f"{executor_agent.memory_namespace}:{run_id}:{proposal.connector}",
+                        branch_key=proposal.connector,
+                        promotion_target_hint=proposal.payload.get("path")
+                        or proposal.payload.get("destination_path")
+                        or proposal.payload.get("url"),
+                    )
                 ),
                 status="waiting_approval" if proposal.requires_approval else "ready",
                 parent_task_node_id=proposal_node.id,
@@ -358,7 +445,7 @@ class RuntimePlanner:
         operator_summary, reporter_provider, reporter_routing = self._report_plan(
             request,
             created,
-            summary.summary_text,
+            summary,
             self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
             correlation_id,
         )
@@ -409,83 +496,202 @@ class RuntimePlanner:
         planner_agent: AgentDefinition,
         correlation_id: str,
     ) -> dict:
-        collected: dict = {"objective": request.objective}
-        self.agent_service.assert_connector_allowed(supervisor_agent, "task")
-        task_snapshot = self.connector_registry.get("task").collect({"limit": 5})
-        collected["tasks"] = task_snapshot
-        self.history_service.log_connector_run(
-            run_id=run_id,
-            connector="task",
-            operation="collect",
-            status="success",
-            payload=self.data_governance_service.sanitize_for_history({"limit": 5}, object_type="connector_input"),
-            agent_id=supervisor_agent.id,
-            agent_role=supervisor_agent.role.value,
-            correlation_id=correlation_id,
-            output=self.data_governance_service.sanitize_for_history(task_snapshot, object_type="connector_output"),
-        )
+        collected: dict = {
+            "objective": request.objective,
+            "planning_collection_mode": "descriptor-only",
+        }
+        deferred_evidence: list[dict] = []
+        if self._task_backlog_requested(request):
+            self.agent_service.assert_connector_allowed(supervisor_agent, "task")
+            task_descriptor = self._task_planning_descriptor()
+            collected["tasks"] = task_descriptor
+            self._log_planning_descriptor(
+                run_id,
+                supervisor_agent,
+                "task",
+                {"limit": 5},
+                task_descriptor,
+                correlation_id,
+            )
+            deferred_evidence.append(
+                self._deferred_evidence_entry(
+                    connector="task",
+                    action_type="task.list",
+                    title="Read local task backlog for planning evidence",
+                    reason="Planning did not inspect the runtime task backlog before approval.",
+                    target={"limit": 20},
+                )
+            )
         if request.filesystem_path:
-            collected["filesystem"] = self._safe_collect(
+            self.agent_service.assert_connector_allowed(planner_agent, "filesystem")
+            filesystem_descriptor = self._filesystem_planning_descriptor(request)
+            collected["filesystem"] = filesystem_descriptor
+            self._log_planning_descriptor(
                 run_id,
                 planner_agent,
                 "filesystem",
                 {"path": request.filesystem_path},
+                filesystem_descriptor,
                 correlation_id,
             )
+            if filesystem_descriptor.get("evidence_deferred"):
+                deferred_evidence.append(
+                    self._deferred_evidence_entry(
+                        connector="filesystem",
+                        action_type=filesystem_descriptor["candidate_action"],
+                        title=filesystem_descriptor["deferred_title"],
+                        reason="Planning did not read local filesystem content before approval.",
+                        target={"path": request.filesystem_path},
+                    )
+                )
         if request.http_url and request.http_method.upper() in {"GET", "HEAD"}:
-            collected["http"] = self._safe_collect(
+            self.agent_service.assert_connector_allowed(planner_agent, "http")
+            http_descriptor = self._http_planning_descriptor(request)
+            collected["http"] = http_descriptor
+            self._log_planning_descriptor(
                 run_id,
                 planner_agent,
                 "http",
-                {"url": request.http_url},
+                {"url": request.http_url, "method": request.http_method.upper()},
+                http_descriptor,
                 correlation_id,
             )
+            deferred_evidence.append(
+                self._deferred_evidence_entry(
+                    connector="http",
+                    action_type=http_descriptor["candidate_action"],
+                    title=http_descriptor["deferred_title"],
+                    reason="Planning did not perform an outbound network fetch before approval.",
+                    target={"url": request.http_url, "method": request.http_method.upper()},
+                )
+            )
         if request.system_action and request.system_path:
-            collected["system"] = self._safe_collect(
+            self.agent_service.assert_connector_allowed(planner_agent, "system")
+            system_descriptor = self._system_planning_descriptor(request)
+            collected["system"] = system_descriptor
+            self._log_planning_descriptor(
                 run_id,
                 planner_agent,
                 "system",
                 {"path": request.system_path, "action": request.system_action},
+                system_descriptor,
                 correlation_id,
             )
+            deferred_evidence.append(
+                self._deferred_evidence_entry(
+                    connector="system",
+                    action_type=request.system_action,
+                    title=system_descriptor["deferred_title"],
+                    reason="Planning did not execute a bounded system read before approval.",
+                    target={"path": request.system_path, "action": request.system_action},
+                )
+            )
+        if deferred_evidence:
+            collected["deferred_evidence"] = deferred_evidence
         return collected
 
-    def _safe_collect(
+    def _log_planning_descriptor(
         self,
         run_id: str,
         agent: AgentDefinition,
         connector_name: str,
         payload: dict,
+        descriptor: dict,
         correlation_id: str,
+    ) -> None:
+        self.history_service.log_connector_run(
+            run_id=run_id,
+            connector=connector_name,
+            operation="planning-descriptor",
+            status="deferred",
+            payload=self.data_governance_service.sanitize_for_history(payload, object_type="connector_input"),
+            agent_id=agent.id,
+            agent_role=agent.role.value,
+            correlation_id=correlation_id,
+            output=self.data_governance_service.sanitize_for_history(descriptor, object_type="connector_output"),
+        )
+
+    @staticmethod
+    def _task_backlog_requested(request: AgentRunRequest) -> bool:
+        objective = request.objective.lower()
+        return any(
+            marker in objective
+            for marker in (
+                "task backlog",
+                "task data",
+                "task details",
+                "list task",
+                "open task",
+                "existing task",
+                "current task",
+            )
+        )
+
+    @staticmethod
+    def _task_planning_descriptor() -> dict:
+        return {
+            "collection_mode": "descriptor-only",
+            "snapshot_deferred": True,
+            "details_redacted": True,
+        }
+
+    def _filesystem_planning_descriptor(self, request: AgentRunRequest) -> dict:
+        candidate_action = self._inferred_filesystem_action(request, observed_kind=None)
+        return {
+            "collection_mode": "descriptor-only",
+            "path": request.filesystem_path,
+            "observed_kind": None,
+            "path_hint": "directory" if (request.filesystem_path or "").endswith(("\\", "/")) else "file-or-directory",
+            "candidate_action": candidate_action,
+            "evidence_deferred": candidate_action in {"filesystem.read_text", "filesystem.list_directory"},
+            "deferred_title": (
+                f"Gather filesystem evidence with {candidate_action}"
+                if candidate_action in {"filesystem.read_text", "filesystem.list_directory"}
+                else f"Plan filesystem action {candidate_action}"
+            ),
+        }
+
+    @staticmethod
+    def _http_planning_descriptor(request: AgentRunRequest) -> dict:
+        method = request.http_method.upper()
+        return {
+            "collection_mode": "descriptor-only",
+            "url": request.http_url,
+            "method": method,
+            "candidate_action": f"http.{method.lower()}",
+            "request_body_present": bool(request.http_body),
+            "headers_present": bool(request.http_headers_text),
+            "fetch_deferred": True,
+            "deferred_title": f"Fetch HTTP evidence with {method} {request.http_url}",
+        }
+
+    @staticmethod
+    def _system_planning_descriptor(request: AgentRunRequest) -> dict:
+        return {
+            "collection_mode": "descriptor-only",
+            "path": request.system_path,
+            "action": request.system_action,
+            "evidence_deferred": True,
+            "deferred_title": f"Gather bounded system evidence with {request.system_action}",
+        }
+
+    @staticmethod
+    def _deferred_evidence_entry(
+        *,
+        connector: str,
+        action_type: str,
+        title: str,
+        reason: str,
+        target: dict,
     ) -> dict:
-        try:
-            self.agent_service.assert_connector_allowed(agent, connector_name)
-            output = self.connector_registry.get(connector_name).collect(payload)
-            self.history_service.log_connector_run(
-                run_id=run_id,
-                connector=connector_name,
-                operation="collect",
-                status="success",
-                payload=self.data_governance_service.sanitize_for_history(payload, object_type="connector_input"),
-                agent_id=agent.id,
-                agent_role=agent.role.value,
-                correlation_id=correlation_id,
-                output=self.data_governance_service.sanitize_for_history(output, object_type="connector_output"),
-            )
-            return output
-        except Exception as exc:
-            self.history_service.log_connector_run(
-                run_id=run_id,
-                connector=connector_name,
-                operation="collect",
-                status="failed",
-                payload=self.data_governance_service.sanitize_for_history(payload, object_type="connector_input"),
-                agent_id=agent.id,
-                agent_role=agent.role.value,
-                correlation_id=correlation_id,
-                error_text=str(exc),
-            )
-            return {"error": str(exc), "input": payload}
+        return {
+            "connector": connector,
+            "action_type": action_type,
+            "title": title,
+            "reason": reason,
+            "target": target,
+            "status": "pending-approval",
+        }
 
     def _summarize(
         self,
@@ -623,7 +829,7 @@ class RuntimePlanner:
                     title="List local tasks",
                     description="Read the current local task backlog from SQLite.",
                     payload={"limit": 20},
-                    rationale="The objective explicitly asks for task visibility.",
+                    rationale="The objective explicitly asks for task visibility, so planning deferred backlog inspection into this approval-gated read action.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
                     created_by_agent_id=planner_agent.id,
@@ -643,7 +849,7 @@ class RuntimePlanner:
                     title=f"Run bounded system action {request.system_action}",
                     description="Execute a schema-driven read-only system action.",
                     payload={"path": request.system_path},
-                    rationale="The operator selected a bounded system action.",
+                    rationale="The operator selected a bounded system action, and planning deferred the actual read until approval.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
                     created_by_agent_id=planner_agent.id,
@@ -1006,14 +1212,14 @@ class RuntimePlanner:
 
     def _branch_reasoning_summary(self, branch_key: str, branch_context: dict) -> str:
         if branch_key == "filesystem":
-            return "Planner isolated the filesystem branch and kept local path context approval-gated."
+            return "Planner separated the filesystem branch and deferred file or directory inspection until an approved read action runs."
         if branch_key == "http":
-            return "Planner isolated the HTTP branch and kept request egress inside the bounded connector policy."
+            return "Planner separated the HTTP branch and deferred the outbound fetch until an approved connector action runs."
         if branch_key == "system":
-            return "Planner isolated the bounded system branch and kept it read-only by action schema."
+            return "Planner separated the bounded system branch and deferred schema-driven reads until approval."
         if branch_key == "task":
-            return "Planner isolated the local task branch and kept runtime task data local-first."
-        return f"Planner isolated branch {branch_key} for bounded orchestration."
+            return "Planner separated the local task branch and deferred backlog inspection until an approved task read runs."
+        return f"Planner separated branch {branch_key} for bounded orchestration."
 
     def _build_branch_proposals(
         self,
@@ -1082,7 +1288,7 @@ class RuntimePlanner:
                         title="List local tasks",
                         description="Read the current local task backlog from SQLite.",
                         payload={"limit": 20},
-                        rationale="The objective explicitly asks for task visibility.",
+                        rationale="The objective explicitly asks for task visibility, so planning deferred backlog inspection into this approval-gated read action.",
                         provider_name=planning_provider,
                         summary_id=summary_id,
                         created_by_agent_id=planner_agent.id,
@@ -1103,7 +1309,7 @@ class RuntimePlanner:
                     title=f"Run bounded system action {request.system_action}",
                     description="Execute a schema-driven read-only system action.",
                     payload={"path": request.system_path},
-                    rationale="The operator selected a bounded system action.",
+                    rationale="The operator selected a bounded system action, and planning deferred the actual read until approval.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
                     created_by_agent_id=planner_agent.id,
@@ -1126,10 +1332,11 @@ class RuntimePlanner:
     ) -> list[ActionProposal]:
         path = request.filesystem_path or ""
         lower_objective = request.objective.lower()
-        observed_kind = (collected.get("filesystem") or {}).get("kind")
+        observed_kind = (collected.get("filesystem") or {}).get("observed_kind")
         proposals: list[ActionProposal] = []
         classification = DataClassification.RESTRICTED if request.file_content is not None else DataClassification.LOCAL_ONLY
         self.agent_service.assert_connector_allowed(planner_agent, "filesystem")
+        inferred_action = self._inferred_filesystem_action(request, observed_kind=observed_kind)
 
         if request.file_content is not None:
             action_type = "filesystem.append_text" if "append" in lower_objective else "filesystem.write_text"
@@ -1153,7 +1360,7 @@ class RuntimePlanner:
             )
             return proposals
 
-        if "delete" in lower_objective:
+        if inferred_action == "filesystem.delete_path":
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
@@ -1172,7 +1379,7 @@ class RuntimePlanner:
                     data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
-        elif "create folder" in lower_objective or "create directory" in lower_objective or "mkdir" in lower_objective:
+        elif inferred_action == "filesystem.make_directory":
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
@@ -1191,7 +1398,7 @@ class RuntimePlanner:
                     data_classification=DataClassification.LOCAL_ONLY,
                 )
             )
-        elif observed_kind == "directory" or path.endswith(("\\", "/")) or "list" in lower_objective:
+        elif inferred_action == "filesystem.list_directory":
             proposals.append(
                 ActionProposal(
                     run_id=run_id,
@@ -1201,7 +1408,7 @@ class RuntimePlanner:
                     title=f"List directory {path}",
                     description="List directory entries within the configured filesystem allowlist.",
                     payload={"path": path},
-                    rationale="The objective or collected context points to a directory listing operation.",
+                    rationale="Planning deferred directory inspection until approval, so this action gathers the needed listing evidence inside the bounded filesystem connector.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
                     created_by_agent_id=planner_agent.id,
@@ -1220,7 +1427,7 @@ class RuntimePlanner:
                     title=f"Read file {path}",
                     description="Read a text file from the configured filesystem allowlist.",
                     payload={"path": path},
-                    rationale="The objective points to a read-oriented filesystem action.",
+                    rationale="Planning deferred file-content inspection until approval, so this action gathers the needed read evidence inside the bounded filesystem connector.",
                     provider_name=planning_provider,
                     summary_id=summary_id,
                     created_by_agent_id=planner_agent.id,
@@ -1252,7 +1459,11 @@ class RuntimePlanner:
             title=f"{method} {request.http_url}",
             description="Execute an HTTP request through the allowlisted HTTP connector.",
             payload={"url": request.http_url, "body": request.http_body, "headers": headers},
-            rationale="The operator provided an explicit target URL.",
+            rationale=(
+                "The operator provided an explicit target URL."
+                if method not in {"GET", "HEAD"}
+                else "Planning did not fetch the remote response before approval, so this bounded request gathers the needed evidence when approved."
+            ),
             provider_name=planning_provider,
             summary_id=summary_id,
             created_by_agent_id=planner_agent.id,
@@ -1281,7 +1492,7 @@ class RuntimePlanner:
         self,
         request: AgentRunRequest,
         proposals,
-        summary_text: str,
+        summary,
         profile: str,
         correlation_id: str,
     ) -> tuple[str, str, dict]:
@@ -1290,7 +1501,10 @@ class RuntimePlanner:
             self.data_governance_service.build_report_context_views(
                 request.model_dump(mode="json"),
                 proposal_payloads,
-                summary_text,
+                summary.summary_text,
+                summary_classification=summary.data_classification,
+                summary_lineage=summary.lineage,
+                outbound_summary_text=summary.outbound_summary_text,
             )
         )
         system_prompt = "You are the reporter agent in a Windows-first local control console."
@@ -1340,8 +1554,15 @@ class RuntimePlanner:
             )
             return response.content, response.provider_name, response.raw_response.get("_routing", {})
         except Exception:
+            deferred = local_collected_context.get("deferred_evidence") or []
+            deferred_note = (
+                f" Planning deferred {len(deferred)} evidence-gathering step(s) until approval."
+                if deferred
+                else ""
+            )
             return (
-                "Plan ready. Review the proposed steps, inspect high-risk actions, and approve only the bounded actions you want executed.",
+                "Plan ready. Review the proposed steps, inspect high-risk actions, and approve only the bounded actions you want executed."
+                f"{deferred_note}",
                 provider_name or "offline-fallback",
                 {"mode": "offline-fallback"},
             )
@@ -1369,7 +1590,7 @@ class RuntimePlanner:
             subtasks.append(
                 {
                     "role": AgentRole.PLANNER.value,
-                    "title": f"Inspect filesystem target {request.filesystem_path}",
+                    "title": f"Plan filesystem evidence for {request.filesystem_path}",
                     "node_type": "collect",
                     "branch_key": "filesystem",
                 }
@@ -1428,9 +1649,23 @@ class RuntimePlanner:
     def _planning_classification(request: AgentRunRequest, collected: dict) -> DataClassification:
         if request.file_content or request.http_body:
             return DataClassification.RESTRICTED
-        if request.filesystem_path or request.system_action or "filesystem" in collected or "system" in collected or "tasks" in collected:
+        if "filesystem" in collected or "system" in collected or "tasks" in collected:
             return DataClassification.LOCAL_ONLY
         return DataClassification.EXTERNAL_OK
+
+    @staticmethod
+    def _inferred_filesystem_action(request: AgentRunRequest, observed_kind: str | None) -> str:
+        path = request.filesystem_path or ""
+        lower_objective = request.objective.lower()
+        if request.file_content is not None:
+            return "filesystem.append_text" if "append" in lower_objective else "filesystem.write_text"
+        if "delete" in lower_objective:
+            return "filesystem.delete_path"
+        if "create folder" in lower_objective or "create directory" in lower_objective or "mkdir" in lower_objective:
+            return "filesystem.make_directory"
+        if observed_kind == "directory" or path.endswith(("\\", "/")) or "list" in lower_objective:
+            return "filesystem.list_directory"
+        return "filesystem.read_text"
 
     @staticmethod
     def _provider_profile_for_role(role: AgentRole, settings) -> str:
@@ -1475,6 +1710,12 @@ class RuntimePlanner:
                             "context_namespace": context_namespace,
                             "connector_hint": branch_key,
                         }
+                        | self._agent_work_area_details(
+                            run_id=run_id,
+                            agent=agent,
+                            context_namespace=context_namespace,
+                            branch_key=branch_key,
+                        )
                     ),
                     status="ready",
                     parent_task_node_id=parent_node_id,
@@ -1509,6 +1750,12 @@ class RuntimePlanner:
                         "connector_hint": planner_node.details.get("connector_hint"),
                         "review_target": planner_node.title,
                     }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=reviewer_agent,
+                        context_namespace=f"{reviewer_agent.memory_namespace}:{run_id}:{branch_key}",
+                        branch_key=branch_key,
+                    )
                 ),
                 status="blocked",
                 parent_task_node_id=planner_node.id,
@@ -1537,6 +1784,12 @@ class RuntimePlanner:
                     "planned_provider_profile": self._provider_profile_for_role(AgentRole.REVIEWER, settings),
                     "branch_count": len(review_nodes),
                 }
+                | self._agent_work_area_details(
+                    run_id=run_id,
+                    agent=reviewer_agent,
+                    context_namespace=f"{reviewer_agent.memory_namespace}:{run_id}:merge",
+                    branch_key="review-merge",
+                )
             ),
             status="blocked",
             parent_task_node_id=parent_node_id,
@@ -1572,6 +1825,12 @@ class RuntimePlanner:
                         "allowed_connectors": agent.allowed_connectors,
                         "depends_on_merge": merge_node.id,
                     }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=agent,
+                        context_namespace=f"{agent.memory_namespace}:{run_id}:reporting",
+                        branch_key="reporting",
+                    )
                 ),
                 status="blocked",
                 parent_task_node_id=parent_node_id,
@@ -1586,6 +1845,26 @@ class RuntimePlanner:
             nodes.append(node)
             sequence += 1
         return nodes
+
+    def _agent_work_area_details(
+        self,
+        *,
+        run_id: str,
+        agent: AgentDefinition,
+        context_namespace: str,
+        branch_key: str | None,
+        promotion_target_hint: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "agent_work_area": self.agent_workspace_service.describe_layout(
+                run_id=run_id,
+                agent_role=agent.role.value,
+                memory_namespace=agent.memory_namespace,
+                context_namespace=context_namespace,
+                branch_key=branch_key,
+                promotion_target_hint=promotion_target_hint,
+            )
+        }
 
     def _complete_role_nodes(
         self,

@@ -28,20 +28,20 @@ class DataGovernanceService:
     ACTION_FIELD_REGISTRY: dict[str, dict[str, str]] = {
         "filesystem.write_text": {"path": NON_SENSITIVE, "content": PRIVILEGED_SENSITIVE},
         "filesystem.append_text": {"path": NON_SENSITIVE, "content": PRIVILEGED_SENSITIVE},
-        "filesystem.read_text": {"path": NON_SENSITIVE},
-        "filesystem.list_directory": {"path": NON_SENSITIVE},
+        "filesystem.read_text": {"path": NON_SENSITIVE, "preview": SENSITIVE_LOCAL, "size_bytes": NON_SENSITIVE},
+        "filesystem.list_directory": {"path": NON_SENSITIVE, "entries": PREVIEW_ONLY, "entry_count": NON_SENSITIVE},
         "filesystem.delete_path": {"path": NON_SENSITIVE},
         "filesystem.make_directory": {"path": NON_SENSITIVE},
-        "http.get": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL},
-        "http.head": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL},
-        "http.post": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE},
-        "http.put": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE},
-        "http.patch": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE},
-        "http.delete": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE},
+        "http.get": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body_preview": SENSITIVE_LOCAL, "status_code": NON_SENSITIVE},
+        "http.head": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body_preview": SENSITIVE_LOCAL, "status_code": NON_SENSITIVE},
+        "http.post": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE, "body_preview": SENSITIVE_LOCAL, "status_code": NON_SENSITIVE},
+        "http.put": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE, "body_preview": SENSITIVE_LOCAL, "status_code": NON_SENSITIVE},
+        "http.patch": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE, "body_preview": SENSITIVE_LOCAL, "status_code": NON_SENSITIVE},
+        "http.delete": {"url": NON_SENSITIVE, "headers": SENSITIVE_LOCAL, "body": PRIVILEGED_SENSITIVE, "body_preview": SENSITIVE_LOCAL, "status_code": NON_SENSITIVE},
         "task.create": {"title": PREVIEW_ONLY, "details": SENSITIVE_LOCAL},
-        "task.list": {"limit": NON_SENSITIVE},
-        "system.list_directory": {"path": NON_SENSITIVE},
-        "system.read_text_file": {"path": NON_SENSITIVE},
+        "task.list": {"limit": NON_SENSITIVE, "tasks": PREVIEW_ONLY},
+        "system.list_directory": {"path": NON_SENSITIVE, "entries": PREVIEW_ONLY},
+        "system.read_text_file": {"path": NON_SENSITIVE, "preview": SENSITIVE_LOCAL, "size_bytes": NON_SENSITIVE},
         "system.test_path": {"path": NON_SENSITIVE},
         "system.get_time": {},
     }
@@ -72,6 +72,9 @@ class DataGovernanceService:
             "collected": PREVIEW_ONLY,
             "summary_text": PREVIEW_ONLY,
             "operator_summary": PREVIEW_ONLY,
+            "data_classification": NON_SENSITIVE,
+            "lineage": PREVIEW_ONLY,
+            "outbound_summary_text": PREVIEW_ONLY,
         },
         "connector_input": {
             "path": NON_SENSITIVE,
@@ -83,6 +86,8 @@ class DataGovernanceService:
         "connector_output": {
             "content": SENSITIVE_LOCAL,
             "body": PRIVILEGED_SENSITIVE,
+            "preview": SENSITIVE_LOCAL,
+            "body_preview": SENSITIVE_LOCAL,
             "details": SENSITIVE_LOCAL,
             "summary": PREVIEW_ONLY,
             "tasks": PREVIEW_ONLY,
@@ -142,6 +147,8 @@ class DataGovernanceService:
             "output": PREVIEW_ONLY,
             "error_text": PREVIEW_ONLY,
             "result": PREVIEW_ONLY,
+            "preview": SENSITIVE_LOCAL,
+            "body_preview": SENSITIVE_LOCAL,
         },
         "provider_prompt": {
             "prompt": SENSITIVE_LOCAL,
@@ -158,6 +165,8 @@ class DataGovernanceService:
             "local_prompt_digest": NON_SENSITIVE,
             "remote_prompt_digest": NON_SENSITIVE,
             "routing_mode": NON_SENSITIVE,
+            "lineage": PREVIEW_ONLY,
+            "curation_posture": NON_SENSITIVE,
         },
     }
     GENERIC_FIELD_CLASSES = {
@@ -175,6 +184,9 @@ class DataGovernanceService:
         "system_prompt": PREVIEW_ONLY,
         "task_details": SENSITIVE_LOCAL,
         "affected_resources": PREVIEW_ONLY,
+        "preview": SENSITIVE_LOCAL,
+        "body_preview": SENSITIVE_LOCAL,
+        "content_preview": SENSITIVE_LOCAL,
     }
     METADATA_SUFFIXES = {
         "_blob_id",
@@ -389,15 +401,34 @@ class DataGovernanceService:
         if request_payload.get("http_headers_text"):
             local_only = True
             reasons.append("operator-supplied HTTP headers may contain local secrets")
-        if collected.get("tasks") is not None:
+        task_context = collected.get("tasks") or {}
+        if task_context:
             local_only = True
-            reasons.append("runtime task snapshot was collected from the local database")
-        if collected.get("filesystem") is not None:
+            if task_context.get("collection_mode") == "descriptor-only":
+                reasons.append("runtime task evidence was deferred; local task data stays local until approval")
+            else:
+                reasons.append("runtime task snapshot was collected from the local database")
+        filesystem_context = collected.get("filesystem") or {}
+        if filesystem_context:
             local_only = True
-            reasons.append("local filesystem context was collected")
-        if collected.get("system") is not None:
+            if filesystem_context.get("collection_mode") == "descriptor-only":
+                reasons.append("local filesystem evidence was deferred; file content stays unread until approval")
+            else:
+                reasons.append("local filesystem context was collected")
+        http_context = collected.get("http") or {}
+        if http_context:
+            if http_context.get("collection_mode") == "descriptor-only":
+                reasons.append("HTTP target metadata was prepared without fetching remote content")
+            else:
+                local_only = True
+                reasons.append("collected HTTP response context requires outbound curation by default")
+        system_context = collected.get("system") or {}
+        if system_context:
             local_only = True
-            reasons.append("bounded system context was collected")
+            if system_context.get("collection_mode") == "descriptor-only":
+                reasons.append("bounded system evidence was deferred; local system reads remain approval-gated")
+            else:
+                reasons.append("bounded system context was collected")
 
         if restricted:
             return DataClassification.RESTRICTED, reasons
@@ -418,10 +449,16 @@ class DataGovernanceService:
             "collected_summary": self._remote_collected_summary(collected),
             "governance_notes": reasons,
         }
-        blocked_sections = [
-            key for key in ("tasks", "filesystem", "system")
-            if key in collected
-        ]
+        blocked_sections: list[str] = []
+        if collected.get("tasks"):
+            blocked_sections.append("tasks.snapshot")
+        if collected.get("filesystem"):
+            blocked_sections.append("filesystem.content")
+        http_context = collected.get("http") or {}
+        if http_context:
+            blocked_sections.append("http.response" if http_context.get("collection_mode") == "descriptor-only" else "http.body_preview")
+        if collected.get("system"):
+            blocked_sections.append("system.content")
         sendable_sections = [
             key for key in remote_context.get("collected_summary", {})
             if remote_context["collected_summary"].get(key) is not None
@@ -432,6 +469,14 @@ class DataGovernanceService:
             "blocked_sections": blocked_sections,
             "sendable_sections": sendable_sections,
             "reasons": reasons,
+            "lineage": self.build_derived_lineage(
+                source_kind="planning-context",
+                source_classification=local_classification,
+                blocked_sections=blocked_sections,
+                sendable_sections=sendable_sections,
+                reasons=reasons,
+            ),
+            "curation_posture": "curated-context-summary",
         }
         return local_context, remote_context, governance
 
@@ -440,7 +485,13 @@ class DataGovernanceService:
         request_payload: dict[str, Any],
         proposals: list[dict[str, Any]],
         summary_text: str,
+        *,
+        summary_classification: DataClassification,
+        summary_lineage: dict[str, Any] | None = None,
+        outbound_summary_text: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        lineage = deepcopy(summary_lineage or {})
+        curation_posture = "summary-preview" if outbound_summary_text else "summary-withheld"
         local_context = {
             "objective": request_payload.get("objective"),
             "summary_text": summary_text,
@@ -448,15 +499,33 @@ class DataGovernanceService:
         }
         remote_context = {
             "objective": request_payload.get("objective"),
-            "summary_text": self._preview_value(summary_text),
             "reviewed_proposals": [self._proposal_prompt_view(proposal) for proposal in proposals],
+            "summary_posture": {
+                "source_classification": summary_classification.value,
+                "curation_posture": curation_posture,
+            },
         }
+        blocked_sections = ["raw_proposal_payloads"]
+        sendable_sections = ["reviewed_proposals"]
+        if outbound_summary_text:
+            remote_context["summary_text"] = self._preview_value(outbound_summary_text)
+            sendable_sections.append("summary_text")
+        else:
+            remote_context["summary_note"] = (
+                "Derived planning summary was kept local because it inherits local-only or restricted context."
+            )
+            blocked_sections.append("summary_text")
         governance = {
-            "local_context_classification": DataClassification.LOCAL_ONLY.value,
+            "local_context_classification": summary_classification.value,
             "outbound_classification": DataClassification.EXTERNAL_OK.value,
-            "blocked_sections": ["raw_proposal_payloads"],
-            "sendable_sections": ["summary_text", "reviewed_proposals"],
-            "reasons": ["review output was curated before provider egress"],
+            "blocked_sections": blocked_sections,
+            "sendable_sections": sendable_sections,
+            "reasons": [
+                "review output was curated before provider egress",
+                "derived summaries inherit the classification of the collected planning context until explicitly curated",
+            ],
+            "lineage": lineage,
+            "curation_posture": curation_posture,
         }
         return local_context, remote_context, governance
 
@@ -495,8 +564,41 @@ class DataGovernanceService:
                 "reasons": governance.get("reasons", []),
                 "local_prompt_digest": sha256_hex(local_prompt),
                 "remote_prompt_digest": sha256_hex(remote_prompt),
+                "lineage": governance.get("lineage", {}),
+                "curation_posture": governance.get("curation_posture"),
             },
         }
+
+    def build_derived_lineage(
+        self,
+        *,
+        source_kind: str,
+        source_classification: DataClassification,
+        blocked_sections: Iterable[str],
+        sendable_sections: Iterable[str],
+        reasons: Iterable[str],
+    ) -> dict[str, Any]:
+        return {
+            "source_kind": source_kind,
+            "source_classification": source_classification.value,
+            "blocked_sections": list(blocked_sections),
+            "sendable_sections": list(sendable_sections),
+            "reasons": list(reasons),
+            "requires_curation": source_classification != DataClassification.EXTERNAL_OK,
+        }
+
+    def curate_derived_summary_for_outbound(
+        self,
+        summary_text: str,
+        *,
+        source_classification: DataClassification,
+        lineage: dict[str, Any] | None = None,
+    ) -> str | None:
+        if source_classification == DataClassification.EXTERNAL_OK:
+            return str(self._preview_value(summary_text))
+        if (lineage or {}).get("requires_curation") is False:
+            return str(self._preview_value(summary_text))
+        return None
 
     def classify_field(
         self,
@@ -625,6 +727,8 @@ class DataGovernanceService:
             summary["system"] = self._summarize_system_context(collected.get("system") or {})
         if "http" in collected:
             summary["http"] = self._summarize_http_context(collected.get("http") or {})
+        if collected.get("deferred_evidence"):
+            summary["deferred_evidence"] = self._summarize_deferred_evidence(collected.get("deferred_evidence") or [])
         return summary
 
     def _proposal_prompt_view(self, proposal: dict[str, Any]) -> dict[str, Any]:
@@ -652,6 +756,12 @@ class DataGovernanceService:
         }
 
     def _summarize_tasks_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("collection_mode") == "descriptor-only":
+            return {
+                "task_snapshot_present": False,
+                "task_snapshot_deferred": True,
+                "details_redacted": True,
+            }
         tasks = payload.get("tasks") or []
         status_counts: dict[str, int] = {}
         for item in tasks:
@@ -665,6 +775,14 @@ class DataGovernanceService:
         }
 
     def _summarize_filesystem_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("collection_mode") == "descriptor-only":
+            return {
+                "present": True,
+                "kind": payload.get("path_hint") or "unknown",
+                "path_redacted": bool(payload.get("path")),
+                "inspection_deferred": True,
+                "candidate_action": payload.get("candidate_action"),
+            }
         kind = payload.get("kind") or "unknown"
         summary = {
             "present": True,
@@ -681,6 +799,13 @@ class DataGovernanceService:
         return summary
 
     def _summarize_system_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("collection_mode") == "descriptor-only":
+            return {
+                "present": True,
+                "path_redacted": bool(payload.get("path")),
+                "action": payload.get("action"),
+                "inspection_deferred": True,
+            }
         return {
             "present": True,
             "path_redacted": bool(payload.get("path")),
@@ -692,15 +817,40 @@ class DataGovernanceService:
         }
 
     def _summarize_http_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("collection_mode") == "descriptor-only":
+            return {
+                "present": True,
+                "target": self._safe_url_summary(payload.get("url")),
+                "method": payload.get("method"),
+                "fetch_deferred": True,
+                "response_body_present": False,
+                "response_body_redacted": False,
+                "response_body_digest": None,
+            }
         headers = payload.get("headers") or {}
         content_type = headers.get("content-type") or headers.get("Content-Type")
+        body_preview = payload.get("body_preview") or ""
         return {
             "present": True,
             "target": self._safe_url_summary(payload.get("url")),
             "status_code": payload.get("status_code"),
             "content_type": self._preview_value(str(content_type or "")),
-            "body_preview": self._preview_value(payload.get("body_preview") or ""),
+            "response_body_present": bool(body_preview),
+            "response_body_redacted": bool(body_preview),
+            "response_body_digest": sha256_hex(str(body_preview)) if body_preview else None,
         }
+
+    def _summarize_deferred_evidence(self, evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "connector": item.get("connector"),
+                "action_type": item.get("action_type"),
+                "title": self._preview_value(str(item.get("title") or "")),
+                "reason": self._preview_value(str(item.get("reason") or "")),
+                "status": item.get("status"),
+            }
+            for item in evidence[:10]
+        ]
 
     @staticmethod
     def _safe_url_summary(url: str | None) -> dict[str, str] | None:

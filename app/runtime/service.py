@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.audit.service import AuditService
 from app.runtime.planner import RuntimePlanner
+from app.runtime.graph_runtime import GraphRuntimeService
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
 from app.schemas.agents import AgentRole
 from app.agents.service import AgentService
@@ -17,12 +18,14 @@ class AgentRuntimeService:
         proposal_service: ProposalService,
         audit_service: AuditService,
         agent_service: AgentService,
+        graph_runtime: GraphRuntimeService,
     ):
         self.planner = planner
         self.queue_service = queue_service
         self.proposal_service = proposal_service
         self.audit_service = audit_service
         self.agent_service = agent_service
+        self.graph_runtime = graph_runtime
 
     def run_agent(self, request: AgentRunRequest):
         return self.planner.run(request)
@@ -39,15 +42,10 @@ class AgentRuntimeService:
             correlation_id=proposal.correlation_id,
         )
         self.proposal_service.set_execution_status(proposal_id, ProposalStatus.QUEUED)
-        self.agent_service.update_nodes_for_proposal(
+        self.graph_runtime.sync_proposal_lifecycle(
             proposal_id,
-            role=AgentRole.EXECUTOR,
-            status="queued",
-            details={
-                "approval_id": approval.id,
-                "job_id": job.id,
-                "manifest_hash": approval.manifest_hash,
-            },
+            actor=decision.actor,
+            reason=decision.reason,
         )
         self.audit_service.emit(
             "proposal.approved",
@@ -79,14 +77,10 @@ class AgentRuntimeService:
 
     def reject(self, proposal_id: str, decision: ApprovalDecisionRequest):
         record = self.proposal_service.reject(proposal_id, decision.actor, decision.reason)
-        self.agent_service.update_nodes_for_proposal(
+        self.graph_runtime.sync_proposal_lifecycle(
             proposal_id,
-            role=AgentRole.EXECUTOR,
-            status="blocked",
-            details={
-                "rejected_by": decision.actor,
-                "rejection_reason": decision.reason,
-            },
+            actor=decision.actor,
+            reason=decision.reason,
         )
         self.audit_service.emit(
             "proposal.rejected",
@@ -98,3 +92,60 @@ class AgentRuntimeService:
             },
         )
         return record
+
+    def cancel_execution(self, proposal_id: str, decision: ApprovalDecisionRequest) -> dict:
+        proposal = self.proposal_service.get(proposal_id)
+        job = self.queue_service.get_by_proposal_id(proposal_id)
+        if job is None:
+            raise ValueError("Proposal has no execution job to cancel.")
+        cancelled = self.queue_service.cancel(job.id, reason=decision.reason)
+        self.proposal_service.set_execution_status(proposal_id, ProposalStatus.APPROVED)
+        self.graph_runtime.sync_proposal_lifecycle(
+            proposal_id,
+            actor=decision.actor,
+            reason=decision.reason,
+        )
+        self.audit_service.emit(
+            "proposal.cancelled",
+            {
+                "proposal_id": proposal_id,
+                "job_id": cancelled.id,
+                "actor": decision.actor,
+                "reason": decision.reason,
+                "correlation_id": proposal.correlation_id,
+            },
+        )
+        return {"job": cancelled, "proposal": self.proposal_service.get(proposal_id)}
+
+    def retry_execution(self, proposal_id: str, decision: ApprovalDecisionRequest) -> dict:
+        proposal = self.proposal_service.get(proposal_id)
+        approval = self.proposal_service.latest_approval(proposal_id)
+        if approval is None or approval.decision != "approved":
+            raise ValueError("Proposal does not have an approved manifest to retry.")
+        job = self.queue_service.enqueue(
+            proposal_id,
+            proposal.run_id,
+            decision.actor,
+            approval_id=approval.id,
+            manifest_hash=approval.manifest_hash,
+            correlation_id=proposal.correlation_id,
+        )
+        self.proposal_service.set_execution_status(proposal_id, ProposalStatus.QUEUED)
+        self.graph_runtime.sync_proposal_lifecycle(
+            proposal_id,
+            actor=decision.actor,
+            reason=decision.reason,
+        )
+        self.audit_service.emit(
+            "proposal.requeued",
+            {
+                "proposal_id": proposal_id,
+                "job_id": job.id,
+                "actor": decision.actor,
+                "reason": decision.reason,
+                "approval_id": approval.id,
+                "manifest_hash": approval.manifest_hash,
+                "correlation_id": proposal.correlation_id,
+            },
+        )
+        return {"job": job, "proposal": self.proposal_service.get(proposal_id)}

@@ -144,7 +144,8 @@ def test_provider_specific_config_is_persisted_and_visible(container):
     assert loaded.privacy_tier == "local"
     assert statuses["openai-compatible"].base_url == "http://127.0.0.1:11434/v1"
     assert statuses["openai-compatible"].allowed_hosts == ["127.0.0.1", "localhost"]
-    assert statuses["openai-compatible"].privacy_posture == "external-egress"
+    assert statuses["openai-compatible"].privacy_posture == "local-gateway"
+    assert statuses["openai-compatible"].endpoint_locality == "local-gateway"
     assert statuses["openai-compatible"].destination_summary == "127.0.0.1, localhost"
     assert statuses["openai-compatible"].cost_tier == "low"
     assert statuses["openai-compatible"].latency_tier == "low"
@@ -339,3 +340,109 @@ def test_review_capability_filters_provider_candidates(container):
 
     assert "openai-compatible" in candidate_names
     assert "generic-http" not in candidate_names
+
+
+def test_local_compatible_gateway_can_handle_local_only_prompts(container, monkeypatch):
+    container.settings_service.save_provider_config(
+        ProviderConfigUpdate(
+            provider_name="openai-compatible",
+            enabled=True,
+            base_url="http://127.0.0.1:11434/v1",
+            default_model="local-gpt-5",
+            allowed_hosts=["127.0.0.1"],
+            privacy_tier="local",
+        ),
+        actor="pytest",
+        reason="local-compatible-gateway",
+    )
+    monkeypatch.setattr(
+        container.provider_registry.get("openai-compatible"),
+        "complete",
+        lambda request, provider_settings: ProviderResponse(
+            provider_name="openai-compatible",
+            model_name=request.model_name or provider_settings.model,
+            content="local gateway response",
+            raw_response={},
+        ),
+    )
+
+    response = container.provider_service.complete(
+        ProviderRequest(
+            provider_name="openai-compatible",
+            prompt="Keep this local-only.",
+            data_classification="local-only",
+        )
+    )
+    statuses = {status.name: status for status in container.provider_service.list_statuses()}
+
+    assert response.provider_name == "openai-compatible"
+    assert statuses["openai-compatible"].endpoint_locality == "local-gateway"
+
+
+def test_model_fit_influences_review_ranking(container):
+    container.settings_service.save_provider_config(
+        ProviderConfigUpdate(
+            provider_name="openai-compatible",
+            enabled=True,
+            base_url="http://127.0.0.1:11434/v1",
+            default_model="gpt-5",
+            privacy_tier="local",
+        ),
+        actor="pytest",
+        reason="review-model-fit-strong",
+    )
+    container.settings_service.save_provider_config(
+        ProviderConfigUpdate(
+            provider_name="generic-http",
+            enabled=True,
+            generic_http_endpoint="https://gateway.example.com/generate",
+            default_model="mini-model",
+            privacy_tier="external",
+        ),
+        actor="pytest",
+        reason="review-model-fit-weak",
+    )
+
+    candidates = container.provider_service._ranked_provider_candidates(  # noqa: SLF001
+        ProviderRequest(prompt="Review this plan carefully.", task_type="review-branch", profile="strong"),
+        container.settings_service.get_effective_settings(),
+    )
+
+    assert candidates[0]["provider_name"] == "openai-compatible"
+
+
+def test_budget_exhaustion_removes_provider_from_candidates(container):
+    container.settings_service.save_provider_config(
+        ProviderConfigUpdate(
+            provider_name="openai-compatible",
+            enabled=True,
+            base_url="http://127.0.0.1:11434/v1",
+            default_model="local-model",
+            budget_limit_units=0.1,
+        ),
+        actor="pytest",
+        reason="budget-limit-test",
+    )
+    container.provider_service._provider_state["openai-compatible"] = {  # noqa: SLF001
+        "failures": 0,
+        "opened_until": 0.0,
+        "last_error": None,
+        "success_count": 3,
+        "failure_count": 0,
+        "last_score": 0.0,
+        "last_routing_reason": None,
+        "latency_ewma_ms": 50.0,
+        "success_rate": 1.0,
+        "consecutive_failures": 0,
+        "last_error_category": None,
+        "budget_used_units": 0.2,
+    }
+
+    candidates = container.provider_service._ranked_provider_candidates(  # noqa: SLF001
+        ProviderRequest(prompt="Avoid budget exhausted providers.", profile="fast"),
+        container.settings_service.get_effective_settings(),
+    )
+    statuses = {status.name: status for status in container.provider_service.list_statuses()}
+
+    assert all(candidate["provider_name"] != "openai-compatible" for candidate in candidates)
+    assert statuses["openai-compatible"].budget_exhausted is True

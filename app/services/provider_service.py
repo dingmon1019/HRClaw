@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from time import time
 from typing import Iterable
+from urllib.parse import urlsplit
 
 from app.audit.service import AuditService
 from app.core.database import Database
@@ -125,6 +126,7 @@ class ProviderService:
                         score=candidate["score"],
                         reason=candidate["reason"],
                         latency_ms=latency_ms,
+                        usage_units=self._estimate_usage_units(provider_request, response.content),
                     )
                     return response
                 except Exception as exc:
@@ -171,9 +173,14 @@ class ProviderService:
                     "cost_tier": provider_config.cost_tier,
                     "latency_tier": provider_config.latency_tier,
                     "privacy_tier": provider_config.privacy_tier,
-                    "privacy_posture": self._privacy_posture(provider.name, status.supports_remote),
-                    "egress_posture": self._egress_posture(provider_config, settings, status.supports_remote),
+                    "privacy_posture": self._privacy_posture(provider, provider_config),
+                    "egress_posture": self._egress_posture(provider, provider_config, settings),
                     "destination_summary": self._destination_summary(provider_config, settings),
+                    "endpoint_locality": self._endpoint_locality(provider, provider_config),
+                    "model_inventory": self._model_inventory(provider, provider_config, provider_settings),
+                    "budget_limit_units": provider_config.budget_limit_units,
+                    "budget_used_units": float(state.get("budget_used_units") or 0.0),
+                    "budget_exhausted": self._is_budget_exhausted(provider.name, provider_config),
                     "success_count": int(state.get("success_count") or 0),
                     "failure_count": int(state.get("failure_count") or 0),
                     "last_score": float(state.get("last_score") or 0.0),
@@ -214,6 +221,7 @@ class ProviderService:
                             "success_rate": float(state.get("success_rate") or 0.0),
                             "consecutive_failures": int(state.get("consecutive_failures") or 0),
                             "last_error_category": state.get("last_error_category"),
+                            "budget_used_units": float(state.get("budget_used_units") or 0.0),
                         }
                     ),
                     checked_at,
@@ -300,16 +308,18 @@ class ProviderService:
     def _validate_provider_usage(
         self,
         provider_name: str,
-        supports_remote: bool,
+        provider,
+        provider_config: ProviderConfigRecord,
         request: ProviderRequest,
         settings: EffectiveSettings,
     ) -> None:
         classification = DataClassification(request.data_classification)
-        if classification == DataClassification.LOCAL_ONLY and supports_remote:
+        external_egress = self._is_external_egress(provider, provider_config)
+        if classification == DataClassification.LOCAL_ONLY and external_egress:
             raise ProviderError(f"Provider {provider_name} is remote-only and cannot handle local-only data.")
         if (
             classification == DataClassification.RESTRICTED
-            and supports_remote
+            and external_egress
             and not settings.allow_restricted_provider_egress
         ):
             raise ProviderError(
@@ -334,7 +344,15 @@ class ProviderService:
         opened_until = float(state.get("opened_until") or 0)
         return opened_until > time()
 
-    def _record_success(self, provider_name: str, *, score: float, reason: str, latency_ms: float) -> None:
+    def _record_success(
+        self,
+        provider_name: str,
+        *,
+        score: float,
+        reason: str,
+        latency_ms: float,
+        usage_units: float = 0.0,
+    ) -> None:
         previous = self._provider_state.get(provider_name) or {}
         success_count = int(previous.get("success_count") or 0) + 1
         failure_count = int(previous.get("failure_count") or 0)
@@ -352,6 +370,7 @@ class ProviderService:
             "success_rate": success_count / max(1, success_count + failure_count),
             "consecutive_failures": 0,
             "last_error_category": None,
+            "budget_used_units": float(previous.get("budget_used_units") or 0.0) + float(usage_units),
         }
         self._persist_provider_state(provider_name)
 
@@ -376,6 +395,7 @@ class ProviderService:
                 "success_rate": 0.0,
                 "consecutive_failures": 0,
                 "last_error_category": None,
+                "budget_used_units": 0.0,
             },
         )
         failures = int(state.get("failures") or 0) + 1
@@ -396,6 +416,7 @@ class ProviderService:
             / max(1, int(state.get("success_count") or 0) + int(state.get("failure_count") or 0) + 1),
             "consecutive_failures": int(state.get("consecutive_failures") or 0) + 1,
             "last_error_category": self._error_category(exc),
+            "budget_used_units": float(state.get("budget_used_units") or 0.0),
         }
         self._persist_provider_state(provider_name)
 
@@ -416,6 +437,7 @@ class ProviderService:
                 "success_rate": float(metadata.get("success_rate") or 0.0),
                 "consecutive_failures": int(metadata.get("consecutive_failures") or 0),
                 "last_error_category": metadata.get("last_error_category"),
+                "budget_used_units": float(metadata.get("budget_used_units") or 0.0),
             }
         return state
 
@@ -491,7 +513,7 @@ class ProviderService:
         if provider_config.auth_source == "credential-manager":
             metadata["resolved_secret"] = self.credential_store.read_secret(provider_config.credential_target)
         prompt_variants = metadata.get("prompt_variants") if isinstance(metadata.get("prompt_variants"), dict) else {}
-        prompt_variant_name = "remote" if provider.supports_remote else "local"
+        prompt_variant_name = "remote" if self._is_external_egress(provider, provider_config) else "local"
         prompt_variant = prompt_variants.get(prompt_variant_name) if prompt_variants else None
         if prompt_variant is None and prompt_variants:
             prompt_variant = prompt_variants.get("local") or prompt_variants.get("remote")
@@ -525,8 +547,10 @@ class ProviderService:
                     raise ProviderError(f"Circuit open for provider {provider_name}.")
                 if not self._provider_configured(provider, provider_settings, provider_config):
                     raise ProviderError(f"Provider {provider_name} is not configured for auth source {provider_config.auth_source}.")
+                if self._is_budget_exhausted(provider_name, provider_config):
+                    raise ProviderError(f"Provider {provider_name} exhausted its local budget ceiling.")
                 resolved_request = self._resolve_provider_request(request, provider, provider_config)
-                self._validate_provider_usage(provider_name, provider.supports_remote, resolved_request, provider_settings)
+                self._validate_provider_usage(provider_name, provider, provider_config, resolved_request, provider_settings)
                 score, reason = self._score_provider(provider_name, provider, provider_config, resolved_request)
                 ranked.append(
                     {
@@ -553,11 +577,12 @@ class ProviderService:
         classification = DataClassification(request.data_classification)
         required = self.TASK_CAPABILITY_MAP.get(request.task_type or "", {"text"})
         capability_fit = 40.0 + (10.0 * len(required.intersection(set(provider.capabilities))))
-        privacy_score = 10.0 if provider.supports_local else -5.0
+        endpoint_locality = self._endpoint_locality(provider, provider_config)
+        privacy_score = 18.0 if endpoint_locality in {"local-native", "local-gateway"} else -5.0
         if request.profile in {"local-only", "privacy-preferred"}:
-            privacy_score += 20.0 if provider.supports_local else -20.0
+            privacy_score += 20.0 if endpoint_locality in {"local-native", "local-gateway"} else -20.0
         if classification in {DataClassification.LOCAL_ONLY, DataClassification.RESTRICTED}:
-            privacy_score += 15.0 if provider.supports_local else -25.0
+            privacy_score += 15.0 if endpoint_locality in {"local-native", "local-gateway"} else -25.0
 
         cost_map = {"low": 15.0, "standard": 6.0, "high": -8.0}
         latency_map = {"low": 15.0, "standard": 6.0, "high": -8.0}
@@ -565,6 +590,7 @@ class ProviderService:
         cost_score = cost_map.get(provider_config.cost_tier, 0.0)
         latency_score = latency_map.get(provider_config.latency_tier, 0.0)
         posture_score = privacy_tier_map.get(provider_config.privacy_tier, 0.0)
+        model_fit_score = self._model_fit_score(provider, provider_config, request)
         if request.profile == "cheap":
             cost_score *= 1.5
         if request.profile == "fast":
@@ -588,21 +614,25 @@ class ProviderService:
             reliability_score += 10.0
         error_category_penalty = -8.0 if state.get("last_error_category") in {"timeout", "network", "auth"} else 0.0
         explicit_override = 100.0 if request.provider_name == provider_name else 0.0
+        budget_penalty = -100.0 if self._is_budget_exhausted(provider_name, provider_config) else 0.0
         total = (
             capability_fit
             + privacy_score
             + cost_score
             + latency_score
             + posture_score
+            + model_fit_score
             + latency_observed_score
             + reliability_score
             + error_category_penalty
+            + budget_penalty
             + explicit_override
         )
         reason = (
             f"capability={capability_fit:.1f}, privacy={privacy_score:.1f}, cost={cost_score:.1f}, "
             f"latency={latency_score:.1f}, observed_latency={latency_observed_score:.1f}, posture={posture_score:.1f}, "
-            f"reliability={reliability_score:.1f}, error_penalty={error_category_penalty:.1f}, explicit={explicit_override:.1f}"
+            f"model_fit={model_fit_score:.1f}, locality={endpoint_locality}, reliability={reliability_score:.1f}, "
+            f"error_penalty={error_category_penalty:.1f}, budget_penalty={budget_penalty:.1f}, explicit={explicit_override:.1f}"
         )
         return total, reason
 
@@ -617,6 +647,7 @@ class ProviderService:
             "success_rate": 0.0,
             "consecutive_failures": 0,
             "last_error_category": None,
+            "budget_used_units": 0.0,
         }
         self._provider_state[provider_name] = {
             **state,
@@ -640,10 +671,12 @@ class ProviderService:
             },
         )
 
-    @staticmethod
-    def _privacy_posture(provider_name: str, supports_remote: bool) -> str:
-        if provider_name == "mock" or not supports_remote:
+    def _privacy_posture(self, provider, config: ProviderConfigRecord) -> str:
+        locality = self._endpoint_locality(provider, config)
+        if locality == "local-native":
             return "local-only"
+        if locality == "local-gateway":
+            return "local-gateway"
         return "external-egress"
 
     @staticmethod
@@ -655,19 +688,99 @@ class ProviderService:
 
     def _egress_posture(
         self,
+        provider,
         config: ProviderConfigRecord,
         settings: EffectiveSettings,
-        supports_remote: bool,
     ) -> str:
         if not config.enabled:
             return "disabled"
-        if not supports_remote:
+        locality = self._endpoint_locality(provider, config)
+        if locality == "local-native":
             return "no external egress"
+        if locality == "local-gateway":
+            return "loopback gateway"
         if config.allowed_hosts:
             return "restricted allowlist"
         if settings.provider_allowed_hosts:
             return "inherits global allowlist"
         return "no outbound host configured"
+
+    def _endpoint_locality(self, provider, config: ProviderConfigRecord) -> str:
+        if provider.name == "mock" or (provider.supports_local and not provider.supports_remote):
+            return "local-native"
+        endpoint = config.base_url or config.generic_http_endpoint
+        if endpoint:
+            host = (urlsplit(endpoint).hostname or "").lower()
+            if host in {"127.0.0.1", "localhost", "::1"}:
+                return "local-gateway"
+        return "remote-endpoint"
+
+    def _is_external_egress(self, provider, config: ProviderConfigRecord) -> bool:
+        return self._endpoint_locality(provider, config) not in {"local-native", "local-gateway"}
+
+    def _model_inventory(
+        self,
+        provider,
+        config: ProviderConfigRecord,
+        settings: EffectiveSettings,
+    ) -> list[dict[str, object]]:
+        model_name = config.default_model or settings.model
+        if not model_name:
+            return []
+        return [self._model_profile(provider, config, model_name)]
+
+    def _model_profile(
+        self,
+        provider,
+        config: ProviderConfigRecord,
+        model_name: str,
+    ) -> dict[str, object]:
+        lowered = model_name.lower()
+        context_window_class = "standard"
+        if any(token in lowered for token in ["32k", "64k", "128k", "gpt-5", "opus", "sonnet"]):
+            context_window_class = "large"
+        elif any(token in lowered for token in ["mini", "small", "haiku", "nano"]):
+            context_window_class = "small"
+        planning_fit = "strong" if any(token in lowered for token in ["gpt-5", "sonnet", "opus", "pro"]) else "standard"
+        review_fit = "strong" if any(token in lowered for token in ["gpt-5", "sonnet", "opus"]) else "standard"
+        report_fit = "fast" if any(token in lowered for token in ["mini", "flash", "haiku"]) else "strong"
+        return {
+            "name": model_name,
+            "context_window_class": context_window_class,
+            "planning_fit": planning_fit,
+            "review_fit": review_fit,
+            "report_fit": report_fit,
+            "structured_output": provider.name in {"openai", "openai-compatible"} or "json" in lowered,
+            "endpoint_locality": self._endpoint_locality(provider, config),
+        }
+
+    def _model_fit_score(
+        self,
+        provider,
+        config: ProviderConfigRecord,
+        request: ProviderRequest,
+    ) -> float:
+        model_name = request.model_name or config.default_model or self.settings_service.get_effective_settings().model
+        if not model_name:
+            return 0.0
+        profile = self._model_profile(provider, config, model_name)
+        if request.task_type in {"planning-summary", "planning-branch"}:
+            return 12.0 if profile["planning_fit"] == "strong" else 6.0
+        if request.task_type == "review-branch":
+            return 14.0 if profile["review_fit"] == "strong" else 6.0
+        if request.task_type == "report-plan":
+            return 10.0 if profile["report_fit"] == "strong" else 7.0
+        return 4.0 if profile["context_window_class"] == "large" else 2.0
+
+    def _is_budget_exhausted(self, provider_name: str, config: ProviderConfigRecord) -> bool:
+        if config.budget_limit_units is None:
+            return False
+        used = float((self._provider_state.get(provider_name) or {}).get("budget_used_units") or 0.0)
+        return used >= float(config.budget_limit_units)
+
+    @staticmethod
+    def _estimate_usage_units(request: ProviderRequest, content: str | None) -> float:
+        return round((len(request.prompt or "") + len(content or "")) / 1000.0, 3)
 
     @staticmethod
     def _error_category(exc: Exception) -> str:

@@ -8,7 +8,7 @@
         </div>
         <div class="stack tight align-end">
             <span class="badge ok">Approval Bound</span>
-            <span class="badge ok">Worker Isolated</span>
+            <span class="badge ok">Constrained Worker Boundary</span>
         </div>
     </div>
 
@@ -101,6 +101,26 @@
                         Filesystem Target
                         <input type="text" name="filesystem_path" placeholder="Relative paths resolve inside {{ settings.workspace_root }}">
                     </label>
+                    <div class="panel inset">
+                        <h4>Windows Workspace Picker</h4>
+                        <p class="small muted">Launch the native Windows file picker and populate the workspace-relative path automatically.</p>
+                        <div class="actions">
+                            <button
+                                type="button"
+                                class="button ghost mini"
+                                data-workspace-picker
+                                data-endpoint="/api/windows/workspace-file-picker"
+                                data-target-input="input[name='filesystem_path']"
+                                data-feedback-selector="#workspace-picker-feedback"
+                            >
+                                Choose Workspace File
+                            </button>
+                        </div>
+                        <p id="workspace-picker-feedback" class="small muted">The picker keeps the returned path inside {{ settings.workspace_root }}.</p>
+                    </div>
+                </div>
+
+                <div class="grid two">
                     <label>
                         Provider Override
                         <select name="provider_name">
@@ -110,6 +130,10 @@
                             {% endfor %}
                         </select>
                     </label>
+                    <div class="panel inset">
+                        <h4>Windows Runtime Helper</h4>
+                        <p class="small muted">Need to inspect the managed workspace before you ask? Use <code>.\scripts\open-runtime-folders.ps1</code> to open the runtime workspace in Explorer.</p>
+                    </div>
                 </div>
 
                 <label>

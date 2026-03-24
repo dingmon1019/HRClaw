@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     reject.add_argument("--username")
     reject.add_argument("--token-file")
 
-    worker = subparsers.add_parser("run-worker", help="Run the isolated execution worker.")
+    worker = subparsers.add_parser("run-worker", help="Run the constrained execution worker.")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--limit", type=int, default=1)
     worker.add_argument("--interval", type=float, default=2.0)

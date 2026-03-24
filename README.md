@@ -15,6 +15,10 @@ The project is designed to be safer and more usable for Windows localhost operat
 - bounded local connectors only, no raw shell execution
 - multi-provider routing with egress controls, scoring, and provider-specific governance records
 - provider prompt governance that keeps raw local runtime context local by default and sends only curated outbound-safe summaries to remote providers
+- agent-scoped scratch work areas with explicit promotion into the shared workspace
+- integrated Windows workspace file picker in the workbench for managed workspace paths
+- Windows scheduled-task controls in the settings console for installing, starting, stopping, and checking the worker background path
+- optional Windows Credential Manager lifecycle for provider secrets when `pywin32` exposes `win32cred`
 - SQLite-backed persistence, audit, task graph history, and clean release packaging
 
 ## Why This Exists
@@ -39,7 +43,7 @@ This repository provides two integrated surfaces:
 
 The runtime follows this high-level flow:
 
-1. collect bounded local context
+1. inspect operator-supplied inputs and safe descriptors only
 2. supervisor decomposes the objective
 3. planner creates typed candidate actions
 4. reviewer applies policy and egress checks
@@ -186,10 +190,13 @@ Default runtime state on Windows:
 - `%LOCALAPPDATA%\\WinAgentRuntime\\secrets`
 - `%LOCALAPPDATA%\\WinAgentRuntime\\logs`
 - `%LOCALAPPDATA%\\WinAgentRuntime\\workspace`
+- `%LOCALAPPDATA%\\WinAgentRuntime\\agent_workspaces`
 
 Default behavior:
 
 - relative paths resolve inside the dedicated workspace
+- planner, reviewer, executor, and reporter each get an agent-scoped scratch root under `agent_workspaces`
+- agent scratch paths are not the shared workspace; promotion into the shared workspace is explicit and approval-bound
 - writes outside the allowlist are denied
 - source tree writes are denied
 - DB, audit, settings, token, and log file writes are denied
@@ -255,6 +262,7 @@ Worker safety improvements:
 - stale running job recovery
 - dead-letter handling after repeated failures
 - task-scoped execution bundles executed in a scrubbed child process
+- child processes start inside an executor-specific scratch root rather than the runtime root
 - exact granted file paths and HTTP targets recorded in boundary metadata when the action schema allows it
 - brokered task actions so the child process does not receive a generic runtime DB path for task-connector work
 - boundary metadata persisted on queue jobs, execution attempts, run history, and audit events
@@ -314,6 +322,12 @@ Optional Windows worker/background helpers:
 .\scripts\show-runtime-posture.ps1
 ```
 
+In-product Windows integrations:
+
+- the Assistant Workbench can open the native workspace file picker and return a workspace-relative path directly into the form
+- the Settings page can install, start, stop, inspect, and remove the worker scheduled task
+- provider catalog entries can check or rotate Windows Credential Manager targets without leaving the localhost UI
+
 Optional Windows startup task for the localhost console:
 
 ```powershell
@@ -367,6 +381,14 @@ python -m app.cli run-worker --once --token-file worker.token
 
 Provider secrets can also be created, tested, rotated, and deleted through Windows Credential Manager when `pywin32` exposes `win32cred`.
 
+Credential Manager examples:
+
+```powershell
+python -m app.cli set-credential --target WinAgentRuntime/provider/openai
+python -m app.cli test-credential --target WinAgentRuntime/provider/openai
+python -m app.cli delete-credential --target WinAgentRuntime/provider/openai
+```
+
 ## Testing
 
 Run the test suite:
@@ -419,6 +441,14 @@ CI-oriented verification mode:
 ```
 
 Every clean archive now contains `release_manifest.json` with build time, include/exclude policy, git revision, and the explicit statement that runtime state belongs outside the repository. The packager also emits a `.sha256` sidecar for the archive.
+
+For collaborator or Codex handoff bundles, use the dedicated handoff mode instead of reusing a release zip:
+
+```powershell
+.\scripts\export-handoff.ps1 -Version handoff -Clean
+```
+
+Handoff bundles use the same allowlist discipline, exclude repo-local runtime artifacts and stale `dist/` outputs, and label the manifest as `handoff-source`.
 
 Clean ignored repo-local caches and legacy runtime folders when needed:
 

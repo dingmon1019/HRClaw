@@ -166,6 +166,9 @@ class SummaryRecord(BaseModel):
     collected: dict[str, Any]
     summary_text: str
     provider_name: str
+    data_classification: DataClassification = DataClassification.LOCAL_ONLY
+    lineage: dict[str, Any] = Field(default_factory=dict)
+    outbound_summary_text: str | None = None
     created_at: str
 
 
@@ -181,6 +184,7 @@ class ExecutionJobStatus(str, Enum):
     EXECUTED = "executed"
     FAILED = "failed"
     BLOCKED = "blocked"
+    CANCELLED = "cancelled"
     DEAD_LETTER = "dead_letter"
 
 
@@ -241,6 +245,10 @@ class ExecutionBoundaryMetadata(BaseModel):
     scope_strategy: str = "connector-bounded"
     cwd: str | None = None
     python_executable: str | None = None
+    shared_workspace_root: str | None = None
+    agent_work_root: str | None = None
+    agent_scratch_root: str | None = None
+    promotion_root: str | None = None
     notes: list[str] = Field(default_factory=list)
 
 

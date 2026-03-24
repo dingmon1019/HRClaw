@@ -81,6 +81,17 @@ def test_session_idle_timeout_forces_relogin(client, container):
     assert response.headers["location"].startswith("/login")
 
 
+def test_run_agent_page_uses_truthful_boundary_language(client):
+    bootstrap_operator(client)
+
+    response = client.get("/run", headers={"accept": "text/html"})
+    body = response.text
+
+    assert response.status_code == 200
+    assert "Constrained Worker Boundary" in body
+    assert "Worker Isolated" not in body
+
+
 def test_approved_snapshot_becomes_stale_when_settings_change(container):
     result = container.runtime_service.run_agent(
         AgentRunRequest(objective="Create a tracked task", task_title="Snapshot task")
@@ -567,6 +578,11 @@ def test_remote_planning_prompt_redacts_filesystem_context(monkeypatch, tmp_path
     captured: list[ProviderRequest] = []
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setattr(
+        container.connector_registry.get("filesystem"),
+        "collect",
+        lambda payload: (_ for _ in ()).throw(AssertionError("planning should not read filesystem content before approval")),
+    )
+    monkeypatch.setattr(
         container.provider_registry.get("openai"),
         "complete",
         lambda request, provider_settings: (
@@ -580,7 +596,7 @@ def test_remote_planning_prompt_redacts_filesystem_context(monkeypatch, tmp_path
         ),
     )
 
-    container.runtime_service.run_agent(
+    result = container.runtime_service.run_agent(
         AgentRunRequest(
             objective="Inspect a local note and propose the next safe step",
             filesystem_path="notes.txt",
@@ -592,6 +608,135 @@ def test_remote_planning_prompt_redacts_filesystem_context(monkeypatch, tmp_path
     assert "TOP SECRET FILE CONTENT" not in planning_request.prompt
     assert str(workspace_file) not in planning_request.prompt
     assert "path_redacted" in planning_request.prompt
+    assert "inspection_deferred" in planning_request.prompt
+    assert any(proposal.action_type == "filesystem.read_text" for proposal in result.proposals)
+    assert result.summary.collected["filesystem"]["collection_mode"] == "descriptor-only"
+    assert result.summary.collected["deferred_evidence"][0]["action_type"] == "filesystem.read_text"
+
+
+def test_remote_report_prompt_withholds_local_only_derived_summary(monkeypatch, tmp_path):
+    settings = AppSettings(
+        app_name="Remote Report Governance Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="openai",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+        allow_insecure_local_storage=True,
+    )
+    container = AppContainer(settings)
+    container.database.execute(
+        "INSERT INTO tasks(id, title, details, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ("task_report_secret", "Secret task", "ULTRA SECRET TASK PAYLOAD", "open", "2026-03-24T00:00:00+00:00", "2026-03-24T00:00:00+00:00"),
+    )
+    captured: list[ProviderRequest] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def complete(request, provider_settings):
+        captured.append(request)
+        if request.task_type == "planning-summary":
+            return ProviderResponse(
+                provider_name="openai",
+                model_name=request.model_name or provider_settings.model,
+                content="TOP SECRET DERIVED SUMMARY FROM LOCAL TASK SNAPSHOT",
+                raw_response={},
+            )
+        return ProviderResponse(
+            provider_name="openai",
+            model_name=request.model_name or provider_settings.model,
+            content="remote report",
+            raw_response={},
+        )
+
+    monkeypatch.setattr(container.provider_registry.get("openai"), "complete", complete)
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Plan a follow-up from local task data and summarize it for me",
+            task_title="Follow up safely",
+            provider_name="openai",
+        )
+    )
+
+    summary = container.summary_service.get_by_run_id(result.run_id)
+    assert summary is not None
+    assert summary.data_classification.value == "local-only"
+    assert summary.outbound_summary_text is None
+
+    report_request = next(request for request in captured if request.task_type == "report-plan")
+    assert "TOP SECRET DERIVED SUMMARY FROM LOCAL TASK SNAPSHOT" not in report_request.prompt
+    assert "summary-withheld" in report_request.prompt
+    assert report_request.metadata["selected_prompt_variant"] == "remote"
+    assert report_request.metadata["prompt_governance"]["lineage"]["source_classification"] == "local-only"
+
+    outbound_rows = container.database.fetch_all(
+        "SELECT payload_json FROM audit_entries WHERE event_type = ? ORDER BY rowid ASC",
+        ("provider.prompt_outbound",),
+    )
+    report_outbound = json.loads(outbound_rows[-1]["payload_json"])
+    assert report_outbound["task_type"] == "report-plan"
+    assert report_outbound["prompt_governance"]["lineage"]["source_classification"] == "local-only"
+    assert report_outbound["prompt_governance"]["curation_posture"] == "summary-withheld"
+
+
+def test_remote_planning_prompt_redacts_http_response_body_preview(monkeypatch, tmp_path):
+    settings = AppSettings(
+        app_name="Remote HTTP Prompt Governance Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        allowed_http_hosts="example.com",
+        provider="openai",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+        allow_insecure_local_storage=True,
+    )
+    container = AppContainer(settings)
+    captured: list[ProviderRequest] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        container.connector_registry.get("http"),
+        "collect",
+        lambda payload: (_ for _ in ()).throw(AssertionError("planning should not fetch HTTP content before approval")),
+    )
+    monkeypatch.setattr(
+        container.provider_registry.get("openai"),
+        "complete",
+        lambda request, provider_settings: (
+            captured.append(request)
+            or ProviderResponse(
+                provider_name="openai",
+                model_name=request.model_name or provider_settings.model,
+                content="remote summary",
+                raw_response={},
+            )
+        ),
+    )
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Inspect an allowlisted HTTP endpoint and propose the next safe step",
+            http_url="https://example.com/api",
+            provider_name="openai",
+        )
+    )
+
+    planning_request = next(request for request in captured if request.task_type == "planning-summary")
+    assert "REMOTE RESPONSE BODY" not in planning_request.prompt
+    assert "body_preview" not in planning_request.prompt
+    assert "fetch_deferred" in planning_request.prompt
+    assert planning_request.metadata["selected_prompt_variant"] == "remote"
+    assert planning_request.metadata["prompt_governance"]["lineage"]["source_classification"] == "external-ok"
+    assert result.summary.data_classification.value == "external-ok"
+    assert any(proposal.action_type == "http.get" for proposal in result.proposals)
+    assert result.summary.collected["http"]["collection_mode"] == "descriptor-only"
 
 
 def test_cli_token_issue_and_verify(container):
@@ -725,3 +870,60 @@ def test_release_archive_uses_allowlist(tmp_path):
     assert manifest["excluded_policy"]["forbidden_segments"]
     assert manifest["include_policy"]
     assert manifest["included_paths"]
+
+
+def test_handoff_preflight_flags_dist_artifacts(tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "package_release.py"
+    spec = importlib.util.spec_from_file_location("package_release", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "workspace").mkdir()
+
+    findings = module.verify_working_tree(tmp_path, include_dist=True)
+
+    assert "dist" in findings
+    assert "workspace" in findings
+
+
+def test_handoff_archive_excludes_runtime_and_dist_artifacts(tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "package_release.py"
+    spec = importlib.util.spec_from_file_location("package_release", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    root = tmp_path / "repo"
+    (root / "app").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    (root / "ui").mkdir()
+    (root / "docs").mkdir()
+    (root / "README.md").write_text("readme", encoding="utf-8")
+    (root / "LICENSE").write_text("license", encoding="utf-8")
+    (root / "main.py").write_text("print('ok')", encoding="utf-8")
+    (root / "requirements.txt").write_text("fastapi", encoding="utf-8")
+    (root / ".env.example").write_text("APP_NAME=Test", encoding="utf-8")
+    (root / "app" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "scripts" / "bootstrap.ps1").write_text("Write-Host ok", encoding="utf-8")
+    (root / "ui" / "index.html").write_text("<html></html>", encoding="utf-8")
+    (root / "docs" / "release_hygiene.md").write_text("docs", encoding="utf-8")
+    (root / "dist").mkdir()
+    (root / "dist" / "stale.zip").write_text("bad", encoding="utf-8")
+    (root / "data").mkdir()
+    (root / "data" / "runtime.db").write_text("bad", encoding="utf-8")
+
+    module.DIST_DIR = tmp_path / "dist-out"
+    result = module.build_handoff_archive(root, version="pytest")
+    import zipfile
+
+    with zipfile.ZipFile(result.archive_path, "r") as handle:
+        names = set(handle.namelist())
+        manifest_name = next(name for name in names if name.endswith("release_manifest.json"))
+        manifest = json.loads(handle.read(manifest_name).decode("utf-8"))
+
+    assert all("/dist/" not in name for name in names)
+    assert all("/data/" not in name for name in names)
+    assert manifest["artifact_kind"] == "handoff-source"
+    assert manifest["runtime_state_outside_repo"] is True

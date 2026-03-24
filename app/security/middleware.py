@@ -11,7 +11,7 @@ from starlette.responses import PlainTextResponse
 class LocalhostSecurityMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, trusted_hosts: Iterable[str], max_request_size_bytes: int):
         super().__init__(app)
-        self.trusted_hosts = {host.lower() for host in trusted_hosts}
+        self.trusted_hosts = self._normalize_hosts(trusted_hosts)
         self.max_request_size_bytes = max_request_size_bytes
 
     async def dispatch(self, request: Request, call_next):
@@ -31,11 +31,18 @@ class LocalhostSecurityMiddleware(BaseHTTPMiddleware):
         if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
             origin = request.headers.get("origin")
             if origin:
+                if origin.strip().lower() == "null":
+                    response = await call_next(request)
+                    return self._apply_security_headers(response)
                 parsed_origin = urlparse(origin)
                 origin_host = (parsed_origin.hostname or "").lower()
                 if origin_host not in self.trusted_hosts:
                     return PlainTextResponse("Origin is not allowed.", status_code=403)
         response = await call_next(request)
+        return self._apply_security_headers(response)
+
+    @staticmethod
+    def _apply_security_headers(response):
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self'; "
@@ -53,3 +60,25 @@ class LocalhostSecurityMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Cache-Control"] = "no-store"
         return response
+
+    @staticmethod
+    def _normalize_hosts(trusted_hosts: Iterable[str] | str | None) -> set[str]:
+        if trusted_hosts is None:
+            return set()
+        if isinstance(trusted_hosts, str):
+            items = trusted_hosts.split(",")
+        else:
+            items = trusted_hosts
+        normalized: set[str] = set()
+        for item in items:
+            host = str(item).strip().lower()
+            if not host:
+                continue
+            if "://" in host:
+                parsed = urlparse(host)
+                host = (parsed.hostname or "").strip().lower()
+            else:
+                host = host.split(":", 1)[0]
+            if host:
+                normalized.add(host)
+        return normalized

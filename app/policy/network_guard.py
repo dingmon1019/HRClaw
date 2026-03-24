@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ipaddress
-import socket
 from urllib.parse import urlparse
 
 import httpx
@@ -58,19 +57,14 @@ def validate_provider_url(
 
 
 def is_private_target(host: str) -> bool:
-    if host in {"localhost"}:
+    normalized = (host or "").strip().strip("[]").lower()
+    if normalized in {"localhost", "localhost.localdomain"} or normalized.endswith(".localhost"):
         return True
     try:
-        ip = ipaddress.ip_address(host)
+        ip = ipaddress.ip_address(normalized)
         return ip.is_private or ip.is_loopback
     except ValueError:
-        infos = socket.getaddrinfo(host, None)
-        for info in infos:
-            address = info[4][0]
-            ip = ipaddress.ip_address(address)
-            if ip.is_private or ip.is_loopback:
-                return True
-    return False
+        return False
 
 
 def enforce_response_constraints(

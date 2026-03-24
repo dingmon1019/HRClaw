@@ -133,6 +133,7 @@ class ProposalService:
 
     def set_execution_status(self, proposal_id: str, status: ProposalStatus, reason: str | None = None) -> None:
         if status not in {
+            ProposalStatus.APPROVED,
             ProposalStatus.QUEUED,
             ProposalStatus.RUNNING,
             ProposalStatus.EXECUTED,

@@ -244,6 +244,27 @@ class ExecutionQueueService:
             raise NotFoundError(f"Execution job {job_id} was not found.")
         return self._row_to_record(row)
 
+    def get_by_proposal_id(self, proposal_id: str) -> ExecutionJobRecord | None:
+        row = self.database.fetch_one("SELECT * FROM execution_jobs WHERE proposal_id = ?", (proposal_id,))
+        return self._row_to_record(row) if row is not None else None
+
+    def cancel(self, job_id: str, reason: str | None = None) -> ExecutionJobRecord:
+        row = self.database.fetch_one("SELECT * FROM execution_jobs WHERE id = ?", (job_id,))
+        if row is None:
+            raise NotFoundError(f"Execution job {job_id} was not found.")
+        if row["status"] not in {"queued", "failed", "blocked", "dead_letter"}:
+            raise InvalidStateError(f"Cannot cancel execution job in state {row['status']}.")
+        finished_at = utcnow_iso()
+        self.database.execute(
+            """
+            UPDATE execution_jobs
+            SET status = ?, finished_at = ?, error_text = ?, lease_expires_at = NULL, last_heartbeat_at = ?
+            WHERE id = ?
+            """,
+            ("cancelled", finished_at, reason, finished_at, job_id),
+        )
+        return self.get(job_id)
+
     def list_recent(self, limit: int = 50) -> list[ExecutionJobRecord]:
         rows = self.database.fetch_all(
             "SELECT * FROM execution_jobs ORDER BY queued_at DESC LIMIT ?",

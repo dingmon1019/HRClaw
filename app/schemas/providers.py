@@ -53,6 +53,11 @@ class ProviderStatus(BaseModel):
     privacy_posture: str = "external-egress"
     egress_posture: str = "inherits global allowlist"
     destination_summary: str = ""
+    endpoint_locality: str = "remote-endpoint"
+    model_inventory: list[dict[str, Any]] = Field(default_factory=list)
+    budget_limit_units: float | None = None
+    budget_used_units: float = 0.0
+    budget_exhausted: bool = False
     success_count: int = 0
     failure_count: int = 0
     last_score: float = 0.0
@@ -76,6 +81,7 @@ class ProviderConfigRecord(BaseModel):
     cost_tier: str = "standard"
     latency_tier: str = "standard"
     privacy_tier: str = "standard"
+    budget_limit_units: float | None = None
     updated_at: str | None = None
 
 
@@ -92,6 +98,7 @@ class ProviderConfigUpdate(BaseModel):
     cost_tier: str = "standard"
     latency_tier: str = "standard"
     privacy_tier: str = "standard"
+    budget_limit_units: float | None = None
 
 
 class ProviderTestRequest(BaseModel):

@@ -48,6 +48,7 @@ By default the runtime keeps live state outside the repository:
 - `%LOCALAPPDATA%\WinAgentRuntime\logs`
 - `%LOCALAPPDATA%\WinAgentRuntime\secrets`
 - `%LOCALAPPDATA%\WinAgentRuntime\workspace`
+- `%LOCALAPPDATA%\WinAgentRuntime\agent_workspaces`
 
 That means the local database, audit mirror, generated session secret, and protected payload blobs should not live under the cloned git working tree unless you explicitly override paths.
 
@@ -105,6 +106,18 @@ Optional Explorer/runtime helpers:
 .\scripts\worker-startup-task-status.ps1
 ```
 
+## Windows UI Features
+
+The localhost UI now exposes Windows-native operator helpers directly:
+
+- the Assistant Workbench can launch the native workspace picker and fill the managed workspace path back into the form
+- the Settings page can install, start, stop, remove, and inspect the worker scheduled task
+- the provider catalog can check Windows Credential Manager targets for configured providers
+- the run detail page shows agent-specific scratch roots and explicit promotion paths into the shared workspace
+- the dashboard shows the managed agent work root and current scheduled-task status when available
+
+Use the scripts when you want the same operations from PowerShell, but the default operator flow no longer depends on copying commands by hand.
+
 ## Windows Notes
 
 - the UI is loopback-bound by default
@@ -149,6 +162,8 @@ For unattended worker startup, use a strongly protected token file and the worke
 
 If strong protection is unavailable, token-file mode remains disabled unless you explicitly enable insecure local storage for development.
 
+You can also manage the same scheduled task from the Settings page. The UI uses the same constrained helper scripts and requires authenticated operator actions.
+
 ### Windows Credential Manager unavailable
 
 If provider credential creation or lookup fails, confirm that `pywin32` is installed and that `win32cred` can be imported. Without it, the runtime falls back to environment-variable-based provider credentials and refuses protected credential-manager writes.
@@ -166,6 +181,12 @@ If you are intentionally building a development smoke archive from a dirty tree,
 
 ```powershell
 .\scripts\package-release.ps1 -Version smoke -AllowDirtyWorkingTree -Clean
+```
+
+For collaborator or Codex handoff bundles, use the dedicated export path instead of the release mode:
+
+```powershell
+.\scripts\export-handoff.ps1 -Version handoff -Clean
 ```
 
 ### Outlook connector unavailable

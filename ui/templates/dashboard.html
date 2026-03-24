@@ -4,7 +4,7 @@
     <div class="card-header">
         <div>
             <h2>Ask The Agent</h2>
-            <p class="muted">기본 진입점은 자연어 목표입니다. supervisor가 목표를 해석하고, planner가 bounded action을 만들고, reviewer가 위험과 egress를 검토한 뒤, 승인된 단계만 worker가 실행합니다.</p>
+            <p class="muted">Start from natural language. The supervisor interprets the objective, the planner prepares bounded actions, the reviewer checks risk and egress, and only approved work reaches the constrained worker boundary.</p>
         </div>
         <div class="stack tight align-end">
             <span class="badge ok">Assistant-First</span>
@@ -118,6 +118,10 @@
                 <strong>{{ settings.workspace_root }}</strong>
             </div>
             <div class="metric-row">
+                <span>Agent Work Root</span>
+                <strong>{{ agent_work_root }}</strong>
+            </div>
+            <div class="metric-row">
                 <span>Startup Script</span>
                 <strong>scripts/install-console-startup-task.ps1</strong>
             </div>
@@ -125,7 +129,18 @@
                 <span>Secret Persistence</span>
                 <strong>{{ "enabled" if storage_posture.secret_persistence_available else "disabled" }}</strong>
             </div>
+            <div class="metric-row">
+                <span>Worker Task</span>
+                <strong>{{ worker_task_status.State if worker_task_status else "not installed or unavailable" }}</strong>
+            </div>
+            {% if worker_task_status %}
+            <div class="metric-row">
+                <span>Next Run</span>
+                <strong>{{ worker_task_status.NextRunTime }}</strong>
+            </div>
+            {% endif %}
         </div>
+        <p class="small muted mt-16">Scratch work stays under the agent work root. Promote anything into the shared workspace only through an approved filesystem copy or move action.</p>
     </article>
 </section>
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import difflib
 import json
+import subprocess
 from collections import Counter
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -51,6 +53,52 @@ def _redirect(path: str, message: str | None = None, error: str | None = None) -
     params = {key: value for key, value in {"message": message, "error": error}.items() if value}
     url = path if not params else f"{path}{'&' if '?' in path else '?'}{urlencode(params)}"
     return RedirectResponse(url=url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _run_windows_script(
+    container: AppContainer,
+    script_name: str,
+    *,
+    arguments: list[str] | None = None,
+    timeout_seconds: int = 30,
+) -> str:
+    allowed_scripts = {
+        "pick-workspace-file.ps1",
+        "install-worker-startup-task.ps1",
+        "start-worker-startup-task.ps1",
+        "stop-worker-startup-task.ps1",
+        "worker-startup-task-status.ps1",
+        "remove-worker-startup-task.ps1",
+    }
+    if script_name not in allowed_scripts:
+        raise ValueError(f"Windows helper {script_name} is not allowed.")
+    script_path = container.base_settings.project_root / "scripts" / script_name
+    if not script_path.exists():
+        raise ValueError(f"Windows helper script {script_name} was not found.")
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script_path),
+    ]
+    if arguments:
+        command.extend(arguments)
+    result = subprocess.run(
+        command,
+        cwd=str(container.base_settings.project_root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=timeout_seconds,
+        check=False,
+    )
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if result.returncode != 0:
+        raise ValueError(stderr or stdout or f"{script_name} exited with code {result.returncode}.")
+    return stdout
 
 
 def _client_key(request: Request) -> str:
@@ -294,6 +342,7 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
         "task_tree": _build_task_tree(task_nodes, proposals),
         "task_swimlanes": _build_task_swimlanes(task_nodes),
         "task_edges": _build_task_edges(task_nodes),
+        "agent_work_areas": _agent_work_area_summary(task_nodes),
         "connector_runs": connector_runs,
         "execution_jobs": execution_jobs,
         "execution_attempts": execution_attempts,
@@ -410,10 +459,14 @@ def _task_status_note(node) -> str:
         return "This node is ready once its dependencies are satisfied."
     if node.status == "running":
         return "This node is currently in progress."
+    if node.status == "executed":
+        return "This node executed successfully through the worker boundary."
     if node.status == "completed":
         return "This node completed and unblocked its downstream steps."
     if node.status == "failed":
         return "This node failed. Inspect the stored error or output summary."
+    if node.status == "cancelled":
+        return "This node was cancelled before execution completed."
     return "This node follows the persisted runtime state."
 
 
@@ -429,6 +482,7 @@ def _task_graph_hint(node, dependency_titles: list[str]) -> str:
 
 def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> list[str]:
     details = node.details or {}
+    work_area = details.get("agent_work_area") or {}
     lines: list[str] = []
     if details.get("phase"):
         lines.append(f"phase: {details['phase']}")
@@ -450,6 +504,12 @@ def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> lis
         lines.append(f"branch: {node.branch_key}")
     if node.context_namespace:
         lines.append(f"context: {node.context_namespace}")
+    if work_area.get("scratch_root"):
+        lines.append(f"scratch: {work_area['scratch_root']}")
+    if work_area.get("promotion_root"):
+        lines.append(f"promotion: {work_area['promotion_root']}")
+    if work_area.get("promotion_policy"):
+        lines.append(f"promotion policy: {work_area['promotion_policy']}")
     if node.merge_key:
         lines.append(f"merge: {node.merge_key}")
     if details.get("planned_provider_profile"):
@@ -480,6 +540,35 @@ def _task_summary_lines(node, proposal_lookup: dict[str, ProposalRecord]) -> lis
     if details.get("error"):
         lines.append(f"error: {str(details['error'])[:140]}")
     return lines
+
+
+def _agent_work_area_summary(task_nodes) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for node in task_nodes:
+        work_area = (node.details or {}).get("agent_work_area")
+        if not isinstance(work_area, dict):
+            continue
+        scratch_root = work_area.get("scratch_root")
+        if not scratch_root:
+            continue
+        key = (node.role.value, scratch_root)
+        if key in seen:
+            continue
+        seen.add(key)
+        summaries.append(
+            {
+                "role": node.role.value,
+                "title": node.title,
+                "context_namespace": work_area.get("context_namespace") or node.context_namespace,
+                "shared_workspace_root": work_area.get("shared_workspace_root"),
+                "scratch_root": scratch_root,
+                "promotion_root": work_area.get("promotion_root"),
+                "promotion_policy": work_area.get("promotion_policy"),
+                "promotion_note": work_area.get("promotion_note"),
+            }
+        )
+    return summaries
 
 
 def _storage_posture_context(container: AppContainer) -> dict[str, Any]:
@@ -556,6 +645,32 @@ def _unsafe_warnings(container: AppContainer) -> list[str]:
     return warnings
 
 
+def _worker_task_status_from_output(output: str) -> dict[str, Any] | None:
+    payload = (output or "").strip()
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _dashboard_worker_task_status(container: AppContainer) -> dict[str, Any] | None:
+    try:
+        output = _run_windows_script(
+            container,
+            "worker-startup-task-status.ps1",
+            arguments=["-TaskName", "WinAgentRuntime.Worker"],
+            timeout_seconds=15,
+        )
+    except ValueError:
+        return None
+    return _worker_task_status_from_output(output)
+
+
 def _temporary_settings(
     container: AppContainer,
     *,
@@ -594,7 +709,13 @@ def _temporary_settings(
     return type(settings)(**data)
 
 
-def _settings_page_context(container: AppContainer, *, result=None) -> dict[str, Any]:
+def _settings_page_context(
+    container: AppContainer,
+    *,
+    result=None,
+    worker_task_result: dict[str, Any] | None = None,
+    credential_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     settings = container.settings_service.get_effective_settings()
     provider_statuses = container.provider_service.list_statuses()
     provider_status_map = {status.name: status for status in provider_statuses}
@@ -682,6 +803,8 @@ def _settings_page_context(container: AppContainer, *, result=None) -> dict[str,
             },
         ],
         "result": result,
+        "worker_task_result": worker_task_result,
+        "credential_result": credential_result,
     }
 
 
@@ -828,6 +951,8 @@ def dashboard(
         "failed_count": counts["failed"],
         "recent_runs": recent_runs,
         "active_runs": active_runs,
+        "worker_task_status": _dashboard_worker_task_status(container),
+        "agent_work_root": str(container.agent_workspace_service.root),
     }
     return _render(templates, request, "templates/dashboard.html", container, **context)
 
@@ -910,6 +1035,48 @@ async def run_agent_submit(
     return _redirect(
         f"/runs/{result.run_id}",
         message="Objective decomposed, reviewed, and prepared for approval.",
+    )
+
+
+@router.post("/api/windows/workspace-file-picker")
+async def api_pick_workspace_file(
+    request: Request,
+    container: AppContainer = Depends(get_container),
+):
+    _api_user_or_401(request, container)
+    await validate_csrf(request)
+    try:
+        selected = _run_windows_script(container, "pick-workspace-file.ps1", timeout_seconds=120).strip()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not selected:
+        return JSONResponse({"cancelled": True, "message": "No workspace file was selected."})
+
+    selected_path = Path(selected).resolve()
+    workspace_root = container.base_settings.resolved_workspace_root.resolve()
+    try:
+        relative_path = selected_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected file must stay inside the managed workspace.",
+        ) from exc
+
+    relative_text = str(relative_path)
+    container.audit_service.emit(
+        "windows.workspace_file_picked",
+        {
+            "workspace_path": relative_text,
+            "selected_name": selected_path.name,
+        },
+    )
+    return JSONResponse(
+        {
+            "cancelled": False,
+            "filesystem_path": relative_text,
+            "workspace_root": str(workspace_root),
+            "message": f"Selected {relative_text} from the managed workspace.",
+        }
     )
 
 
@@ -1059,7 +1226,7 @@ async def approve_proposal(
         )
         return _redirect(
             f"/proposals/{proposal_id}",
-            message="Proposal approved and queued for the isolated worker.",
+            message="Proposal approved and queued for the constrained child-process worker boundary.",
         )
     except (AuthenticationError, AuthorizationError, CsrfError, InvalidStateError, NotFoundError, RateLimitError) as exc:
         return _redirect(f"/proposals/{proposal_id}", error=str(exc))
@@ -1391,6 +1558,7 @@ async def provider_config_submit(
     cost_tier: str = Form("standard"),
     latency_tier: str = Form("standard"),
     privacy_tier: str = Form("standard"),
+    budget_limit_units: float | None = Form(None),
     current_password: str | None = Form(None),
     container: AppContainer = Depends(get_container),
 ):
@@ -1418,6 +1586,7 @@ async def provider_config_submit(
                 cost_tier=cost_tier,
                 latency_tier=latency_tier,
                 privacy_tier=privacy_tier,
+                budget_limit_units=budget_limit_units,
             ),
             actor=user.username,
             reason=f"provider-config:{provider_name}",
@@ -1441,6 +1610,7 @@ async def provider_config_submit(
                 "cost_tier": record.cost_tier,
                 "latency_tier": record.latency_tier,
                 "privacy_tier": record.privacy_tier,
+                "budget_limit_units": record.budget_limit_units,
             },
         )
         return _redirect("/settings", message=f"Provider catalog entry for {provider_name} saved.")
@@ -1600,6 +1770,125 @@ async def test_provider_partial(
     context = _settings_page_context(container, result=result)
     context["requires_recent_auth"] = not user.recent_auth
     return _render(templates, request, "templates/settings.html", container, **context)
+
+
+@router.post("/settings/windows/worker-task")
+async def worker_task_action(
+    request: Request,
+    action: str = Form(...),
+    task_name: str = Form("WinAgentRuntime.Worker"),
+    token_file: str = Form("worker.token"),
+    limit: int = Form(0),
+    interval: float = Form(2.0),
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+    templates: Jinja2Templates = Depends(get_templates),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        script_map = {
+            "install": "install-worker-startup-task.ps1",
+            "start": "start-worker-startup-task.ps1",
+            "stop": "stop-worker-startup-task.ps1",
+            "status": "worker-startup-task-status.ps1",
+            "remove": "remove-worker-startup-task.ps1",
+        }
+        script_name = script_map.get(action)
+        if script_name is None:
+            raise ValueError("Unknown worker task action.")
+        if action != "status":
+            _require_recent_auth(
+                request,
+                container,
+                user,
+                current_password,
+                f"{action} the Windows worker scheduled task",
+            )
+        arguments = ["-TaskName", task_name]
+        if action == "install":
+            arguments.extend(
+                [
+                    "-TokenFile",
+                    token_file,
+                    "-Limit",
+                    str(limit),
+                    "-Interval",
+                    str(interval),
+                ]
+            )
+        output = _run_windows_script(
+            container,
+            script_name,
+            arguments=arguments,
+            timeout_seconds=45,
+        )
+        worker_task_result = {
+            "action": action,
+            "task_name": task_name,
+            "output": output,
+            "status": _worker_task_status_from_output(output) if action == "status" else None,
+        }
+        container.audit_service.emit(
+            "windows.worker_task_action",
+            {
+                "actor": user.username,
+                "action": action,
+                "task_name": task_name,
+                "status_available": bool(worker_task_result["status"]),
+            },
+        )
+        context = _settings_page_context(container, worker_task_result=worker_task_result)
+        context["requires_recent_auth"] = not user.recent_auth
+        return _render(templates, request, "templates/settings.html", container, **context)
+    except (AuthenticationError, AuthorizationError, CsrfError, ValueError) as exc:
+        return _redirect("/settings", error=str(exc))
+
+
+@router.post("/settings/provider-config/test-credential")
+async def provider_credential_test(
+    request: Request,
+    provider_name: str = Form(...),
+    credential_target: str = Form(...),
+    current_password: str | None = Form(None),
+    container: AppContainer = Depends(get_container),
+    templates: Jinja2Templates = Depends(get_templates),
+):
+    try:
+        await validate_csrf(request)
+        user = _page_user_or_redirect(request, container)
+        if isinstance(user, RedirectResponse):
+            return user
+        _require_recent_auth(
+            request,
+            container,
+            user,
+            current_password,
+            f"inspect provider credential state for {provider_name}",
+        )
+        if not container.windows_credential_store.available:
+            raise ValueError("Windows Credential Manager integration is not available on this host.")
+        credential_result = {
+            "provider_name": provider_name,
+            "credential_target": credential_target,
+            "status": container.windows_credential_store.describe(credential_target),
+        }
+        container.audit_service.emit(
+            "settings.provider_credential_checked",
+            {
+                "actor": user.username,
+                "provider_name": provider_name,
+                "credential_target": credential_target,
+                "configured": credential_result["status"]["configured"],
+            },
+        )
+        context = _settings_page_context(container, credential_result=credential_result)
+        context["requires_recent_auth"] = not user.recent_auth
+        return _render(templates, request, "templates/settings.html", container, **context)
+    except (AuthenticationError, AuthorizationError, CsrfError, ValueError) as exc:
+        return _redirect("/settings", error=str(exc))
 
 
 @router.get("/api/proposals")

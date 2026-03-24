@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS summaries (
     collected_json TEXT NOT NULL,
     summary_text TEXT NOT NULL,
     provider_name TEXT NOT NULL,
+    data_classification TEXT NOT NULL DEFAULT 'local-only',
+    lineage_json TEXT NOT NULL DEFAULT '{}',
+    outbound_summary_text TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -349,6 +352,25 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id, expires_at 
 CREATE INDEX IF NOT EXISTS idx_cli_tokens_user_id ON cli_tokens(user_id, expires_at DESC);
 """
 
+INDEX_STATEMENTS = [
+    "CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);",
+    "CREATE INDEX IF NOT EXISTS idx_proposals_created_at ON proposals(created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_action_history_started_at ON action_history(started_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_connector_runs_created_at ON connector_runs(created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_execution_jobs_status ON execution_jobs(status, queued_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_audit_entries_created_at ON audit_entries(created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_proposal_snapshots_proposal ON proposal_snapshots(proposal_id, created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_agent_runs_run_id ON agent_runs(run_id, started_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_handoffs_run_id ON handoffs(run_id, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_task_nodes_run_id ON task_nodes(run_id, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_task_nodes_proposal_id ON task_nodes(proposal_id, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_execution_attempts_job_id ON execution_attempts(job_id, started_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id, expires_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_cli_tokens_user_id ON cli_tokens(user_id, expires_at DESC);",
+]
+
+TABLE_SCHEMA = SCHEMA.split("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);", 1)[0].strip() + "\n"
+
 
 class Database:
     def __init__(self, db_path: Path):
@@ -357,8 +379,10 @@ class Database:
 
     def initialize(self) -> None:
         with self.connection() as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(TABLE_SCHEMA)
             self._apply_migrations(conn)
+            for statement in INDEX_STATEMENTS:
+                conn.execute(statement)
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -454,6 +478,12 @@ class Database:
                 "cost_tier": "TEXT NOT NULL DEFAULT 'standard'",
                 "latency_tier": "TEXT NOT NULL DEFAULT 'standard'",
                 "privacy_tier": "TEXT NOT NULL DEFAULT 'standard'",
+                "budget_limit_units": "REAL",
+            },
+            "summaries": {
+                "data_classification": "TEXT NOT NULL DEFAULT 'local-only'",
+                "lineage_json": "TEXT NOT NULL DEFAULT '{}'",
+                "outbound_summary_text": "TEXT",
             },
         }
         for table_name, columns in migrations.items():

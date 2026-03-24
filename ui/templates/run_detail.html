@@ -59,6 +59,20 @@
         <article class="panel">
             <h3>Intent Summary</h3>
             <p>{{ summary.summary_text }}</p>
+            {% if summary.collected.get("deferred_evidence") %}
+            <details class="mt-16">
+                <summary>Deferred evidence</summary>
+                <ul class="flat-list mt-16">
+                    {% for item in summary.collected.get("deferred_evidence") %}
+                    <li>
+                        <strong>{{ item.title }}</strong>
+                        <div class="muted small">{{ item.connector }} / {{ item.action_type }} / {{ item.status }}</div>
+                        <div class="muted small">{{ item.reason }}</div>
+                    </li>
+                    {% endfor %}
+                </ul>
+            </details>
+            {% endif %}
             <div class="metric-row">
                 <span>Summary Provider</span>
                 <strong>{{ summary.provider_name }}</strong>
@@ -149,6 +163,28 @@
             </div>
             {% else %}
             <p class="muted">No agent run history was stored for this run.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h3>Agent Work Areas</h3>
+            <span class="badge ok">{{ agent_work_areas|length }} scoped roots</span>
+        </div>
+        <div class="stack">
+            {% for area in agent_work_areas %}
+            <div class="list-item">
+                <strong>{{ area.role }}</strong>
+                <p>{{ area.title }}</p>
+                <small>{{ area.context_namespace }}</small>
+                <div class="metric-row mt-16"><span>Scratch</span><strong>{{ area.scratch_root }}</strong></div>
+                <div class="metric-row"><span>Promotion</span><strong>{{ area.promotion_root }}</strong></div>
+                <div class="metric-row"><span>Shared Workspace</span><strong>{{ area.shared_workspace_root }}</strong></div>
+                <p class="muted small">{{ area.promotion_note }}</p>
+            </div>
+            {% else %}
+            <p class="muted">No agent-scoped work areas were recorded for this run.</p>
             {% endfor %}
         </div>
     </article>

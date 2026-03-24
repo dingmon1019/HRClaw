@@ -4,6 +4,7 @@ from app.agents.service import AgentService
 from app.audit.service import AuditService
 from app.config.settings import AppSettings
 from app.runtime.executor import ExecutionDispatcher
+from app.runtime.graph_runtime import GraphRuntimeService
 from app.schemas.actions import ExecutionJobStatus, ProposalStatus
 from app.schemas.agents import AgentRole
 from app.services.data_governance_service import DataGovernanceService
@@ -22,6 +23,7 @@ class ExecutionWorker:
         audit_service: AuditService,
         agent_service: AgentService,
         data_governance_service: DataGovernanceService,
+        graph_runtime: GraphRuntimeService,
     ):
         self.worker_id = worker_id
         self.base_settings = base_settings
@@ -31,6 +33,7 @@ class ExecutionWorker:
         self.audit_service = audit_service
         self.agent_service = agent_service
         self.data_governance_service = data_governance_service
+        self.graph_runtime = graph_runtime
 
     def run_once(self) -> dict | None:
         claimed = self.queue_service.claim_next_job(
@@ -66,11 +69,12 @@ class ExecutionWorker:
             },
         )
         try:
+            self.graph_runtime.sync_proposal_lifecycle(job.proposal_id)
             self.agent_service.update_nodes_for_proposal(
                 job.proposal_id,
                 role=AgentRole.EXECUTOR,
                 status="running",
-                details={"job_id": job.id, "worker_id": self.worker_id},
+                details={"job_id": job.id, "worker_id": self.worker_id, "agent_run_id": executor_run.id},
                 agent_run_id=executor_run.id,
             )
             self.queue_service.heartbeat(job.id, self.worker_id, self.base_settings.worker_lease_seconds)
@@ -93,10 +97,11 @@ class ExecutionWorker:
                 boundary_metadata=boundary_metadata.model_dump(mode="json"),
             )
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.EXECUTED, result=result)
+            self.graph_runtime.sync_proposal_lifecycle(job.proposal_id)
             self.agent_service.update_nodes_for_proposal(
                 job.proposal_id,
                 role=AgentRole.EXECUTOR,
-                status="completed",
+                status="executed",
                 details={
                     "job_id": job.id,
                     "worker_id": self.worker_id,
@@ -138,6 +143,7 @@ class ExecutionWorker:
             return result
         except ValueError as exc:
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.BLOCKED, error_text=str(exc))
+            self.graph_runtime.sync_proposal_lifecycle(job.proposal_id)
             self.agent_service.update_nodes_for_proposal(
                 job.proposal_id,
                 role=AgentRole.EXECUTOR,
@@ -169,6 +175,7 @@ class ExecutionWorker:
             raise
         except Exception as exc:
             self.queue_service.mark_finished(job.id, ExecutionJobStatus.FAILED, error_text=str(exc))
+            self.graph_runtime.sync_proposal_lifecycle(job.proposal_id)
             self.agent_service.update_nodes_for_proposal(
                 job.proposal_id,
                 role=AgentRole.EXECUTOR,

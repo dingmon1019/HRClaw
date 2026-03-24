@@ -337,6 +337,7 @@ class AgentService:
         provider_name: str | None = None,
         agent_run_id: str | None = None,
     ) -> list[TaskNodeRecord]:
+        terminal_statuses = {"completed", "executed", "failed", "blocked", "cancelled", "rejected"}
         params: list[object] = [proposal_id]
         query = "SELECT id FROM task_nodes WHERE proposal_id = ?"
         if role is not None:
@@ -346,12 +347,13 @@ class AgentService:
         updated: list[TaskNodeRecord] = []
         for row in rows:
             updated.append(
-                self.complete_task_node(
+                self.update_task_node(
                     row["id"],
                     status=status,
                     details=details,
                     provider_name=provider_name,
                     agent_run_id=agent_run_id,
+                    finalize=status in terminal_statuses,
                 )
             )
         return updated

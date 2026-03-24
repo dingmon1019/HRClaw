@@ -14,6 +14,7 @@ The runtime tries to reduce accidental or invisible side effects through:
 - separate worker execution with task-scoped child-process bundles
 - provider prompt governance that separates local-only collected context from outbound-safe provider context
 - tamper-evident audit logs
+- agent-scoped scratch roots that separate planner/reviewer/reporter/executor temporary work from the shared workspace
 
 ## Authentication
 
@@ -65,6 +66,8 @@ Before execution, the worker verifies the exact approval record attached to the 
 The queue job and execution attempt also carry the execution bundle hash and boundary mode, so the operator can verify which constrained child-process bundle actually ran.
 
 ## Connector Safety
+
+Planning no longer performs file-content reads, HTTP response fetches, or bounded system text reads by default. The planner works from operator-supplied inputs plus descriptor-only evidence, then creates explicit approval-gated proposals when more evidence is needed.
 
 ### Filesystem
 
@@ -133,6 +136,15 @@ Instead, the worker:
 - narrows file and HTTP scope to exact task resources when the action schema allows it
 - brokers task-connector actions through the parent process instead of handing the child a general runtime DB path
 - records boundary metadata on the queue job and execution attempt
+
+The current boundary is a constrained same-user child process:
+
+- it does not inherit arbitrary parent `PYTHONPATH`
+- it launches with isolated interpreter flags for more reproducible imports
+- it carries exact granted file paths and HTTP targets where the action manifest allows it
+- it starts inside an executor-specific scratch root under `%LOCALAPPDATA%\WinAgentRuntime\agent_workspaces`
+- it keeps the worker lease alive with a heartbeat bridge during long-running child work
+- it still runs as the same local Windows user account and is not an OS sandbox
 
 This is a meaningful process boundary, but it is still not an OS sandbox.
 

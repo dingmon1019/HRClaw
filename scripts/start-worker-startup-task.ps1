@@ -1,5 +1,5 @@
 param(
-    [string]$TaskName = "WinAgentRuntimeWorker"
+    [string]$TaskName = "WinAgentRuntime.Worker"
 )
 
 Start-ScheduledTask -TaskName $TaskName
