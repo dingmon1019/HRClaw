@@ -22,57 +22,64 @@ class GraphNodeQueueService:
         queued_by: str,
         correlation_id: str | None = None,
     ) -> GraphNodeJobRecord:
-        existing = self.database.fetch_one("SELECT * FROM graph_node_jobs WHERE task_node_id = ?", (task_node_id,))
         queued_at = utcnow_iso()
-        if existing and existing["status"] in {"queued", "running"}:
-            raise InvalidStateError("Task node is already queued for graph execution.")
-        if existing:
-            self.database.execute(
-                """
-                UPDATE graph_node_jobs
-                SET status = ?, queued_by = ?, queued_at = ?, started_at = NULL, finished_at = NULL,
-                    worker_id = NULL, result_json = NULL, error_text = NULL, lease_expires_at = NULL,
-                    last_heartbeat_at = NULL, attempt_count = 0, correlation_id = ?, dead_letter_reason = NULL,
-                    cancel_requested_at = NULL, cancel_requested_by = NULL, cancel_reason = NULL,
-                    role = ?, node_type = ?
-                WHERE task_node_id = ?
-                """,
-                ("queued", queued_by, queued_at, correlation_id, role.value, node_type, task_node_id),
-            )
-            return self.get_by_task_node_id(task_node_id)
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM graph_node_jobs WHERE task_node_id = ?",
+                (task_node_id,),
+            ).fetchone()
+            if existing and existing["status"] in {"queued", "running"}:
+                return self._row_to_record(existing)
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE graph_node_jobs
+                    SET status = ?, queued_by = ?, queued_at = ?, started_at = NULL, finished_at = NULL,
+                        worker_id = NULL, result_json = NULL, error_text = NULL, lease_expires_at = NULL,
+                        last_heartbeat_at = NULL, attempt_count = 0, correlation_id = ?, dead_letter_reason = NULL,
+                        cancel_requested_at = NULL, cancel_requested_by = NULL, cancel_reason = NULL,
+                        role = ?, node_type = ?
+                    WHERE task_node_id = ?
+                    """,
+                    ("queued", queued_by, queued_at, correlation_id, role.value, node_type, task_node_id),
+                )
+                row = conn.execute("SELECT * FROM graph_node_jobs WHERE task_node_id = ?", (task_node_id,)).fetchone()
+                return self._row_to_record(row)
 
-        job_id = new_id("graphjob")
-        self.database.execute(
-            """
-            INSERT INTO graph_node_jobs(
-                id, task_node_id, run_id, role, node_type, status, queued_by, queued_at,
-                started_at, finished_at, worker_id, result_json, error_text, lease_expires_at,
-                last_heartbeat_at, attempt_count, correlation_id, dead_letter_reason
+            job_id = new_id("graphjob")
+            conn.execute(
+                """
+                INSERT INTO graph_node_jobs(
+                    id, task_node_id, run_id, role, node_type, status, queued_by, queued_at,
+                    started_at, finished_at, worker_id, result_json, error_text, lease_expires_at,
+                    last_heartbeat_at, attempt_count, correlation_id, dead_letter_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    task_node_id,
+                    run_id,
+                    role.value,
+                    node_type,
+                    "queued",
+                    queued_by,
+                    queued_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    correlation_id,
+                    None,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id,
-                task_node_id,
-                run_id,
-                role.value,
-                node_type,
-                "queued",
-                queued_by,
-                queued_at,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                0,
-                correlation_id,
-                None,
-            ),
-        )
-        return self.get(job_id)
+            row = conn.execute("SELECT * FROM graph_node_jobs WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_record(row)
 
     def claim_next_job(
         self,

@@ -12,10 +12,13 @@ import pytest
 
 from app.config.settings import AppSettings
 from app.core.container import AppContainer
+from app.core.database import Database
 from app.core.errors import FailClosedStorageRefusalError
 from app.schemas.actions import ExecutionBoundaryMetadata
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
 from app.schemas.agents import AgentRole
+from app.services import graph_node_queue_service as graph_node_queue_module
+from app.services.graph_node_queue_service import GraphNodeQueueService
 
 
 def _runtime_settings(tmp_path: Path, *, graph_execution_mode: str) -> AppSettings:
@@ -38,6 +41,235 @@ def _runtime_settings(tmp_path: Path, *, graph_execution_mode: str) -> AppSettin
         session_secret="test-session-secret",
         session_cookie_name="test_session",
     )
+
+
+def _insert_task_node(
+    database: Database,
+    *,
+    task_node_id: str,
+    run_id: str,
+    role: AgentRole = AgentRole.PLANNER,
+    node_type: str = "plan",
+    status: str = "ready",
+) -> None:
+    database.execute(
+        """
+        INSERT INTO task_nodes(
+            id, run_id, role, node_type, title, details_json, status, depends_on_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            task_node_id,
+            run_id,
+            role.value,
+            node_type,
+            f"{node_type} node",
+            "{}",
+            status,
+            "[]",
+            "2026-01-01T00:00:00+00:00",
+        ),
+    )
+
+
+def test_graph_node_enqueue_is_idempotent_under_concurrent_duplicate_admission(tmp_path, monkeypatch):
+    database = Database(tmp_path / "runtime.db")
+    database.initialize()
+    task_node_id = "task-node-concurrent"
+    run_id = "run-concurrent"
+    _insert_task_node(database, task_node_id=task_node_id, run_id=run_id)
+
+    service_a = GraphNodeQueueService(Database(database.db_path))
+    service_b = GraphNodeQueueService(Database(database.db_path))
+    start = threading.Barrier(2)
+    new_id_release = threading.Event()
+    new_id_calls = {"count": 0}
+    new_id_lock = threading.Lock()
+    original_new_id = graph_node_queue_module.new_id
+    results = []
+    errors = []
+    result_lock = threading.Lock()
+
+    def coordinated_new_id(prefix: str) -> str:
+        with new_id_lock:
+            new_id_calls["count"] += 1
+            if new_id_calls["count"] == 2:
+                new_id_release.set()
+        new_id_release.wait(timeout=0.25)
+        return original_new_id(prefix)
+
+    def run_enqueue(service: GraphNodeQueueService, queued_by: str, correlation_id: str) -> None:
+        start.wait()
+        try:
+            record = service.enqueue(
+                task_node_id=task_node_id,
+                run_id=run_id,
+                role=AgentRole.PLANNER,
+                node_type="plan",
+                queued_by=queued_by,
+                correlation_id=correlation_id,
+            )
+            with result_lock:
+                results.append(record)
+        except Exception as exc:  # pragma: no cover - exercised by regression before the fix
+            with result_lock:
+                errors.append(exc)
+
+    monkeypatch.setattr(graph_node_queue_module, "new_id", coordinated_new_id)
+
+    threads = [
+        threading.Thread(target=run_enqueue, args=(service_a, "worker-a", "corr-a")),
+        threading.Thread(target=run_enqueue, args=(service_b, "worker-b", "corr-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2
+
+    rows = database.fetch_all("SELECT * FROM graph_node_jobs WHERE task_node_id = ?", (task_node_id,))
+
+    assert len(rows) == 1
+    assert {record.id for record in results} == {rows[0]["id"]}
+    assert rows[0]["status"] == "queued"
+    assert rows[0]["worker_id"] is None
+    assert rows[0]["attempt_count"] == 0
+
+
+def test_duplicate_enqueue_keeps_existing_queued_graph_job_unchanged(tmp_path):
+    database = Database(tmp_path / "runtime.db")
+    database.initialize()
+    task_node_id = "task-node-queued"
+    run_id = "run-queued"
+    service = GraphNodeQueueService(database)
+    _insert_task_node(database, task_node_id=task_node_id, run_id=run_id)
+
+    queued = service.enqueue(
+        task_node_id=task_node_id,
+        run_id=run_id,
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        queued_by="original-queue",
+        correlation_id="corr-original",
+    )
+    duplicate = service.enqueue(
+        task_node_id=task_node_id,
+        run_id=run_id,
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        queued_by="duplicate-queue",
+        correlation_id="corr-duplicate",
+    )
+
+    assert duplicate.id == queued.id
+    assert duplicate.status == "queued"
+    assert duplicate.queued_by == queued.queued_by
+    assert duplicate.queued_at == queued.queued_at
+    assert duplicate.correlation_id == queued.correlation_id
+    assert duplicate.attempt_count == queued.attempt_count == 0
+
+
+def test_duplicate_enqueue_keeps_running_graph_job_claim_state(tmp_path):
+    database = Database(tmp_path / "runtime.db")
+    database.initialize()
+    task_node_id = "task-node-running"
+    run_id = "run-running"
+    service = GraphNodeQueueService(database)
+    _insert_task_node(database, task_node_id=task_node_id, run_id=run_id)
+
+    queued = service.enqueue(
+        task_node_id=task_node_id,
+        run_id=run_id,
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        queued_by="original-queue",
+        correlation_id="corr-original",
+    )
+    claimed = service.claim_next_job(
+        worker_id="graph-worker-a",
+        lease_seconds=30,
+        max_attempts=3,
+        run_id=run_id,
+    )
+
+    assert claimed is not None
+
+    duplicate = service.enqueue(
+        task_node_id=task_node_id,
+        run_id=run_id,
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        queued_by="duplicate-queue",
+        correlation_id="corr-duplicate",
+    )
+
+    assert duplicate.id == queued.id
+    assert duplicate.status == "running"
+    assert duplicate.worker_id == claimed.worker_id == "graph-worker-a"
+    assert duplicate.started_at == claimed.started_at
+    assert duplicate.lease_expires_at == claimed.lease_expires_at
+    assert duplicate.attempt_count == claimed.attempt_count == 1
+    assert duplicate.queued_by == queued.queued_by
+    assert duplicate.queued_at == queued.queued_at
+    assert duplicate.correlation_id == queued.correlation_id
+
+
+def test_terminal_graph_job_requeue_still_resets_execution_state(tmp_path):
+    database = Database(tmp_path / "runtime.db")
+    database.initialize()
+    task_node_id = "task-node-terminal"
+    run_id = "run-terminal"
+    service = GraphNodeQueueService(database)
+    _insert_task_node(database, task_node_id=task_node_id, run_id=run_id)
+
+    queued = service.enqueue(
+        task_node_id=task_node_id,
+        run_id=run_id,
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        queued_by="original-queue",
+        correlation_id="corr-original",
+    )
+    claimed = service.claim_next_job(
+        worker_id="graph-worker-a",
+        lease_seconds=30,
+        max_attempts=3,
+        run_id=run_id,
+    )
+
+    assert claimed is not None
+
+    service.request_cancel(claimed.id, actor="pytest", reason="operator requested stop")
+    service.mark_finished(claimed.id, status="cancelled", error_text="operator cancelled")
+
+    requeued = service.enqueue(
+        task_node_id=task_node_id,
+        run_id=run_id,
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        queued_by="retry-queue",
+        correlation_id="corr-retry",
+    )
+
+    assert requeued.id == queued.id
+    assert requeued.status == "queued"
+    assert requeued.queued_by == "retry-queue"
+    assert requeued.correlation_id == "corr-retry"
+    assert requeued.started_at is None
+    assert requeued.finished_at is None
+    assert requeued.worker_id is None
+    assert requeued.result == {}
+    assert requeued.error_text is None
+    assert requeued.lease_expires_at is None
+    assert requeued.last_heartbeat_at is None
+    assert requeued.attempt_count == 0
+    assert requeued.cancel_requested_at is None
+    assert requeued.cancel_requested_by is None
+    assert requeued.cancel_reason is None
 
 
 def test_graph_run_can_be_created_before_summary_exists_background_mode(tmp_path):
