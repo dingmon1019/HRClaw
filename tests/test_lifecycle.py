@@ -1,13 +1,131 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
+import pytest
+
+from app.config.settings import AppSettings
 from app.core.container import AppContainer
+from app.core.errors import FailClosedStorageRefusalError
 from app.schemas.actions import ExecutionBoundaryMetadata
 from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
 from app.schemas.agents import AgentRole
+
+
+def _runtime_settings(tmp_path: Path, *, graph_execution_mode: str) -> AppSettings:
+    workspace_root = tmp_path / "workspace"
+    return AppSettings(
+        app_name="Win Agent Runtime Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit" / "audit.jsonl",
+        workspace_root=workspace_root,
+        allowed_filesystem_roots=str(workspace_root),
+        allowed_http_hosts="example.com,127.0.0.1,localhost,testserver",
+        trusted_hosts="127.0.0.1,localhost,testserver",
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        runtime_mode="safe",
+        graph_execution_mode=graph_execution_mode,
+        allow_insecure_local_storage=True,
+        session_secret="test-session-secret",
+        session_cookie_name="test_session",
+    )
+
+
+def test_graph_run_can_be_created_before_summary_exists_background_mode(tmp_path):
+    container = AppContainer(_runtime_settings(tmp_path, graph_execution_mode="background_preferred"))
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Queue planning before summary creation",
+            task_title="Queued planning",
+        )
+    )
+
+    graph_context = container.graph_runtime.get_run_context(result.run_id)
+    assert graph_context is not None
+    assert graph_context["summary_id"] is None
+    assert container.summary_service.get_by_run_id(result.run_id) is None
+    assert result.summary is None
+    assert result.planning_status.value in {"planning_queued", "planning_running", "accepted"}
+    assert any(job.node_type == "objective" for job in container.graph_node_queue_service.list_for_run(result.run_id))
+
+
+def test_graph_first_summary_node_can_fail_and_retry_durably(tmp_path, monkeypatch):
+    container = AppContainer(_runtime_settings(tmp_path, graph_execution_mode="background_preferred"))
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Retry summary node durably",
+            task_title="Retry summary",
+        )
+    )
+
+    container.worker.run_once()
+    summary_node = next(
+        node for node in container.agent_service.list_task_nodes(result.run_id) if node.node_type == "summary"
+    )
+    original_summarize = container.planner._summarize
+    call_count = {"count": 0}
+
+    def flaky_summarize(*args, **kwargs):
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            raise RuntimeError("summary provider unavailable")
+        return original_summarize(*args, **kwargs)
+
+    monkeypatch.setattr(container.planner, "_summarize", flaky_summarize)
+
+    failed = container.worker.run_once()
+    assert failed["status"] == "failed"
+    assert container.graph_runtime.get_run_context(result.run_id)["summary_id"] is None
+
+    container.graph_runtime.request_retry(summary_node.id, actor="pytest", reason="retry summary node")
+    container.worker.run_once()
+
+    graph_context = container.graph_runtime.get_run_context(result.run_id)
+    assert graph_context["summary_id"] is not None
+    assert container.summary_service.get_by_run_id(result.run_id) is not None
+
+
+def test_background_resume_does_not_execute_graph_inline_on_startup(tmp_path):
+    settings = _runtime_settings(tmp_path, graph_execution_mode="background_preferred")
+    container_a = AppContainer(settings)
+    result = container_a.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Recover queued graph without inline startup drain",
+            task_title="Resume background graph",
+        )
+    )
+
+    assert container_a.summary_service.get_by_run_id(result.run_id) is None
+
+    container_b = AppContainer(settings)
+
+    assert container_b.summary_service.get_by_run_id(result.run_id) is None
+    graph_jobs = container_b.graph_node_queue_service.list_for_run(result.run_id)
+    assert graph_jobs
+    assert all(job.status in {"queued", "running"} for job in graph_jobs)
+
+
+def test_inline_compat_mode_still_materializes_summary_inline(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Keep inline compatibility for interactive planning",
+            task_title="Inline compatibility",
+        )
+    )
+
+    assert result.planning_status.value == "planning_completed"
+    assert result.summary is not None
+    assert result.proposals
 
 
 def test_proposal_lifecycle_from_run_to_worker_execution(container):
@@ -189,7 +307,8 @@ def test_child_import_paths_ignore_arbitrary_parent_paths(container, monkeypatch
 def test_child_launch_command_uses_isolated_python(container):
     command = container.executor.boundary_runner._child_command()
 
-    assert command[0].endswith("python.exe") or command[0].endswith("python")
+    executable_name = Path(command[0]).name.lower()
+    assert executable_name.startswith("python")
     assert "-I" in command
     assert "-S" in command
     assert "app.runtime.child_process" in command[-1]
@@ -489,6 +608,119 @@ def test_execution_boundary_uses_executor_scratch_area_as_child_cwd(container):
     assert Path(bundle.boundary.agent_scratch_root).exists()
 
 
+def test_executor_scratch_path_is_distinct_per_proposal_even_for_same_connector(container):
+    settings = container.settings_service.get_effective_settings()
+    proposal_a = SimpleNamespace(
+        id="proposal_a",
+        run_id="run_shared_connector_scope",
+        connector="task",
+        action_type="task.create",
+        correlation_id="corr-a",
+    )
+    proposal_b = SimpleNamespace(
+        id="proposal_b",
+        run_id="run_shared_connector_scope",
+        connector="task",
+        action_type="task.create",
+        correlation_id="corr-b",
+    )
+
+    bundle_a = container.executor.boundary_runner.build_bundle(
+        proposal=proposal_a,
+        approval_id="approval_a",
+        manifest_hash="manifest_a",
+        runtime_payload={"title": "A", "details": "alpha"},
+        allowed_connectors=["task"],
+        capabilities=["execute-approved-action"],
+        effective_settings=settings,
+    )
+    bundle_b = container.executor.boundary_runner.build_bundle(
+        proposal=proposal_b,
+        approval_id="approval_b",
+        manifest_hash="manifest_b",
+        runtime_payload={"title": "B", "details": "bravo"},
+        allowed_connectors=["task"],
+        capabilities=["execute-approved-action"],
+        effective_settings=settings,
+    )
+
+    assert bundle_a.boundary.agent_scratch_root != bundle_b.boundary.agent_scratch_root
+    assert bundle_a.execution_settings["agent_context_namespace"] != bundle_b.execution_settings["agent_context_namespace"]
+
+
+def test_artifact_lineage_records_promotion_events(container):
+    layout = container.agent_workspace_service.layout_for(
+        run_id="run_artifact_lineage",
+        agent_role="executor",
+        memory_namespace="executor",
+        context_namespace="executor:run_artifact_lineage:proposal_copy:filesystem",
+        branch_key="filesystem",
+    )
+    source = layout.promotion_root / "draft.txt"
+    destination = container.base_settings.resolved_workspace_root / "published.txt"
+    source.write_text("draft", encoding="utf-8")
+
+    events = container.artifact_lineage_service.record_execution_artifacts(
+        run_id="run_artifact_lineage",
+        proposal_id="proposal_copy",
+        agent_role="executor",
+        context_namespace="executor:run_artifact_lineage:proposal_copy:filesystem",
+        action_type="filesystem.copy_path",
+        payload={"source_path": str(source), "destination_path": str(destination)},
+        result={"source_path": str(source), "destination_path": str(destination), "copied": True},
+        scratch_root=str(layout.scratch_root),
+        promotion_root=str(layout.promotion_root),
+        shared_workspace_root=str(layout.shared_workspace_root),
+    )
+
+    assert any(event.event_type == "promotion" for event in events)
+    stored = container.artifact_lineage_service.list_events("run_artifact_lineage")
+    promotion = next(event for event in stored if event.event_type == "promotion")
+    assert promotion.source_path == str(source.resolve())
+    assert promotion.destination_path == str(destination.resolve())
+
+
+def test_agent_workspace_cleanup_skips_active_runs_and_removes_stale_roots(container):
+    stale_layout = container.agent_workspace_service.layout_for(
+        run_id="run_stale_workspace",
+        agent_role="planner",
+        memory_namespace="planner",
+        context_namespace="planner:run_stale_workspace:stale",
+        branch_key="stale",
+    )
+    active_layout = container.agent_workspace_service.layout_for(
+        run_id="run_active_workspace",
+        agent_role="planner",
+        memory_namespace="planner",
+        context_namespace="planner:run_active_workspace:active",
+        branch_key="active",
+    )
+    old_timestamp = 946684800  # 2000-01-01 UTC
+    for path in (stale_layout.run_root, active_layout.run_root):
+        os.utime(path, (old_timestamp, old_timestamp))
+
+    planner = container.agent_service.get_by_role(AgentRole.PLANNER)
+    container.agent_service.create_task_node(
+        "run_active_workspace",
+        role=AgentRole.PLANNER,
+        node_type="plan",
+        title="Active planner node",
+        details={"agent_work_area": active_layout.as_dict()},
+        status="running",
+        context_namespace="planner:run_active_workspace:active",
+        agent=planner,
+        depends_on=[],
+    )
+
+    dry_run = container.artifact_lineage_service.cleanup_stale_work_areas(dry_run=True, retention_days=1)
+    assert str(stale_layout.run_root) in dry_run["removed"]
+    assert str(active_layout.run_root) not in dry_run["removed"]
+
+    result = container.artifact_lineage_service.cleanup_stale_work_areas(dry_run=False, retention_days=1)
+    assert str(stale_layout.run_root) in result["removed"]
+    assert stale_layout.run_root.exists() is False
+    assert active_layout.run_root.exists() is True
+
 def test_filesystem_read_history_redacts_preview(container, monkeypatch):
     target = container.base_settings.resolved_workspace_root / "secret.txt"
     target.write_text("TOP SECRET FILE CONTENT", encoding="utf-8")
@@ -589,3 +821,562 @@ def test_system_read_history_redacts_preview(container, monkeypatch):
     history = container.history_service.list_action_history(limit=1)[0]
     assert "TOP SECRET SYSTEM CONTENT" not in json.dumps(history.output)
     assert history.output["preview"]["redacted"] is True
+
+
+def test_graph_runtime_waiting_approval_progresses_to_completed_after_execution(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Durable graph status")
+    )
+
+    waiting = container.graph_runtime.get_run_context(result.run_id)
+    assert waiting["status"] == "waiting_approval"
+    assert waiting["state"]["planning_completed"] is True
+    assert waiting["state"]["proposal_ids"]
+
+    proposal = result.proposals[0]
+    container.runtime_service.approve_and_queue(
+        proposal.id,
+        ApprovalDecisionRequest(actor="pytest", reason="finish graph runtime"),
+    )
+    container.worker.run_once()
+    container.graph_runtime.reconcile_run(result.run_id)
+
+    completed = container.graph_runtime.get_run_context(result.run_id)
+    assert completed["status"] == "completed"
+
+
+def test_graph_runtime_resumes_partial_non_executor_run_after_restart(app_settings, monkeypatch):
+    container_a = AppContainer(app_settings)
+    original_advance = container_a.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container_a.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=1, execute_inline=execute_inline
+        ),
+    )
+
+    result = container_a.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Resume non executor runtime")
+    )
+
+    partial = container_a.graph_runtime.get_run_context(result.run_id)
+    assert partial["status"] == "running"
+    assert partial["state"].get("planning_completed") is not True
+
+    container_b = AppContainer(app_settings)
+    resumed = container_b.graph_runtime.get_run_context(result.run_id)
+
+    assert resumed["state"]["planning_completed"] is True
+    assert resumed["status"] == "waiting_approval"
+    assert resumed["state"]["proposal_ids"]
+
+
+def test_graph_runtime_can_drain_non_executor_queue_via_worker(app_settings, monkeypatch):
+    container = AppContainer(app_settings)
+    original_advance = container.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Queued worker drain")
+    )
+    container.worker.run_once()
+    container.worker.run_once()
+    queued_nodes = container.agent_service.list_task_nodes(result.run_id)
+    planner_node = next(
+        node
+        for node in queued_nodes
+        if node.role == AgentRole.PLANNER and node.node_type not in {"proposal", "summary"}
+    )
+    queued_job = container.graph_node_queue_service.get_by_task_node_id(planner_node.id)
+
+    assert planner_node.status == "queued"
+    assert queued_job is not None
+    assert queued_job.status == "queued"
+
+    for _ in range(12):
+        if container.worker.run_once() is None:
+            break
+
+    drained_nodes = container.agent_service.list_task_nodes(result.run_id)
+    drained_planner = next(node for node in drained_nodes if node.id == planner_node.id)
+    drained_review = next(
+        node
+        for node in drained_nodes
+        if node.role == AgentRole.REVIEWER and node.node_type == "review"
+    )
+    resumed = container.graph_runtime.get_run_context(result.run_id)
+
+    assert drained_planner.status == "completed"
+    assert drained_review.status == "completed"
+    assert resumed["status"] == "waiting_approval"
+    assert resumed["state"]["proposal_ids"]
+
+
+def test_graph_runtime_resumes_queued_non_executor_nodes_after_restart(app_settings, monkeypatch):
+    container_a = AppContainer(app_settings)
+    original_advance = container_a.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container_a.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+
+    result = container_a.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Queued restart resume")
+    )
+    container_a.worker.run_once()
+    container_a.worker.run_once()
+    queued_node = next(
+        node
+        for node in container_a.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.node_type not in {"proposal", "summary"}
+    )
+    queued_job = container_a.graph_node_queue_service.get_by_task_node_id(queued_node.id)
+
+    assert queued_node.status == "queued"
+    assert queued_job is not None
+    assert queued_job.status == "queued"
+
+    container_b = AppContainer(app_settings)
+    resumed = container_b.graph_runtime.get_run_context(result.run_id)
+    resumed_nodes = container_b.agent_service.list_task_nodes(result.run_id)
+    resumed_planner = next(node for node in resumed_nodes if node.id == queued_node.id)
+
+    assert resumed_planner.status == "completed"
+    assert resumed["status"] == "waiting_approval"
+    assert resumed["state"]["proposal_ids"]
+
+
+def test_graph_runtime_retry_replays_failed_planner_branch(container, monkeypatch):
+    original_build = container.planner._build_branch_proposals
+    original_advance = container.graph_runtime.advance_run
+    failed_once = {"value": False}
+
+    def flaky_build(*args, **kwargs):
+        if kwargs.get("branch_key") == "filesystem" and not failed_once["value"]:
+            failed_once["value"] = True
+            raise RuntimeError("planner branch failed once")
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        container.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+    monkeypatch.setattr(container.planner, "_build_branch_proposals", flaky_build)
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Inspect a local note", filesystem_path="notes.txt")
+    )
+    container.worker.run_once()
+    container.worker.run_once()
+    container.worker.run_once()
+    planner_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.branch_key == "filesystem"
+    )
+    review_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.REVIEWER and node.node_type == "review"
+    )
+
+    assert planner_node.status == "failed"
+    assert review_node.status == "blocked"
+
+    container.graph_runtime.request_retry(planner_node.id, actor="pytest", reason="retry planner branch")
+    container.graph_runtime.advance_run(result.run_id)
+    for _ in range(12):
+        if container.worker.run_once() is None:
+            break
+
+    retried_nodes = container.agent_service.list_task_nodes(result.run_id)
+    retried_planner = next(node for node in retried_nodes if node.id == planner_node.id)
+    retried_review = next(node for node in retried_nodes if node.id == review_node.id)
+    resumed = container.graph_runtime.get_run_context(result.run_id)
+
+    assert retried_planner.status == "completed"
+    assert retried_review.status == "completed"
+    assert resumed["state"]["planning_completed"] is True
+    assert resumed["state"]["proposal_ids"]
+
+
+def test_graph_runtime_cancelled_queued_non_executor_job_is_persisted(app_settings, monkeypatch):
+    container = AppContainer(app_settings)
+    original_advance = container.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Inspect a local note", filesystem_path="notes.txt")
+    )
+    container.worker.run_once()
+    container.worker.run_once()
+    planner_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.branch_key == "filesystem"
+    )
+
+    container.graph_runtime.cancel_node(planner_node.id, actor="pytest", reason="cancel queued planner node")
+
+    cancelled_nodes = container.agent_service.list_task_nodes(result.run_id)
+    cancelled_planner = next(node for node in cancelled_nodes if node.id == planner_node.id)
+    cancelled_job = container.graph_node_queue_service.get_by_task_node_id(planner_node.id)
+
+    assert cancelled_planner.status == "cancelled"
+    assert cancelled_job is not None
+    assert cancelled_job.status == "cancelled"
+
+
+def test_graph_runtime_cancelled_non_executor_node_blocks_dependents(app_settings, monkeypatch):
+    container = AppContainer(app_settings)
+    original_advance = container.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Inspect a local note", filesystem_path="notes.txt")
+    )
+    container.worker.run_once()
+    container.worker.run_once()
+    planner_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.branch_key == "filesystem" and node.node_type != "summary"
+    )
+
+    container.graph_runtime.cancel_node(planner_node.id, actor="pytest", reason="cancel branch")
+
+    nodes = container.agent_service.list_task_nodes(result.run_id)
+    cancelled_planner = next(node for node in nodes if node.id == planner_node.id)
+    blocked_review = next(node for node in nodes if node.role == AgentRole.REVIEWER and node.node_type == "review")
+    blocked_merge = next(node for node in nodes if node.node_type == "merge")
+    blocked_reporter = next(node for node in nodes if node.role == AgentRole.REPORTER)
+    context = container.graph_runtime.get_run_context(result.run_id)
+
+    assert cancelled_planner.status == "cancelled"
+    assert blocked_review.status == "blocked"
+    assert blocked_merge.status == "blocked"
+
+
+def test_graph_runtime_state_does_not_persist_filesystem_write_content(container):
+    secret = "VERY SECRET FILE CONTENT"
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Write protected file content",
+            filesystem_path="secret.txt",
+            file_content=secret,
+        )
+    )
+    graph_row = container.database.fetch_one("SELECT state_json FROM graph_runs WHERE run_id = ?", (result.run_id,))
+    job_rows = container.database.fetch_all(
+        "SELECT result_json FROM graph_node_jobs WHERE run_id = ? ORDER BY queued_at ASC",
+        (result.run_id,),
+    )
+
+    assert secret not in graph_row["state_json"]
+    assert all(secret not in (row["result_json"] or "") for row in job_rows)
+
+
+def test_reporter_provider_failure_returns_governance_safe_fallback(container, monkeypatch):
+    secret = "VERY SECRET OBJECTIVE CONTEXT"
+    original_complete = container.provider_service.complete
+
+    def fail_report_provider(request):
+        if request.task_type == "report-plan":
+            raise RuntimeError("report provider unavailable")
+        return original_complete(request)
+
+    monkeypatch.setattr(container.provider_service, "complete", fail_report_provider)
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective=f"Inspect deferred evidence for {secret}",
+            filesystem_path="secret.txt",
+        )
+    )
+    context = container.graph_runtime.get_run_context(result.run_id)
+
+    assert context is not None
+    assert "Plan ready." in context["state"]["operator_summary"]
+    assert "deferred" in context["state"]["operator_summary"].lower()
+    assert secret not in context["state"]["operator_summary"]
+    assert "report provider unavailable" not in context["state"]["operator_summary"]
+
+
+def test_graph_node_job_result_does_not_persist_restricted_http_body(container):
+    secret = "{\"token\":\"TOP SECRET HTTP BODY\"}"
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Post to an allowlisted endpoint",
+            http_url="https://example.com/api",
+            http_method="POST",
+            http_body=secret,
+        )
+    )
+    job_rows = container.database.fetch_all(
+        "SELECT result_json FROM graph_node_jobs WHERE run_id = ? ORDER BY queued_at ASC",
+        (result.run_id,),
+    )
+
+    assert job_rows
+    assert all(secret not in (row["result_json"] or "") for row in job_rows)
+
+
+def test_graph_runtime_retry_purges_orphaned_graph_result_blobs_and_preserves_summary_blob(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Write protected file content",
+            filesystem_path="secret.txt",
+            file_content="VERY SECRET FILE CONTENT",
+        )
+    )
+    state_row = container.database.fetch_one("SELECT state_json FROM graph_runs WHERE run_id = ?", (result.run_id,))
+    job_rows = container.database.fetch_all(
+        "SELECT result_json FROM graph_node_jobs WHERE run_id = ? ORDER BY queued_at ASC",
+        (result.run_id,),
+    )
+    summary_row = container.database.fetch_one(
+        "SELECT summary_text_blob_id FROM summaries WHERE run_id = ?",
+        (result.run_id,),
+    )
+    blob_dir = container.base_settings.resolved_protected_blob_dir
+    referenced_blob_ids = container.data_governance_service.collect_blob_ids(json.loads(state_row["state_json"]))
+    for row in job_rows:
+        referenced_blob_ids.update(
+            container.data_governance_service.collect_blob_ids(json.loads(row["result_json"] or "{}"))
+        )
+    assert referenced_blob_ids
+    assert summary_row is not None
+    assert summary_row["summary_text_blob_id"]
+    assert (blob_dir / f"{summary_row['summary_text_blob_id']}.bin").exists()
+
+    planner_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.node_type not in {"proposal", "summary"}
+    )
+    container.graph_runtime.request_retry(planner_node.id, actor="pytest", reason="purge orphan graph blobs")
+
+    for blob_id in referenced_blob_ids:
+        assert not (blob_dir / f"{blob_id}.bin").exists()
+    assert (blob_dir / f"{summary_row['summary_text_blob_id']}.bin").exists()
+
+
+def test_fail_closed_storage_refusal_surfaces_and_records_failed_graph(tmp_path):
+    from app.config.settings import AppSettings
+
+    settings = AppSettings(
+        app_name="Fail Closed Graph Runtime Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        graph_execution_mode="inline_compat",
+        local_protection_mode="unprotected-local",
+        allow_insecure_local_storage=False,
+        session_secret="test-session-secret",
+    )
+    container = AppContainer(settings)
+
+    with pytest.raises(FailClosedStorageRefusalError, match="Strong local protection is required"):
+        container.runtime_service.run_agent(
+            AgentRunRequest(
+                objective="Write protected file content",
+                filesystem_path="secret.txt",
+                file_content="restricted material",
+            )
+        )
+
+    graph_row = container.database.fetch_one(
+        "SELECT status, last_error, state_json FROM graph_runs ORDER BY created_at DESC LIMIT 1"
+    )
+    audit_row = container.database.fetch_one(
+        "SELECT event_type, payload_json FROM audit_entries WHERE event_type = 'graph.node_failed' ORDER BY created_at DESC LIMIT 1"
+    )
+
+    assert graph_row is not None
+    assert graph_row["status"] == "failed"
+    assert "Strong local protection is required" in (graph_row["last_error"] or "")
+    assert "restricted material" not in graph_row["state_json"]
+    assert audit_row is not None
+    assert "Strong local protection is required" in audit_row["payload_json"]
+
+
+def test_graph_node_lease_is_extended_for_long_running_non_executor_job(app_settings, monkeypatch):
+    container = AppContainer(app_settings.model_copy(update={"worker_lease_seconds": 1}))
+    original_advance = container.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+    original_execute = container.planner.execute_planner_node
+    started = threading.Event()
+
+    def slow_execute(*args, **kwargs):
+        started.set()
+        time.sleep(2.5)
+        return original_execute(*args, **kwargs)
+
+    monkeypatch.setattr(container.planner, "execute_planner_node", slow_execute)
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Create a tracked task", task_title="Long graph lease")
+    )
+    container.worker.run_once()
+    container.worker.run_once()
+    runner = threading.Thread(
+        target=lambda: container.graph_runtime.run_next_non_executor_job(worker_id="graph-worker-a", run_id=result.run_id),
+        daemon=True,
+    )
+    runner.start()
+    assert started.wait(timeout=5)
+
+    time.sleep(1.4)
+    planner_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.node_type not in {"proposal", "summary"}
+    )
+    running_job = container.graph_node_queue_service.get_by_task_node_id(planner_node.id)
+    competing_claim = container.graph_node_queue_service.claim_next_job(
+        worker_id="graph-worker-b",
+        lease_seconds=1,
+        max_attempts=3,
+        run_id=result.run_id,
+    )
+
+    runner.join(timeout=10)
+    finished_job = container.graph_node_queue_service.get_by_task_node_id(planner_node.id)
+
+    assert running_job.status == "running"
+    assert running_job.last_heartbeat_at is not None
+    assert competing_claim is None
+    assert finished_job.status == "completed"
+    assert finished_job.attempt_count == 1
+
+
+def test_running_non_executor_job_supports_cooperative_cancel(app_settings, monkeypatch):
+    container = AppContainer(app_settings.model_copy(update={"worker_lease_seconds": 1}))
+    original_advance = container.graph_runtime.advance_run
+    monkeypatch.setattr(
+        container.graph_runtime,
+        "advance_run",
+        lambda run_id, max_steps=100, execute_inline=True: original_advance(
+            run_id, max_steps=max_steps, execute_inline=False
+        ),
+    )
+    original_build = container.planner._build_branch_proposals
+    entered = threading.Event()
+
+    def slow_build(*args, **kwargs):
+        entered.set()
+        time.sleep(1.5)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(container.planner, "_build_branch_proposals", slow_build)
+
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(objective="Inspect a local note", filesystem_path="notes.txt")
+    )
+    container.worker.run_once()
+    container.worker.run_once()
+    planner_node = next(
+        node
+        for node in container.agent_service.list_task_nodes(result.run_id)
+        if node.role == AgentRole.PLANNER and node.branch_key == "filesystem"
+    )
+    runner = threading.Thread(
+        target=lambda: container.graph_runtime.run_next_non_executor_job(worker_id="graph-worker-a", run_id=result.run_id),
+        daemon=True,
+    )
+    runner.start()
+    assert entered.wait(timeout=5)
+
+    container.graph_runtime.cancel_node(planner_node.id, actor="pytest", reason="cancel running planner")
+    runner.join(timeout=10)
+
+    cancelled_nodes = container.agent_service.list_task_nodes(result.run_id)
+    cancelled_planner = next(node for node in cancelled_nodes if node.id == planner_node.id)
+    blocked_review = next(
+        node
+        for node in cancelled_nodes
+        if node.role == AgentRole.REVIEWER and node.node_type == "review"
+    )
+    cancelled_job = container.graph_node_queue_service.get_by_task_node_id(planner_node.id)
+
+    assert cancelled_planner.status == "cancelled"
+    assert blocked_review.status == "blocked"
+    assert cancelled_job is not None
+    assert cancelled_job.status == "cancelled"
+    assert cancelled_job.cancel_requested_at is not None
+
+    container.graph_runtime.request_retry(planner_node.id, actor="pytest", reason="retry cancelled planner")
+    container.graph_runtime.advance_run(result.run_id)
+    for _ in range(12):
+        if container.worker.run_once() is None:
+            break
+
+    retried_nodes = container.agent_service.list_task_nodes(result.run_id)
+    retried_planner = next(node for node in retried_nodes if node.id == planner_node.id)
+    assert retried_planner.status == "completed"
+
+
+def test_worker_fairness_alternates_between_graph_and_executor_work(container):
+    result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Prepare executor work",
+            task_title="Executor fairness task",
+        )
+    )
+    proposal = result.proposals[0]
+    queued = container.runtime_service.approve_and_queue(
+        proposal.id,
+        ApprovalDecisionRequest(actor="pytest", reason="executor fairness"),
+    )
+
+    container.base_settings.graph_execution_mode = "background_preferred"
+    graph_result = container.runtime_service.run_agent(
+        AgentRunRequest(
+            objective="Queue graph work for fairness",
+            task_title="Graph fairness task",
+        )
+    )
+    assert graph_result.summary is None
+
+    first = container.worker.run_once()
+    second = container.worker.run_once()
+
+    assert first["status"] == "completed"
+    assert second["status"] == "open"
+    assert container.execution_queue_service.get(queued["job"].id).status.value == "executed"

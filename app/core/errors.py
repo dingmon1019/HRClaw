@@ -36,3 +36,27 @@ class CsrfError(AppError):
 
 class RateLimitError(AppError):
     """Raised when a request exceeds the allowed rate."""
+
+
+class CancellationRequestedError(AppError):
+    """Raised when cooperative cancellation is requested for a running job."""
+
+
+class SecurityRefusalError(AppError, ValueError):
+    """Raised when the runtime intentionally refuses an unsafe operation."""
+
+
+class ProtectedStorageRefusalError(SecurityRefusalError):
+    """Raised when protected storage policy refuses the requested operation."""
+
+
+class FailClosedStorageRefusalError(ProtectedStorageRefusalError):
+    """Raised when storage is denied because strong local protection is required."""
+
+
+class InsecureSecretStorageRefusalError(ProtectedStorageRefusalError):
+    """Raised when a secret would only be available through unprotected local storage."""
+
+
+class ProtectedBlobIntegrityError(SecurityRefusalError):
+    """Raised when protected blob contents fail integrity verification."""

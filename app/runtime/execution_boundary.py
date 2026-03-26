@@ -113,11 +113,12 @@ class ConstrainedExecutionRunner:
             exact_http_targets=exact_http_targets,
             effective_settings=effective_settings,
         )
+        executor_context_namespace = f"executor:{proposal.run_id}:{proposal.id}:{proposal.connector}"
         executor_layout = self.agent_workspace_service.layout_for(
             run_id=proposal.run_id,
             agent_role="executor",
             memory_namespace="executor",
-            context_namespace=f"executor:{proposal.run_id}:{proposal.connector}",
+            context_namespace=executor_context_namespace,
             branch_key=proposal.connector,
         )
         child_filesystem_roots = exact_file_paths or list(effective_settings.allowed_filesystem_roots)
@@ -147,7 +148,7 @@ class ConstrainedExecutionRunner:
                 "The child interpreter runs with explicit import bootstrap instead of inheriting ambient PYTHONPATH.",
                 "This boundary reduces control-plane coupling but is not an OS or kernel sandbox.",
                 "Connector access is restricted to the single approved action bundle and brokered task actions.",
-                "The child process starts inside an executor-specific scratch area and does not share a writable scratch directory with planner, reviewer, or reporter agents.",
+                "The child process starts inside a proposal-scoped executor scratch area and does not share a writable scratch directory with planner, reviewer, or reporter agents.",
             ],
         )
         return ExecutionBundle(
@@ -185,6 +186,7 @@ class ConstrainedExecutionRunner:
                 "agent_reports_root": str(executor_layout.reports_root),
                 "promotion_root": str(executor_layout.promotion_root),
                 "shared_workspace_root": str(executor_layout.shared_workspace_root),
+                "agent_context_namespace": executor_context_namespace,
                 "child_cwd": str(executor_layout.scratch_root),
             },
             boundary=boundary,

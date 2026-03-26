@@ -9,6 +9,9 @@
         <div class="stack tight align-end">
             <span class="badge ok">Approval Bound</span>
             <span class="badge ok">Constrained Worker Boundary</span>
+            <span class="badge {{ 'ok' if windows_helper_status.supported else 'warn' }}">
+                {{ "Windows helpers ready" if windows_helper_status.supported else "Windows helpers unavailable" }}
+            </span>
         </div>
     </div>
 
@@ -86,6 +89,13 @@
             <div class="stack form-grid mt-16">
                 <div class="panel">
                     <h4>Windows Helpers</h4>
+                    <p class="small muted">
+                        {% if windows_helper_status.supported %}
+                        Native helper scripts are available on this host.
+                        {% else %}
+                        {{ windows_helper_status.reason }}
+                        {% endif %}
+                    </p>
                     <div class="stack tight">
                         {% for helper in windows_helpers %}
                         <div class="list-item">
@@ -112,11 +122,18 @@
                                 data-endpoint="/api/windows/workspace-file-picker"
                                 data-target-input="input[name='filesystem_path']"
                                 data-feedback-selector="#workspace-picker-feedback"
+                                {% if not windows_helper_status.supported %}disabled{% endif %}
                             >
                                 Choose Workspace File
                             </button>
                         </div>
-                        <p id="workspace-picker-feedback" class="small muted">The picker keeps the returned path inside {{ settings.workspace_root }}.</p>
+                        <p id="workspace-picker-feedback" class="small muted">
+                            {% if windows_helper_status.supported %}
+                            The picker keeps the returned path inside {{ settings.workspace_root }}.
+                            {% else %}
+                            {{ windows_helper_status.reason }}
+                            {% endif %}
+                        </p>
                     </div>
                 </div>
 

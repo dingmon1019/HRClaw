@@ -13,8 +13,8 @@ from app import cli as cli_module
 from app.api.app import create_app
 from app.config.settings import AppSettings
 from app.core.container import AppContainer
-from app.core.errors import AuthorizationError
-from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
+from app.core.errors import AuthorizationError, FailClosedStorageRefusalError
+from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, DataClassification, ProposalStatus
 from app.schemas.providers import ProviderRequest, ProviderResponse
 from app.schemas.settings import SettingsUpdate
 from tests.helpers import bootstrap_operator
@@ -360,13 +360,14 @@ def test_fail_closed_storage_blocks_sensitive_payload_without_override(tmp_path)
         provider="mock",
         fallback_provider="mock",
         model="mock-model",
+        graph_execution_mode="inline_compat",
         local_protection_mode="unprotected-local",
         allow_insecure_local_storage=False,
         session_secret="test-session-secret",
     )
     container = AppContainer(settings)
 
-    with pytest.raises(ValueError, match="Strong local protection is required"):
+    with pytest.raises(FailClosedStorageRefusalError, match="Strong local protection is required"):
         container.runtime_service.run_agent(
             AgentRunRequest(
                 objective="Write protected file content",
@@ -516,6 +517,7 @@ def test_remote_planning_prompt_redacts_local_task_snapshot(monkeypatch, tmp_pat
         provider="openai",
         fallback_provider="mock",
         model="mock-model",
+        graph_execution_mode="inline_compat",
         session_secret="test-session-secret",
         allow_insecure_local_storage=True,
     )
@@ -568,6 +570,7 @@ def test_remote_planning_prompt_redacts_filesystem_context(monkeypatch, tmp_path
         provider="openai",
         fallback_provider="mock",
         model="mock-model",
+        graph_execution_mode="inline_compat",
         session_secret="test-session-secret",
         allow_insecure_local_storage=True,
     )
@@ -625,6 +628,7 @@ def test_remote_report_prompt_withholds_local_only_derived_summary(monkeypatch, 
         provider="openai",
         fallback_provider="mock",
         model="mock-model",
+        graph_execution_mode="inline_compat",
         session_secret="test-session-secret",
         allow_insecure_local_storage=True,
     )
@@ -683,6 +687,132 @@ def test_remote_report_prompt_withholds_local_only_derived_summary(monkeypatch, 
     assert report_outbound["prompt_governance"]["curation_posture"] == "summary-withheld"
 
 
+def test_local_only_summary_text_is_not_stored_as_cleartext_at_rest(tmp_path):
+    settings = AppSettings(
+        app_name="Protected Summary Storage Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+        local_protection_mode="unprotected-local",
+        allow_insecure_local_storage=True,
+    )
+    container = AppContainer(settings)
+    summary_text = "LOCAL ONLY SUMMARY " + ("x" * 900)
+
+    container.summary_service.create(
+        run_id="run_local_only_summary",
+        objective="Protect local-only summary",
+        collected={"tasks": {"task_snapshot_present": True}},
+        summary_text=summary_text,
+        provider_name="mock",
+        data_classification=DataClassification.LOCAL_ONLY,
+        lineage={"source_classification": "local-only", "requires_curation": True},
+        outbound_summary_text=None,
+    )
+
+    row = container.database.fetch_one(
+        "SELECT summary_text, summary_text_blob_id, summary_text_storage_mode FROM summaries WHERE run_id = ?",
+        ("run_local_only_summary",),
+    )
+    assert row is not None
+    assert row["summary_text_blob_id"]
+    assert row["summary_text_storage_mode"].startswith("protected-blob:")
+    assert row["summary_text"] == "[protected local-only summary]"
+    assert container.summary_service.list_recent(limit=1)[0].summary_text == "[protected local-only summary]"
+    assert container.summary_service.get_by_run_id("run_local_only_summary").summary_text == summary_text
+
+
+def test_external_ok_summary_can_remain_inline_at_rest(tmp_path):
+    settings = AppSettings(
+        app_name="Inline Summary Storage Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+    )
+    container = AppContainer(settings)
+    summary_text = "External OK summary"
+
+    container.summary_service.create(
+        run_id="run_external_ok_summary",
+        objective="Keep external summary inline",
+        collected={"http": {"present": True}},
+        summary_text=summary_text,
+        provider_name="mock",
+        data_classification=DataClassification.EXTERNAL_OK,
+        lineage={"source_classification": "external-ok", "requires_curation": False},
+        outbound_summary_text="curated outbound summary",
+    )
+
+    row = container.database.fetch_one(
+        """
+        SELECT summary_text, summary_text_blob_id, summary_text_storage_mode,
+               outbound_summary_text, outbound_summary_text_blob_id, outbound_summary_text_storage_mode
+        FROM summaries WHERE run_id = ?
+        """,
+        ("run_external_ok_summary",),
+    )
+    assert row is not None
+    assert row["summary_text"] == summary_text
+    assert row["summary_text_blob_id"] is None
+    assert row["summary_text_storage_mode"] == "direct"
+    assert row["outbound_summary_text"] == "curated outbound summary"
+    assert row["outbound_summary_text_blob_id"] is None
+    assert row["outbound_summary_text_storage_mode"] == "direct"
+
+
+def test_preview_only_summary_storage_when_strong_protection_is_unavailable(tmp_path):
+    settings = AppSettings(
+        app_name="Preview Only Summary Storage Test",
+        runtime_state_root=tmp_path / "runtime-state",
+        database_path=tmp_path / "runtime.db",
+        audit_log_path=tmp_path / "audit.jsonl",
+        workspace_root=tmp_path / "workspace",
+        allowed_filesystem_roots=str(tmp_path / "workspace"),
+        provider="mock",
+        fallback_provider="mock",
+        model="mock-model",
+        session_secret="test-session-secret",
+        local_protection_mode="unprotected-local",
+        allow_insecure_local_storage=False,
+    )
+    container = AppContainer(settings)
+    summary_text = "LOCAL ONLY " + ("y" * 900)
+
+    container.summary_service.create(
+        run_id="run_preview_only_summary",
+        objective="Degrade summary storage safely",
+        collected={"filesystem": {"present": True}},
+        summary_text=summary_text,
+        provider_name="mock",
+        data_classification=DataClassification.LOCAL_ONLY,
+        lineage={"source_classification": "local-only", "requires_curation": True},
+        outbound_summary_text=None,
+    )
+
+    row = container.database.fetch_one(
+        "SELECT summary_text, summary_text_blob_id, summary_text_storage_mode FROM summaries WHERE run_id = ?",
+        ("run_preview_only_summary",),
+    )
+    assert row is not None
+    assert row["summary_text_blob_id"] is None
+    assert row["summary_text_storage_mode"] == "preview-only"
+    assert row["summary_text"] == summary_text[: container.summary_service.SENSITIVE_PREVIEW_LIMIT]
+    assert container.summary_service.get_by_run_id("run_preview_only_summary").summary_text == summary_text[
+        : container.summary_service.SENSITIVE_PREVIEW_LIMIT
+    ]
+
 def test_remote_planning_prompt_redacts_http_response_body_preview(monkeypatch, tmp_path):
     settings = AppSettings(
         app_name="Remote HTTP Prompt Governance Test",
@@ -695,6 +825,7 @@ def test_remote_planning_prompt_redacts_http_response_body_preview(monkeypatch, 
         provider="openai",
         fallback_provider="mock",
         model="mock-model",
+        graph_execution_mode="inline_compat",
         session_secret="test-session-secret",
         allow_insecure_local_storage=True,
     )
@@ -886,6 +1017,20 @@ def test_handoff_preflight_flags_dist_artifacts(tmp_path):
 
     assert "dist" in findings
     assert "workspace" in findings
+
+
+def test_validate_source_tree_rejects_handoff_contamination(tmp_path):
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "package_release.py"
+    spec = importlib.util.spec_from_file_location("package_release", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "workspace").mkdir()
+
+    with pytest.raises(ValueError, match="Working tree still contains ignored local artifacts"):
+        module.validate_source_tree(tmp_path, mode="handoff")
 
 
 def test_handoff_archive_excludes_runtime_and_dist_artifacts(tmp_path):

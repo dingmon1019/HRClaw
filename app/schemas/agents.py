@@ -78,3 +78,27 @@ class TaskNodeRecord(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     created_at: str
     completed_at: str | None = None
+
+
+class GraphNodeJobRecord(BaseModel):
+    id: str
+    task_node_id: str
+    run_id: str
+    role: AgentRole
+    node_type: str
+    status: str
+    queued_by: str
+    queued_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    worker_id: str | None = None
+    result: dict[str, Any] = Field(default_factory=dict)
+    error_text: str | None = None
+    lease_expires_at: str | None = None
+    last_heartbeat_at: str | None = None
+    attempt_count: int = 0
+    correlation_id: str | None = None
+    dead_letter_reason: str | None = None
+    cancel_requested_at: str | None = None
+    cancel_requested_by: str | None = None
+    cancel_reason: str | None = None

@@ -84,10 +84,20 @@ CREATE TABLE IF NOT EXISTS summaries (
     objective TEXT NOT NULL,
     collected_json TEXT NOT NULL,
     summary_text TEXT NOT NULL,
+    summary_text_blob_id TEXT,
+    summary_text_digest TEXT,
+    summary_text_storage_mode TEXT,
+    summary_text_storage_class TEXT,
+    summary_text_encoding TEXT,
     provider_name TEXT NOT NULL,
     data_classification TEXT NOT NULL DEFAULT 'local-only',
     lineage_json TEXT NOT NULL DEFAULT '{}',
     outbound_summary_text TEXT,
+    outbound_summary_text_blob_id TEXT,
+    outbound_summary_text_digest TEXT,
+    outbound_summary_text_storage_mode TEXT,
+    outbound_summary_text_storage_class TEXT,
+    outbound_summary_text_encoding TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -104,6 +114,65 @@ CREATE TABLE IF NOT EXISTS connector_runs (
     output_json TEXT,
     error_text TEXT,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS artifact_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    proposal_id TEXT,
+    agent_role TEXT NOT NULL,
+    context_namespace TEXT,
+    event_type TEXT NOT NULL,
+    artifact_path TEXT,
+    source_path TEXT,
+    destination_path TEXT,
+    status TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_runs (
+    run_id TEXT PRIMARY KEY,
+    request_json TEXT NOT NULL,
+    summary_id TEXT,
+    planner_run_id TEXT,
+    planner_handoff_id TEXT,
+    reviewer_run_id TEXT,
+    reviewer_handoff_id TEXT,
+    reporter_run_id TEXT,
+    reporter_handoff_id TEXT,
+    correlation_id TEXT,
+    status TEXT NOT NULL,
+    state_json TEXT NOT NULL DEFAULT '{}',
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS graph_node_jobs (
+    id TEXT PRIMARY KEY,
+    task_node_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    node_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    queued_by TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    worker_id TEXT,
+    result_json TEXT,
+    error_text TEXT,
+    lease_expires_at TEXT,
+    last_heartbeat_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    correlation_id TEXT,
+    dead_letter_reason TEXT,
+    cancel_requested_at TEXT,
+    cancel_requested_by TEXT,
+    cancel_reason TEXT,
+    FOREIGN KEY(task_node_id) REFERENCES task_nodes(id)
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -340,6 +409,9 @@ CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 CREATE INDEX IF NOT EXISTS idx_proposals_created_at ON proposals(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_action_history_started_at ON action_history(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_connector_runs_created_at ON connector_runs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifact_events_run_id ON artifact_events(run_id, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_graph_runs_status ON graph_runs(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_graph_node_jobs_status ON graph_node_jobs(status, queued_at ASC);
 CREATE INDEX IF NOT EXISTS idx_execution_jobs_status ON execution_jobs(status, queued_at ASC);
 CREATE INDEX IF NOT EXISTS idx_audit_entries_created_at ON audit_entries(created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_proposal_snapshots_proposal ON proposal_snapshots(proposal_id, created_at DESC);
@@ -357,6 +429,9 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_proposals_created_at ON proposals(created_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_action_history_started_at ON action_history(started_at DESC);",
     "CREATE INDEX IF NOT EXISTS idx_connector_runs_created_at ON connector_runs(created_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_artifact_events_run_id ON artifact_events(run_id, created_at ASC);",
+    "CREATE INDEX IF NOT EXISTS idx_graph_runs_status ON graph_runs(status, updated_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_graph_node_jobs_status ON graph_node_jobs(status, queued_at ASC);",
     "CREATE INDEX IF NOT EXISTS idx_execution_jobs_status ON execution_jobs(status, queued_at ASC);",
     "CREATE INDEX IF NOT EXISTS idx_audit_entries_created_at ON audit_entries(created_at ASC);",
     "CREATE INDEX IF NOT EXISTS idx_proposal_snapshots_proposal ON proposal_snapshots(proposal_id, created_at DESC);",
@@ -467,6 +542,18 @@ class Database:
                 "boundary_mode": "TEXT",
                 "boundary_metadata_json": "TEXT",
             },
+            "graph_node_jobs": {
+                "role": "TEXT",
+                "node_type": "TEXT",
+                "lease_expires_at": "TEXT",
+                "last_heartbeat_at": "TEXT",
+                "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+                "correlation_id": "TEXT",
+                "dead_letter_reason": "TEXT",
+                "cancel_requested_at": "TEXT",
+                "cancel_requested_by": "TEXT",
+                "cancel_reason": "TEXT",
+            },
             "task_nodes": {
                 "proposal_id": "TEXT",
                 "branch_key": "TEXT",
@@ -484,6 +571,16 @@ class Database:
                 "data_classification": "TEXT NOT NULL DEFAULT 'local-only'",
                 "lineage_json": "TEXT NOT NULL DEFAULT '{}'",
                 "outbound_summary_text": "TEXT",
+                "summary_text_blob_id": "TEXT",
+                "summary_text_digest": "TEXT",
+                "summary_text_storage_mode": "TEXT",
+                "summary_text_storage_class": "TEXT",
+                "summary_text_encoding": "TEXT",
+                "outbound_summary_text_blob_id": "TEXT",
+                "outbound_summary_text_digest": "TEXT",
+                "outbound_summary_text_storage_mode": "TEXT",
+                "outbound_summary_text_storage_class": "TEXT",
+                "outbound_summary_text_encoding": "TEXT",
             },
         }
         for table_name, columns in migrations.items():
@@ -518,6 +615,76 @@ class Database:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_nodes_run_id ON task_nodes(run_id, created_at ASC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS artifact_events (
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                proposal_id TEXT,
+                agent_role TEXT NOT NULL,
+                context_namespace TEXT,
+                event_type TEXT NOT NULL,
+                artifact_path TEXT,
+                source_path TEXT,
+                destination_path TEXT,
+                status TEXT NOT NULL,
+                details_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_runs (
+                run_id TEXT PRIMARY KEY,
+                request_json TEXT NOT NULL,
+                summary_id TEXT,
+                planner_run_id TEXT,
+                planner_handoff_id TEXT,
+                reviewer_run_id TEXT,
+                reviewer_handoff_id TEXT,
+                reporter_run_id TEXT,
+                reporter_handoff_id TEXT,
+                correlation_id TEXT,
+                status TEXT NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_runs_status ON graph_runs(status, updated_at DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS graph_node_jobs (
+                id TEXT PRIMARY KEY,
+                task_node_id TEXT NOT NULL UNIQUE,
+                run_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                queued_by TEXT NOT NULL,
+                queued_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                worker_id TEXT,
+                result_json TEXT,
+                error_text TEXT,
+                lease_expires_at TEXT,
+                last_heartbeat_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                correlation_id TEXT,
+                dead_letter_reason TEXT,
+                cancel_requested_at TEXT,
+                cancel_requested_by TEXT,
+                cancel_reason TEXT,
+                FOREIGN KEY(task_node_id) REFERENCES task_nodes(id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_node_jobs_status ON graph_node_jobs(status, queued_at ASC)")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS provider_configs (

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
+import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -62,6 +65,9 @@ def _run_windows_script(
     arguments: list[str] | None = None,
     timeout_seconds: int = 30,
 ) -> str:
+    support = _windows_helper_support(container)
+    if not support["supported"]:
+        raise ValueError(support["reason"])
     allowed_scripts = {
         "pick-workspace-file.ps1",
         "install-worker-startup-task.ps1",
@@ -75,8 +81,11 @@ def _run_windows_script(
     script_path = container.base_settings.project_root / "scripts" / script_name
     if not script_path.exists():
         raise ValueError(f"Windows helper script {script_name} was not found.")
+    shell_path = support["shell_path"]
+    if not shell_path:
+        raise ValueError("Windows helper shell is unavailable on this host.")
     command = [
-        "powershell.exe",
+        shell_path,
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
@@ -85,20 +94,65 @@ def _run_windows_script(
     ]
     if arguments:
         command.extend(arguments)
-    result = subprocess.run(
-        command,
-        cwd=str(container.base_settings.project_root),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=timeout_seconds,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(container.base_settings.project_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError(f"Windows helper shell could not be launched: {exc}") from exc
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
     if result.returncode != 0:
         raise ValueError(stderr or stdout or f"{script_name} exited with code {result.returncode}.")
     return stdout
+
+
+def _windows_helper_support(container: AppContainer) -> dict[str, Any]:
+    if not sys.platform.startswith("win"):
+        return {
+            "supported": False,
+            "host_platform": sys.platform,
+            "shell_path": None,
+            "reason": "Windows helper integration is unavailable on non-Windows hosts.",
+        }
+    project_root = container.base_settings.project_root
+    candidates = [
+        shutil.which("powershell.exe"),
+        shutil.which("pwsh.exe"),
+        shutil.which("pwsh"),
+    ]
+    system_root = Path(os.environ.get("WINDIR", "C:\\Windows"))
+    bundled = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    if bundled.exists():
+        candidates.append(str(bundled))
+    shell_path = next((candidate for candidate in candidates if candidate), None)
+    if not shell_path:
+        return {
+            "supported": False,
+            "host_platform": sys.platform,
+            "shell_path": None,
+            "reason": "PowerShell is not available on this host.",
+        }
+    script_root = project_root / "scripts"
+    if not script_root.exists():
+        return {
+            "supported": False,
+            "host_platform": sys.platform,
+            "shell_path": shell_path,
+            "reason": f"Windows helper scripts were not found under {script_root}.",
+        }
+    return {
+        "supported": True,
+        "host_platform": sys.platform,
+        "shell_path": shell_path,
+        "reason": None,
+    }
 
 
 def _client_key(request: Request) -> str:
@@ -325,6 +379,8 @@ def _proposal_snapshot_context(container: AppContainer, proposal: ProposalRecord
 
 
 def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
+    run_result = container.runtime_service.describe_run(run_id)
+    graph_run = container.graph_runtime.get_run_context(run_id)
     summary = container.summary_service.get_by_run_id(run_id)
     proposals = [proposal for proposal in container.proposal_service.list() if proposal.run_id == run_id]
     agent_runs = container.agent_service.list_run_history(run_id)
@@ -334,6 +390,10 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
     execution_jobs = [job for job in container.execution_queue_service.list_recent(limit=200) if job.run_id == run_id]
     execution_attempts = {job.id: container.execution_queue_service.list_attempts(job.id) for job in execution_jobs}
     return {
+        "run_result": run_result,
+        "graph_run": graph_run,
+        "planning_status": run_result.planning_status if run_result is not None else None,
+        "planning_message": run_result.message if run_result is not None else "Run not found.",
         "summary": summary,
         "proposals": proposals,
         "agent_runs": agent_runs,
@@ -346,6 +406,7 @@ def _run_context(container: AppContainer, run_id: str) -> dict[str, Any]:
         "connector_runs": connector_runs,
         "execution_jobs": execution_jobs,
         "execution_attempts": execution_attempts,
+        "artifact_events": container.artifact_lineage_service.list_events(run_id),
     }
 
 
@@ -659,6 +720,17 @@ def _worker_task_status_from_output(output: str) -> dict[str, Any] | None:
 
 
 def _dashboard_worker_task_status(container: AppContainer) -> dict[str, Any] | None:
+    support = _windows_helper_support(container)
+    if not support["supported"]:
+        return {
+            "TaskName": "WinAgentRuntime.Worker",
+            "State": "Unavailable on this host",
+            "LastRunTime": "-",
+            "NextRunTime": "-",
+            "LastTaskResult": "-",
+            "Supported": False,
+            "Reason": support["reason"],
+        }
     try:
         output = _run_windows_script(
             container,
@@ -667,8 +739,29 @@ def _dashboard_worker_task_status(container: AppContainer) -> dict[str, Any] | N
             timeout_seconds=15,
         )
     except ValueError:
-        return None
-    return _worker_task_status_from_output(output)
+        return {
+            "TaskName": "WinAgentRuntime.Worker",
+            "State": "Unavailable on this host",
+            "LastRunTime": "-",
+            "NextRunTime": "-",
+            "LastTaskResult": "-",
+            "Supported": False,
+            "Reason": "Worker task helper could not be executed on this host.",
+        }
+    data = _worker_task_status_from_output(output)
+    if data is None:
+        return {
+            "TaskName": "WinAgentRuntime.Worker",
+            "State": "Unknown",
+            "LastRunTime": "-",
+            "NextRunTime": "-",
+            "LastTaskResult": "-",
+            "Supported": True,
+            "Reason": "Worker task helper returned an unstructured response.",
+        }
+    data.setdefault("Supported", True)
+    data.setdefault("Reason", None)
+    return data
 
 
 def _temporary_settings(
@@ -721,6 +814,7 @@ def _settings_page_context(
     provider_status_map = {status.name: status for status in provider_statuses}
     provider_usage = _provider_runtime_usage(container)
     storage_posture = _storage_posture_context(container)
+    windows_helper_status = _windows_helper_support(container)
     provider_catalog = [
         {
             "status": provider_status_map.get(config.provider_name),
@@ -737,6 +831,7 @@ def _settings_page_context(
         "protected_storage_mode": container.protected_storage.storage_mode,
         "protected_storage_posture": container.protected_storage.posture_label,
         "storage_posture": storage_posture,
+        "windows_helper_status": windows_helper_status,
         "providers": provider_statuses,
         "provider_catalog": provider_catalog,
         "unsafe_warnings": _unsafe_warnings(container),
@@ -952,6 +1047,7 @@ def dashboard(
         "recent_runs": recent_runs,
         "active_runs": active_runs,
         "worker_task_status": _dashboard_worker_task_status(container),
+        "windows_helper_status": _windows_helper_support(container),
         "agent_work_root": str(container.agent_workspace_service.root),
     }
     return _render(templates, request, "templates/dashboard.html", container, **context)
@@ -988,6 +1084,7 @@ def run_agent_form(
                 "detail": "Open the managed runtime workspace, logs, or secrets folder in Explorer while preparing an action.",
             },
         ],
+        "windows_helper_status": _windows_helper_support(container),
         "unsafe_warnings": _unsafe_warnings(container),
     }
     return _render(templates, request, "templates/run_agent.html", container, **context)
@@ -1034,7 +1131,7 @@ async def run_agent_submit(
     result = container.runtime_service.run_agent(run_request)
     return _redirect(
         f"/runs/{result.run_id}",
-        message="Objective decomposed, reviewed, and prepared for approval.",
+        message=result.message,
     )
 
 
@@ -1045,6 +1142,16 @@ async def api_pick_workspace_file(
 ):
     _api_user_or_401(request, container)
     await validate_csrf(request)
+    support = _windows_helper_support(container)
+    if not support["supported"]:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "cancelled": False,
+                "supported": False,
+                "detail": support["reason"],
+            },
+        )
     try:
         selected = _run_windows_script(container, "pick-workspace-file.ps1", timeout_seconds=120).strip()
     except ValueError as exc:
@@ -1091,7 +1198,7 @@ def run_detail_page(
     if isinstance(user, RedirectResponse):
         return user
     context = _run_context(container, run_id)
-    if context["summary"] is None:
+    if context["summary"] is None and context["graph_run"] is None and not context["task_nodes"]:
         raise NotFoundError(f"Run {run_id} was not found.")
     context.update(
         {
@@ -1799,6 +1906,25 @@ async def worker_task_action(
         script_name = script_map.get(action)
         if script_name is None:
             raise ValueError("Unknown worker task action.")
+        support = _windows_helper_support(container)
+        if not support["supported"]:
+            worker_task_result = {
+                "action": action,
+                "task_name": task_name,
+                "output": support["reason"],
+                "status": {
+                    "TaskName": task_name,
+                    "State": "Unavailable on this host",
+                    "LastRunTime": "-",
+                    "NextRunTime": "-",
+                    "LastTaskResult": "-",
+                    "Supported": False,
+                    "Reason": support["reason"],
+                },
+            }
+            context = _settings_page_context(container, worker_task_result=worker_task_result)
+            context["requires_recent_auth"] = not user.recent_auth
+            return _render(templates, request, "templates/settings.html", container, **context)
         if action != "status":
             _require_recent_auth(
                 request,
@@ -1933,7 +2059,7 @@ def api_get_run(
 ):
     _api_user_or_401(request, container)
     context = _run_context(container, run_id)
-    if context["summary"] is None:
+    if context["summary"] is None and context["graph_run"] is None and not context["task_nodes"]:
         raise HTTPException(status_code=404, detail=f"Run {run_id} was not found.")
     return context
 

@@ -51,6 +51,7 @@ class AppSettings(BaseSettings):
     history_retention_days: int = Field(default=30, ge=1, le=3650)
 
     runtime_mode: str = "safe"
+    graph_execution_mode: str = "background_preferred"
     allowed_filesystem_roots: str = "workspace"
     allowed_http_hosts: str = "127.0.0.1,localhost"
     allowed_http_schemes: str = "http,https"

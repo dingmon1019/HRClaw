@@ -297,6 +297,7 @@ class AgentService:
         agent_run_id: str | None = None,
         handoff_id: str | None = None,
         finalize: bool = False,
+        clear_completion: bool = False,
     ) -> TaskNodeRecord:
         current = self.database.fetch_one("SELECT * FROM task_nodes WHERE id = ?", (task_node_id,))
         if current is None:
@@ -310,7 +311,11 @@ class AgentService:
             UPDATE task_nodes
             SET status = ?, details_json = ?, provider_name = COALESCE(?, provider_name),
                 agent_run_id = COALESCE(?, agent_run_id), handoff_id = COALESCE(?, handoff_id),
-                completed_at = CASE WHEN ? IS NULL THEN completed_at ELSE ? END
+                completed_at = CASE
+                    WHEN ? = 1 THEN NULL
+                    WHEN ? IS NULL THEN completed_at
+                    ELSE ?
+                END
             WHERE id = ?
             """,
             (
@@ -319,6 +324,7 @@ class AgentService:
                 provider_name,
                 agent_run_id,
                 handoff_id,
+                int(clear_completion),
                 completed_at,
                 completed_at,
                 task_node_id,

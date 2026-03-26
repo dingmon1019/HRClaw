@@ -47,7 +47,7 @@
     <div class="card-header">
         <div>
             <h2>Assistant Workbench</h2>
-            <p class="muted">{{ summary.objective }}</p>
+            <p class="muted">{{ summary.objective if summary else graph_run.request.objective }}</p>
         </div>
         <div class="stack tight align-end">
             <span class="badge high">{{ high_risk_count }} high-risk</span>
@@ -58,6 +58,7 @@
     <div class="grid two">
         <article class="panel">
             <h3>Intent Summary</h3>
+            {% if summary %}
             <p>{{ summary.summary_text }}</p>
             {% if summary.collected.get("deferred_evidence") %}
             <details class="mt-16">
@@ -78,13 +79,39 @@
                 <strong>{{ summary.provider_name }}</strong>
             </div>
             <div class="metric-row">
+                <span>Summary At Rest</span>
+                <strong>{{ summary.summary_storage_mode or "direct" }}</strong>
+            </div>
+            {% if summary.outbound_storage_mode %}
+            <div class="metric-row">
+                <span>Outbound Summary At Rest</span>
+                <strong>{{ summary.outbound_storage_mode }}</strong>
+            </div>
+            {% endif %}
+            <div class="metric-row">
                 <span>Run ID</span>
                 <strong>{{ run_id }}</strong>
             </div>
+            {% else %}
+            <p>{{ planning_message }}</p>
+            <div class="metric-row">
+                <span>Admission Status</span>
+                <strong>{{ planning_status.value if planning_status else "accepted" }}</strong>
+            </div>
+            <div class="metric-row">
+                <span>Graph Status</span>
+                <strong>{{ graph_run.status if graph_run else "accepted" }}</strong>
+            </div>
+            <div class="metric-row">
+                <span>Run ID</span>
+                <strong>{{ run_id }}</strong>
+            </div>
+            {% endif %}
         </article>
 
         <article class="panel">
             <h3>Plan Status</h3>
+            <div class="metric-row"><span>Planning</span><strong>{{ planning_status.value if planning_status else "accepted" }}</strong></div>
             <div class="metric-row"><span>Proposals</span><strong>{{ proposals|length }}</strong></div>
             <div class="metric-row"><span>Agent Steps</span><strong>{{ agent_runs|length }}</strong></div>
             <div class="metric-row"><span>Handoffs</span><strong>{{ handoffs|length }}</strong></div>
@@ -185,6 +212,37 @@
             </div>
             {% else %}
             <p class="muted">No agent-scoped work areas were recorded for this run.</p>
+            {% endfor %}
+        </div>
+    </article>
+
+    <article class="card">
+        <div class="card-header">
+            <h3>Artifact Lineage</h3>
+            <span class="badge ok">{{ artifact_events|length }} events</span>
+        </div>
+        <div class="stack">
+            {% for event in artifact_events %}
+            <div class="list-item">
+                <strong>{{ event.event_type }}</strong>
+                <p>{{ event.agent_role }} / {{ event.status }}{% if event.proposal_id %} / proposal {{ event.proposal_id }}{% endif %}</p>
+                <small>{{ event.created_at }}</small>
+                {% if event.artifact_path %}
+                <div class="metric-row mt-16"><span>Artifact</span><strong>{{ event.artifact_path }}</strong></div>
+                {% endif %}
+                {% if event.source_path %}
+                <div class="metric-row"><span>Source</span><strong>{{ event.source_path }}</strong></div>
+                {% endif %}
+                {% if event.destination_path %}
+                <div class="metric-row"><span>Destination</span><strong>{{ event.destination_path }}</strong></div>
+                {% endif %}
+                <details class="mt-16">
+                    <summary>Stored lineage details</summary>
+                    <pre>{{ event.details | tojson(indent=2) }}</pre>
+                </details>
+            </div>
+            {% else %}
+            <p class="muted">No artifact lineage records were stored for this run.</p>
             {% endfor %}
         </div>
     </article>

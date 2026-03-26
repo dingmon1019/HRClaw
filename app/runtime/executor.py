@@ -13,6 +13,7 @@ from app.services.data_governance_service import DataGovernanceService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.proposal_snapshot_service import ProposalSnapshotService
+from app.services.artifact_lineage_service import ArtifactLineageService
 from app.runtime.execution_boundary import ConstrainedExecutionRunner
 
 
@@ -28,6 +29,7 @@ class ExecutionDispatcher:
         agent_service: AgentService,
         data_governance_service: DataGovernanceService,
         boundary_runner: ConstrainedExecutionRunner,
+        artifact_lineage_service: ArtifactLineageService,
     ):
         self.connector_registry = connector_registry
         self.proposal_service = proposal_service
@@ -38,6 +40,7 @@ class ExecutionDispatcher:
         self.agent_service = agent_service
         self.data_governance_service = data_governance_service
         self.boundary_runner = boundary_runner
+        self.artifact_lineage_service = artifact_lineage_service
 
     def execute_approved(
         self,
@@ -95,6 +98,18 @@ class ExecutionDispatcher:
             result, boundary_metadata = self.boundary_runner.execute(
                 bundle,
                 heartbeat_callback=heartbeat_callback,
+            )
+            self.artifact_lineage_service.record_execution_artifacts(
+                run_id=proposal.run_id,
+                proposal_id=proposal.id,
+                agent_role=(executor_agent.role.value if executor_agent is not None else "executor"),
+                context_namespace=bundle.execution_settings.get("agent_context_namespace"),
+                action_type=proposal.action_type,
+                payload=runtime_payload,
+                result=result,
+                scratch_root=bundle.boundary.agent_scratch_root,
+                promotion_root=bundle.boundary.promotion_root,
+                shared_workspace_root=bundle.boundary.shared_workspace_root,
             )
             safe_result = self.data_governance_service.sanitize_for_history(
                 result,

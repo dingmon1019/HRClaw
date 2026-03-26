@@ -148,6 +148,20 @@ class ExecutionQueueService:
                 return self._row_to_record(claimed), attempt
         return None
 
+    def has_claimable_job(self) -> bool:
+        now_iso = datetime.now(UTC).replace(microsecond=0).isoformat()
+        row = self.database.fetch_one(
+            """
+            SELECT id FROM execution_jobs
+            WHERE status = 'queued'
+               OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+            ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END, queued_at ASC
+            LIMIT 1
+            """,
+            (now_iso,),
+        )
+        return row is not None
+
     def heartbeat(self, job_id: str, worker_id: str, lease_seconds: int) -> ExecutionJobRecord:
         now = datetime.now(UTC).replace(microsecond=0)
         lease_expires = (now + timedelta(seconds=lease_seconds)).isoformat()

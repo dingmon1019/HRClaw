@@ -6,7 +6,8 @@ param(
     [switch]$AllowDirtyWorkingTree,
     [switch]$Clean,
     [switch]$CI,
-    [string]$VerifyArchive
+    [string]$VerifyArchive,
+    [switch]$ValidateSourceOnly
 )
 
 $python = ".\.venv\Scripts\python.exe"
@@ -32,6 +33,9 @@ if ($Clean) {
 }
 if ($CI) {
     $args += "--ci"
+}
+if ($ValidateSourceOnly) {
+    $args += "--validate-source-only"
 }
 
 & $python @args

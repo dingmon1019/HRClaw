@@ -16,6 +16,9 @@ The project is designed to be safer and more usable for Windows localhost operat
 - multi-provider routing with egress controls, scoring, and provider-specific governance records
 - provider prompt governance that keeps raw local runtime context local by default and sends only curated outbound-safe summaries to remote providers
 - agent-scoped scratch work areas with explicit promotion into the shared workspace
+- artifact-lineage records for agent work-area assignment, scratch/shared writes, and approved promotion-style transfers
+- graph-first run admission where decomposition, summary generation, review, merge, and reporting all execute as durable graph nodes
+- explicit graph execution modes: `inline_compat`, `background_preferred`, and `background_only`
 - integrated Windows workspace file picker in the workbench for managed workspace paths
 - Windows scheduled-task controls in the settings console for installing, starting, stopping, and checking the worker background path
 - optional Windows Credential Manager lifecycle for provider secrets when `pywin32` exposes `win32cred`
@@ -150,6 +153,7 @@ Implemented controls:
 - protected local blob storage for sensitive payload fields with DPAPI when available
 - fail-closed blob and secret-text storage unless strong protection exists or an explicit insecure override is enabled
 - provider prompt curation so remote planning and reporting prompts receive sanitized summaries instead of raw local task or filesystem context by default
+- derived local-only or restricted summaries are kept out of cleartext SQLite storage by using protected blobs or preview-only persistence when stronger protection is unavailable
 - hash-chained audit trail with verification
 
 Important limit:
@@ -310,6 +314,8 @@ Run worker:
 .\scripts\run-worker.ps1
 ```
 
+Graph execution now defaults to `background_preferred`. New objectives are admitted into the durable graph immediately, and planning may remain queued or running until a worker drains graph-node jobs. `inline_compat` remains available for compatibility flows that explicitly need synchronous planning completion.
+
 Optional Windows worker/background helpers:
 
 ```powershell
@@ -327,6 +333,7 @@ In-product Windows integrations:
 - the Assistant Workbench can open the native workspace file picker and return a workspace-relative path directly into the form
 - the Settings page can install, start, stop, inspect, and remove the worker scheduled task
 - provider catalog entries can check or rotate Windows Credential Manager targets without leaving the localhost UI
+- non-Windows or missing-helper hosts now render explicit “unavailable on this host” states instead of failing dashboard/settings/workbench flows
 
 Optional Windows startup task for the localhost console:
 
@@ -449,6 +456,12 @@ For collaborator or Codex handoff bundles, use the dedicated handoff mode instea
 ```
 
 Handoff bundles use the same allowlist discipline, exclude repo-local runtime artifacts and stale `dist/` outputs, and label the manifest as `handoff-source`.
+
+Validate a collaboration handoff source tree without creating an archive:
+
+```powershell
+.\scripts\validate-handoff.ps1
+```
 
 Clean ignored repo-local caches and legacy runtime folders when needed:
 

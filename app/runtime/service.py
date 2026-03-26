@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.audit.service import AuditService
 from app.runtime.planner import RuntimePlanner
 from app.runtime.graph_runtime import GraphRuntimeService
-from app.schemas.actions import ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
+from app.schemas.actions import AgentRunResult, ApprovalDecisionRequest, AgentRunRequest, ProposalStatus
 from app.schemas.agents import AgentRole
 from app.agents.service import AgentService
 from app.services.execution_queue_service import ExecutionQueueService
@@ -29,6 +29,9 @@ class AgentRuntimeService:
 
     def run_agent(self, request: AgentRunRequest):
         return self.planner.run(request)
+
+    def describe_run(self, run_id: str) -> AgentRunResult | None:
+        return self.planner.describe_run(run_id)
 
     def approve_and_queue(self, proposal_id: str, decision: ApprovalDecisionRequest) -> dict:
         approval = self.proposal_service.approve(proposal_id, decision.actor, decision.reason)

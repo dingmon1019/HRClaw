@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from app.agents.service import AgentService
+from app.core.errors import CancellationRequestedError
 from app.config.settings import AppSettings
 from app.connectors.registry import ConnectorRegistry
 from app.core.utils import json_dumps, new_id
@@ -13,11 +14,13 @@ from app.schemas.actions import (
     AgentRunRequest,
     AgentRunResult,
     DataClassification,
+    PlanningStatus,
 )
 from app.schemas.agents import AgentDefinition, AgentRole
 from app.schemas.providers import ProviderRequest
 from app.services.data_governance_service import DataGovernanceService
 from app.services.agent_workspace_service import AgentWorkspaceService
+from app.services.artifact_lineage_service import ArtifactLineageService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.provider_service import ProviderService
@@ -39,6 +42,7 @@ class RuntimePlanner:
         agent_service: AgentService,
         data_governance_service: DataGovernanceService,
         agent_workspace_service: AgentWorkspaceService,
+        artifact_lineage_service: ArtifactLineageService,
     ):
         self.base_settings = base_settings
         self.connector_registry = connector_registry
@@ -51,11 +55,17 @@ class RuntimePlanner:
         self.agent_service = agent_service
         self.data_governance_service = data_governance_service
         self.agent_workspace_service = agent_workspace_service
+        self.artifact_lineage_service = artifact_lineage_service
+        self.graph_runtime = None
+
+    def attach_graph_runtime(self, graph_runtime) -> None:
+        self.graph_runtime = graph_runtime
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         run_id = new_id("run")
         correlation_id = new_id("corr")
         effective_settings = self.provider_service.settings_service.get_effective_settings()
+        request_payload = request.model_dump(mode="json")
 
         supervisor = self.agent_service.get_by_role(AgentRole.SUPERVISOR)
         planner = self.agent_service.get_by_role(AgentRole.PLANNER)
@@ -69,6 +79,21 @@ class RuntimePlanner:
         self.agent_service.assert_capability(reviewer, "policy-review")
         self.agent_service.assert_capability(reviewer, "approval-gating")
         self.agent_service.assert_capability(reporter, "summarize-plan")
+        if self.graph_runtime is None:
+            raise RuntimeError("Graph runtime is not attached.")
+        self.graph_runtime.register_run(
+            run_id=run_id,
+            request_payload=request_payload,
+            summary_id=None,
+            planner_run_id=None,
+            planner_handoff_id=None,
+            correlation_id=correlation_id,
+            initial_state={
+                "admission": "accepted",
+                "graph_execution_mode": self.base_settings.graph_execution_mode,
+                "planning_completed": False,
+            },
+        )
         objective_node = self.agent_service.create_task_node(
             run_id,
             role=AgentRole.SUPERVISOR,
@@ -84,12 +109,12 @@ class RuntimePlanner:
                 }
                 | self._agent_work_area_details(
                     run_id=run_id,
-                    agent=supervisor,
-                    context_namespace=objective_namespace,
-                    branch_key="objective",
-                )
+                        agent=supervisor,
+                        context_namespace=objective_namespace,
+                        branch_key="objective",
+                    )
             ),
-            status="running",
+            status="ready",
             parent_task_node_id=None,
             branch_key="objective",
             context_namespace=objective_namespace,
@@ -98,395 +123,347 @@ class RuntimePlanner:
             correlation_id=correlation_id,
             depends_on=[],
         )
-
-        supervisor_run = self.agent_service.start_run(
+        self.graph_runtime.advance_run(
             run_id,
+            execute_inline=self.base_settings.graph_execution_mode == "inline_compat",
+        )
+        result = self.describe_run(run_id)
+        if result is None:
+            raise RuntimeError(f"Graph run {run_id} was not created.")
+        return result
+
+    def describe_run(self, run_id: str) -> AgentRunResult | None:
+        if self.graph_runtime is None:
+            raise RuntimeError("Graph runtime is not attached.")
+        graph_context = self.graph_runtime.get_run_context(run_id)
+        summary = self.summary_service.get_by_run_id(run_id)
+        proposals = [proposal for proposal in self.proposal_service.list() if proposal.run_id == run_id]
+        task_nodes = self.agent_service.list_task_nodes(run_id)
+        if graph_context is None and summary is None and not proposals and not task_nodes:
+            return None
+        planning_status = self._planning_status(graph_context, task_nodes, summary, proposals)
+        return AgentRunResult(
+            run_id=run_id,
+            planning_status=planning_status,
+            graph_status=(graph_context or {}).get("status", "unknown"),
+            message=self._planning_message(planning_status),
+            summary=summary,
+            proposals=proposals,
+        )
+
+    def _planning_status(self, graph_context, task_nodes, summary, proposals) -> PlanningStatus:
+        if graph_context and graph_context.get("status") == "failed":
+            return PlanningStatus.PLANNING_FAILED
+        if graph_context and (
+            graph_context.get("state", {}).get("planning_completed") or graph_context.get("status") == "waiting_approval"
+        ):
+            return PlanningStatus.PLANNING_COMPLETED
+        if summary is not None and proposals:
+            return PlanningStatus.PLANNING_COMPLETED
+        non_executor_nodes = [
+            node for node in task_nodes if node.role != AgentRole.EXECUTOR and not (node.proposal_id and node.node_type == "proposal")
+        ]
+        if any(node.status == "running" for node in non_executor_nodes):
+            return PlanningStatus.PLANNING_RUNNING
+        if any(node.status == "queued" for node in non_executor_nodes):
+            return PlanningStatus.PLANNING_QUEUED
+        if non_executor_nodes:
+            return PlanningStatus.ACCEPTED
+        return PlanningStatus.ACCEPTED
+
+    @staticmethod
+    def _planning_message(planning_status: PlanningStatus) -> str:
+        messages = {
+            PlanningStatus.ACCEPTED: "Run accepted. Planning graph admission is in progress.",
+            PlanningStatus.PLANNING_QUEUED: "Run accepted. Planning is queued in the graph runtime.",
+            PlanningStatus.PLANNING_RUNNING: "Run accepted. Planning is currently running.",
+            PlanningStatus.PLANNING_COMPLETED: "Planning completed. Review the generated proposals.",
+            PlanningStatus.PLANNING_FAILED: "Planning failed. Inspect the graph run details for the failing node.",
+        }
+        return messages[planning_status]
+
+    def execute_objective_node(
+        self,
+        *,
+        node,
+        request_payload: dict,
+        correlation_id: str,
+        effective_settings,
+        heartbeat_callback=None,
+        cancel_check=None,
+    ) -> dict:
+        request = AgentRunRequest.model_validate(request_payload)
+        supervisor = self.agent_service.get_by_role(AgentRole.SUPERVISOR)
+        planner_agent = self.agent_service.get_by_role(AgentRole.PLANNER)
+        self.agent_service.update_task_node(
+            node.id,
+            status="running",
+            details=self._sanitize_task_node_details(
+                {
+                    "context_namespace": node.context_namespace,
+                    "attempt_count": int(node.details.get("attempt_count", 0)) + 1,
+                }
+            ),
+            clear_completion=True,
+        )
+        supervisor_run = self.agent_service.start_run(
+            node.run_id,
             supervisor,
             input_payload=self._sanitize_agent_payload(
-                {"objective": request.objective, "request": request.model_dump(mode="json")},
+                {"objective": request.objective, "request": request_payload},
                 object_type="agent_input",
             ),
             provider_profile=self._provider_profile_for_role(AgentRole.SUPERVISOR, effective_settings),
             correlation_id=correlation_id,
         )
-        subtasks = self._decompose(request)
-        intent_summary = self._intent_summary(request, subtasks)
-        subtask_nodes = self._create_subtask_nodes(run_id, subtasks, objective_node.id, correlation_id, effective_settings)
-        self.agent_service.complete_run(
-            supervisor_run.id,
-            status="completed",
-            output_payload=self._sanitize_agent_payload(
-                {"intent_summary": intent_summary, "subtasks": subtasks},
-                object_type="agent_output",
-            ),
-        )
-        self.agent_service.complete_task_node(
-            objective_node.id,
-            status="completed",
+        try:
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            subtasks = self._decompose(request)
+            intent_summary = self._intent_summary(request, subtasks)
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            graph_context = self.graph_runtime.get_run_context(node.run_id) if self.graph_runtime else None
+            planner_handoff_id = graph_context.get("planner_handoff_id") if graph_context else None
+            planner_run_id = graph_context.get("planner_run_id") if graph_context else None
+            if planner_handoff_id is None or planner_run_id is None:
+                planner_handoff = self.agent_service.create_handoff(
+                    node.run_id,
+                    from_agent_run_id=supervisor_run.id,
+                    to_agent=planner_agent,
+                    title="Objective decomposed for planning",
+                    payload=self._sanitize_handoff_payload({"intent_summary": intent_summary, "subtasks": subtasks}),
+                    correlation_id=correlation_id,
+                )
+                planner_run = self.agent_service.start_run(
+                    node.run_id,
+                    planner_agent,
+                    input_payload=self._sanitize_agent_payload(
+                        {"subtasks": subtasks, "objective": request.objective},
+                        object_type="agent_input",
+                    ),
+                    parent_agent_run_id=supervisor_run.id,
+                    provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
+                    correlation_id=correlation_id,
+                )
+                planner_handoff_id = planner_handoff.id
+                planner_run_id = planner_run.id
+            summary_node, created_nodes = self._ensure_graph_planning_nodes(
+                run_id=node.run_id,
+                request=request,
+                objective_node=node,
+                subtasks=subtasks,
+                correlation_id=correlation_id,
+                settings=effective_settings,
+            )
+            self.agent_service.complete_run(
+                supervisor_run.id,
+                status="completed",
+                output_payload=self._sanitize_agent_payload(
+                    {"intent_summary": intent_summary, "subtasks": subtasks},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="completed",
+                details=self._sanitize_task_node_details(
+                    {
+                        "intent_summary": intent_summary,
+                        "subtask_count": len(subtasks),
+                        "subtask_titles": [subtask["title"] for subtask in subtasks],
+                        "subtask_node_ids": [created.id for created in created_nodes],
+                        "summary_node_id": summary_node.id,
+                    }
+                ),
+                agent_run_id=supervisor_run.id,
+            )
+            return {
+                "status": "completed",
+                "intent_summary": intent_summary,
+                "subtask_count": len(subtasks),
+                "subtasks": [{"title": subtask["title"], "role": subtask["role"]} for subtask in subtasks],
+                "planner_handoff_id": planner_handoff_id,
+                "planner_run_id": planner_run_id,
+                "summary_node_id": summary_node.id,
+                "planner_graph_ready": True,
+            }
+        except CancellationRequestedError as exc:
+            self.agent_service.complete_run(
+                supervisor_run.id,
+                status="cancelled",
+                output_payload=self._sanitize_agent_payload(
+                    {"objective": request.objective, "error": str(exc)},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="cancelled",
+                details=self._sanitize_task_node_details(
+                    {"objective_cancelled": True, "cancel_mode": "cooperative", "error": str(exc)}
+                ),
+                agent_run_id=supervisor_run.id,
+            )
+            raise
+        except Exception:
+            self.agent_service.complete_run(
+                supervisor_run.id,
+                status="failed",
+                output_payload=self._sanitize_agent_payload({"objective": request.objective}, object_type="agent_output"),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="failed",
+                details=self._sanitize_task_node_details({"objective_failed": True}),
+                agent_run_id=supervisor_run.id,
+            )
+            raise
+
+    def execute_summary_node(
+        self,
+        *,
+        node,
+        request_payload: dict,
+        planner_run_id: str,
+        correlation_id: str,
+        effective_settings,
+        heartbeat_callback=None,
+        cancel_check=None,
+    ) -> dict:
+        request = AgentRunRequest.model_validate(request_payload)
+        supervisor = self.agent_service.get_by_role(AgentRole.SUPERVISOR)
+        planner_agent = self.agent_service.get_by_role(AgentRole.PLANNER)
+        provider_profile = node.provider_profile or self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+        self.agent_service.update_task_node(
+            node.id,
+            status="running",
             details=self._sanitize_task_node_details(
                 {
-                    "intent_summary": intent_summary,
-                    "subtask_count": len(subtasks),
-                    "subtask_node_ids": [node.id for node in subtask_nodes],
+                    "phase": "planning-summary",
+                    "attempt_count": int(node.details.get("attempt_count", 0)) + 1,
                 }
             ),
-            agent_run_id=supervisor_run.id,
+            clear_completion=True,
         )
-
-        planner_handoff = self.agent_service.create_handoff(
-            run_id,
-            from_agent_run_id=supervisor_run.id,
-            to_agent=planner,
-            title="Objective decomposed for planning",
-            payload=self._sanitize_handoff_payload({"intent_summary": intent_summary, "subtasks": subtasks}),
-            correlation_id=correlation_id,
-        )
-        planner_run = self.agent_service.start_run(
-            run_id,
-            planner,
+        summary_run = self.agent_service.start_run(
+            node.run_id,
+            planner_agent,
             input_payload=self._sanitize_agent_payload(
-                {"subtasks": subtasks, "objective": request.objective},
+                {"objective": request.objective, "phase": "planning-summary"},
                 object_type="agent_input",
             ),
-            parent_agent_run_id=supervisor_run.id,
-            provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
+            provider_profile=provider_profile,
+            parent_agent_run_id=planner_run_id,
             correlation_id=correlation_id,
         )
-        collected = self._collect(run_id, request, supervisor, planner, correlation_id)
-        request_payload = request.model_dump(mode="json")
-        local_collected_context, provider_collected_context, planning_governance = (
-            self.data_governance_service.build_planning_context_views(request_payload, collected)
-        )
-        planning_classification = DataClassification(planning_governance["local_context_classification"])
-        summary_text, summary_provider_name, summary_routing = self._summarize(
-            request,
-            local_collected_context,
-            provider_collected_context,
-            self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
-            correlation_id,
-            planning_classification,
-            planning_governance,
-        )
-        summary_lineage = self.data_governance_service.build_derived_lineage(
-            source_kind="planning-summary",
-            source_classification=planning_classification,
-            blocked_sections=planning_governance.get("blocked_sections", []),
-            sendable_sections=planning_governance.get("sendable_sections", []),
-            reasons=planning_governance.get("reasons", []),
-        )
-        outbound_summary_text = self.data_governance_service.curate_derived_summary_for_outbound(
-            summary_text,
-            source_classification=planning_classification,
-            lineage=summary_lineage,
-        )
-        summary = self.summary_service.create(
-            run_id=run_id,
-            objective=request.objective,
-            collected=self.data_governance_service.sanitize_for_history(local_collected_context, object_type="summary_payload"),
-            summary_text=summary_text,
-            provider_name=summary_provider_name,
-            data_classification=planning_classification,
-            lineage=summary_lineage,
-            outbound_summary_text=outbound_summary_text,
-        )
-        planner_nodes = [node for node in subtask_nodes if node.role == AgentRole.PLANNER]
-        review_nodes = [
-            node
-            for node in subtask_nodes
-            if node.role == AgentRole.REVIEWER and node.node_type == "review"
-        ]
-        review_merge_node = next((node for node in subtask_nodes if node.node_type == "merge"), None)
-        raw_proposals, planner_branch_results = self._schedule_planner_branches(
-            run_id=run_id,
-            request=request,
-            planner_run_id=planner_run.id,
-            planner_agent=planner,
-            planner_nodes=planner_nodes,
-            collected=collected,
-            summary_id=summary.id,
-            summary_text=summary.summary_text,
-            effective_settings=effective_settings,
-            correlation_id=correlation_id,
-        )
-        if not raw_proposals:
-            raw_proposals = self._build_proposals(
-                run_id=run_id,
-                request=request,
-                summary_id=summary.id,
-                collected=collected,
-                summary_text=summary.summary_text,
-                planning_provider=request.provider_name or self.provider_service.resolve_profile_provider(
-                    self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+        try:
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            collected = self._collect(node.run_id, request, supervisor, planner_agent, correlation_id)
+            local_collected_context, provider_collected_context, planning_governance = (
+                self.data_governance_service.build_planning_context_views(request_payload, collected)
+            )
+            planning_classification = DataClassification(planning_governance["local_context_classification"])
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            summary_text, summary_provider_name, summary_routing = self._summarize(
+                request,
+                local_collected_context,
+                provider_collected_context,
+                provider_profile,
+                correlation_id,
+                planning_classification,
+                planning_governance,
+            )
+            summary_lineage = self.data_governance_service.build_derived_lineage(
+                source_kind="planning-summary",
+                source_classification=planning_classification,
+                blocked_sections=planning_governance.get("blocked_sections", []),
+                sendable_sections=planning_governance.get("sendable_sections", []),
+                reasons=planning_governance.get("reasons", []),
+            )
+            outbound_summary_text = self.data_governance_service.curate_derived_summary_for_outbound(
+                summary_text,
+                source_classification=planning_classification,
+                lineage=summary_lineage,
+            )
+            summary = self.summary_service.create(
+                run_id=node.run_id,
+                objective=request.objective,
+                collected=self.data_governance_service.sanitize_for_history(
+                    local_collected_context,
+                    object_type="summary_payload",
                 ),
-                planner_agent=planner,
-                correlation_id=correlation_id,
+                summary_text=summary_text,
+                provider_name=summary_provider_name,
+                data_classification=planning_classification,
+                lineage=summary_lineage,
+                outbound_summary_text=outbound_summary_text,
             )
-            for node in planner_nodes:
-                self.agent_service.complete_task_node(
-                    node.id,
-                    status="completed",
-                    details=self._sanitize_task_node_details(
-                        {
-                            "fallback_planning": True,
-                            "proposal_count": len(raw_proposals),
-                            "proposal_titles": [proposal.title for proposal in raw_proposals],
-                            "branch_reasoning": "Planner used the persisted fallback branch builder because no branch-specific execution result was stored.",
-                            "context_namespace": node.context_namespace,
-                        }
-                    ),
-                    agent_run_id=planner_run.id,
-                )
-            for node in review_nodes:
-                self.agent_service.complete_task_node(
-                    node.id,
-                    status="completed",
-                    details=self._sanitize_task_node_details(
-                        {
-                            "fallback_review": True,
-                            "proposal_count": len(raw_proposals),
-                            "proposal_titles": [proposal.title for proposal in raw_proposals],
-                            "review_target": node.details.get("review_target"),
-                        }
-                    ),
-                    agent_run_id=reviewer_run.id if 'reviewer_run' in locals() else None,
-                )
-            if review_merge_node is not None:
-                self.agent_service.complete_task_node(
-                    review_merge_node.id,
-                    status="completed",
-                    details=self._sanitize_task_node_details(
-                        {
-                            "fallback_merge": True,
-                            "proposal_count": len(raw_proposals),
-                            "merge_key": review_merge_node.merge_key,
-                        }
-                    ),
-                    agent_run_id=reviewer_run.id if 'reviewer_run' in locals() else None,
-                )
-        self.agent_service.complete_handoff(planner_handoff.id)
-        self.agent_service.complete_run(
-            planner_run.id,
-            status="completed",
-            provider_name=summary_provider_name,
-            output_payload=self._sanitize_agent_payload(
-                {
-                    "summary_id": summary.id,
-                    "collected_keys": list(collected),
-                    "proposal_titles": [proposal.title for proposal in raw_proposals],
-                    "proposal_count": len(raw_proposals),
-                    "provider_routing": summary_routing,
-                    "branch_count": len(planner_branch_results),
-                },
-                object_type="agent_output",
-            ),
-        )
-
-        reviewer_handoff = self.agent_service.create_handoff(
-            run_id,
-            from_agent_run_id=planner_run.id,
-            to_agent=reviewer,
-            title="Candidate actions ready for policy and egress review",
-            payload=self._sanitize_handoff_payload(
-                {"proposal_count": len(raw_proposals), "summary_id": summary.id}
-            ),
-            correlation_id=correlation_id,
-        )
-        reviewer_run = self.agent_service.start_run(
-            run_id,
-            reviewer,
-            input_payload=self._sanitize_agent_payload(
-                {"summary_id": summary.id, "proposal_count": len(raw_proposals)},
-                object_type="agent_input",
-            ),
-            parent_agent_run_id=planner_run.id,
-            provider_profile=self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings),
-            correlation_id=correlation_id,
-        )
-        has_branch_proposals = any(result.get("proposals") for result in planner_branch_results.values())
-        if has_branch_proposals:
-            reviewed = self._schedule_review_branches(
-                review_nodes=review_nodes,
-                merge_node=review_merge_node,
-                reviewer_agent=reviewer,
-                reviewer_run_id=reviewer_run.id,
-                planner_branch_results=planner_branch_results,
-                correlation_id=correlation_id,
-                effective_settings=effective_settings,
+            self.agent_service.complete_run(
+                summary_run.id,
+                status="completed",
+                provider_name=summary_provider_name,
+                output_payload=self._sanitize_agent_payload(
+                    {
+                        "summary_id": summary.id,
+                        "collected_keys": list(collected),
+                        "deferred_evidence_count": len(local_collected_context.get("deferred_evidence", [])),
+                    },
+                    object_type="agent_output",
+                ),
             )
-        else:
-            reviewed = [self._review_proposal(proposal, reviewer) for proposal in raw_proposals]
-            if review_merge_node is not None:
-                self.agent_service.complete_task_node(
-                    review_merge_node.id,
-                    status="completed",
-                    details=self._sanitize_task_node_details(
-                        {"proposal_count": len(reviewed), "merge_key": review_merge_node.merge_key}
-                    ),
-                    agent_run_id=reviewer_run.id,
-                )
-        created = self.proposal_service.create_many(reviewed)
-        self.agent_service.complete_handoff(reviewer_handoff.id)
-        self.agent_service.complete_run(
-            reviewer_run.id,
-            status="completed",
-            output_payload=self._sanitize_agent_payload(
-                {
-                    "proposal_ids": [proposal.id for proposal in created],
-                    "blocked_count": sum(1 for proposal in created if proposal.status.value == "blocked"),
-                    "approval_required_count": sum(1 for proposal in created if proposal.requires_approval),
-                },
-                object_type="agent_output",
-            ),
-        )
-        proposal_dependency = [review_merge_node.id] if review_merge_node else [
-            node.id for node in subtask_nodes if node.role == AgentRole.REVIEWER
-        ]
-        executor_agent = self.agent_service.get_by_role(AgentRole.EXECUTOR)
-        for proposal in created:
-            proposal_parent = self._proposal_parent_node(proposal.connector, subtask_nodes, objective_node.id)
-            proposal_node = self.agent_service.create_task_node(
-                run_id,
-                role=AgentRole.PLANNER,
-                node_type="proposal",
-                title=proposal.title,
+            self.agent_service.complete_task_node(
+                node.id,
+                status="completed",
                 details=self._sanitize_task_node_details(
                     {
-                        "proposal_id": proposal.id,
-                        "connector": proposal.connector,
-                        "action_type": proposal.action_type,
-                        "risk_level": proposal.risk_level.value,
-                        "status": proposal.status.value,
-                        "requires_approval": proposal.requires_approval,
-                        "created_by": proposal.created_by_agent_role,
-                        "reviewed_by": proposal.reviewed_by_agent_role,
-                        "approval_wait": proposal.requires_approval and proposal.status.value in {"pending", "stale"},
-                        "capabilities": planner.capabilities,
-                        "allowed_connectors": planner.allowed_connectors,
-                        "branch_key": proposal.connector,
-                        "context_namespace": f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
+                        "summary_id": summary.id,
+                        "summary_provider_name": summary_provider_name,
+                        "collected_keys": list(collected),
+                        "deferred_evidence_count": len(local_collected_context.get("deferred_evidence", [])),
                     }
-                    | self._agent_work_area_details(
-                        run_id=run_id,
-                        agent=planner,
-                        context_namespace=f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
-                        branch_key=proposal.connector,
-                        promotion_target_hint=proposal.payload.get("path")
-                        or proposal.payload.get("destination_path")
-                        or proposal.payload.get("url"),
-                    )
                 ),
-                status="waiting_approval" if proposal.requires_approval and proposal.status.value in {"pending", "stale"} else proposal.status.value,
-                parent_task_node_id=proposal_parent,
-                proposal_id=proposal.id,
-                branch_key=proposal.connector,
-                context_namespace=f"{planner.memory_namespace}:{run_id}:{proposal.connector}",
-                agent=planner,
-                agent_run_id=planner_run.id,
-                provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
-                provider_name=proposal.provider_name,
-                correlation_id=correlation_id,
-                depends_on=proposal_dependency,
+                provider_name=summary_provider_name,
+                agent_run_id=summary_run.id,
             )
-            self.agent_service.create_task_node(
-                run_id,
-                role=AgentRole.EXECUTOR,
-                node_type="execute",
-                title=f"Execute approved action for {proposal.title}",
-                details=self._sanitize_task_node_details(
-                    {
-                        "proposal_id": proposal.id,
-                        "connector": proposal.connector,
-                        "action_type": proposal.action_type,
-                        "memory_namespace": executor_agent.memory_namespace,
-                        "capabilities": executor_agent.capabilities,
-                        "allowed_connectors": executor_agent.allowed_connectors,
-                        "approval_wait": proposal.requires_approval,
-                    }
-                    | self._agent_work_area_details(
-                        run_id=run_id,
-                        agent=executor_agent,
-                        context_namespace=f"{executor_agent.memory_namespace}:{run_id}:{proposal.connector}",
-                        branch_key=proposal.connector,
-                        promotion_target_hint=proposal.payload.get("path")
-                        or proposal.payload.get("destination_path")
-                        or proposal.payload.get("url"),
-                    )
-                ),
-                status="waiting_approval" if proposal.requires_approval else "ready",
-                parent_task_node_id=proposal_node.id,
-                proposal_id=proposal.id,
-                branch_key=proposal.connector,
-                context_namespace=f"{executor_agent.memory_namespace}:{run_id}:{proposal.connector}",
-                agent=executor_agent,
-                provider_profile=self._provider_profile_for_role(AgentRole.EXECUTOR, effective_settings),
-                correlation_id=correlation_id,
-                depends_on=[proposal_node.id],
-            )
-
-        reporter_handoff = self.agent_service.create_handoff(
-            run_id,
-            from_agent_run_id=reviewer_run.id,
-            to_agent=reporter,
-            title="Reviewed plan ready for operator summary",
-            payload=self._sanitize_handoff_payload({"proposal_ids": [proposal.id for proposal in created]}),
-            correlation_id=correlation_id,
-        )
-        reporter_run = self.agent_service.start_run(
-            run_id,
-            reporter,
-            input_payload=self._sanitize_agent_payload(
-                {"summary_id": summary.id, "proposal_count": len(created)},
-                object_type="agent_input",
-            ),
-            parent_agent_run_id=reviewer_run.id,
-            provider_profile=self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
-            correlation_id=correlation_id,
-        )
-        operator_summary, reporter_provider, reporter_routing = self._report_plan(
-            request,
-            created,
-            summary,
-            self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
-            correlation_id,
-        )
-        self.agent_service.complete_handoff(reporter_handoff.id)
-        self.agent_service.complete_run(
-            reporter_run.id,
-            status="completed",
-            provider_name=reporter_provider,
-            output_payload=self._sanitize_agent_payload(
-                {
-                    "operator_summary": operator_summary,
-                    "proposal_ids": [proposal.id for proposal in created],
-                    "provider_routing": reporter_routing,
-                },
-                object_type="agent_output",
-            ),
-        )
-        self._complete_role_nodes(
-            subtask_nodes,
-            role=AgentRole.REPORTER,
-            agent_run_id=reporter_run.id,
-            handoff_id=reporter_handoff.id,
-            provider_name=reporter_provider,
-            details={
-                "operator_summary": operator_summary,
-                "memory_namespace": reporter.memory_namespace,
-                "provider_routing": reporter_routing,
-            },
-        )
-
-        self.audit_service.emit(
-            "planning.completed",
-            {
-                "run_id": run_id,
-                "correlation_id": correlation_id,
-                "objective": request.objective,
-                "proposal_ids": [proposal.id for proposal in created],
+            return {
+                "status": "completed",
                 "summary_id": summary.id,
-            },
-        )
-        return AgentRunResult(run_id=run_id, summary=summary, proposals=created)
+                "provider_name": summary_provider_name,
+                "summary_provider_routing": summary_routing,
+                "collected_keys": list(collected),
+                "deferred_evidence_count": len(local_collected_context.get("deferred_evidence", [])),
+                "data_classification": planning_classification.value,
+            }
+        except CancellationRequestedError as exc:
+            self.agent_service.complete_run(
+                summary_run.id,
+                status="cancelled",
+                output_payload=self._sanitize_agent_payload(
+                    {"phase": "planning-summary", "error": str(exc)},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="cancelled",
+                details=self._sanitize_task_node_details(
+                    {"summary_generation_cancelled": True, "cancel_mode": "cooperative", "error": str(exc)}
+                ),
+                agent_run_id=summary_run.id,
+            )
+            raise
+        except Exception:
+            self.agent_service.complete_run(
+                summary_run.id,
+                status="failed",
+                output_payload=self._sanitize_agent_payload({"phase": "planning-summary"}, object_type="agent_output"),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="failed",
+                details=self._sanitize_task_node_details({"summary_generation_failed": True}),
+                agent_run_id=summary_run.id,
+            )
+            raise
 
     def _collect(
         self,
@@ -879,6 +856,554 @@ class RuntimePlanner:
                 )
             )
         return proposals
+
+    def execute_planner_node(
+        self,
+        *,
+        node,
+        request_payload: dict,
+        summary_id: str | None,
+        planner_run_id: str,
+        correlation_id: str,
+        effective_settings,
+        heartbeat_callback=None,
+        cancel_check=None,
+    ) -> dict:
+        request = AgentRunRequest.model_validate(request_payload)
+        planner_agent = self.agent_service.get_by_role(AgentRole.PLANNER)
+        summary = self.summary_service.get_by_run_id(node.run_id)
+        if summary is None:
+            raise ValueError(f"Planning summary for run {node.run_id} is missing.")
+        summary_id = summary_id or summary.id
+        branch_key = node.branch_key or "general"
+        provider_profile = node.provider_profile or self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+        provider_name = request.provider_name or self.provider_service.resolve_profile_provider(provider_profile)
+        branch_context = self._branch_context(branch_key, request, summary.collected)
+        branch_reasoning = self._branch_reasoning_summary(branch_key, branch_context)
+        self.agent_service.update_task_node(
+            node.id,
+            status="running",
+            details=self._sanitize_task_node_details(
+                {
+                    "branch_key": branch_key,
+                    "context_namespace": node.context_namespace,
+                    "branch_reasoning": branch_reasoning,
+                    "attempt_count": int(node.details.get("attempt_count", 0)) + 1,
+                }
+            ),
+            provider_name=provider_name,
+            clear_completion=True,
+        )
+        self.audit_service.emit(
+            "planning.branch_routed",
+            {
+                "run_id": node.run_id,
+                "correlation_id": correlation_id,
+                "branch_key": branch_key,
+                "provider_profile": provider_profile,
+                "provider_name": provider_name,
+                "context_namespace": node.context_namespace,
+            },
+        )
+        branch_run = self.agent_service.start_run(
+            node.run_id,
+            planner_agent,
+            input_payload=self._sanitize_agent_payload(
+                {
+                    "objective": request.objective,
+                    "branch_key": branch_key,
+                    "context_namespace": node.context_namespace,
+                    "branch_context": branch_context,
+                },
+                object_type="agent_input",
+            ),
+            provider_profile=provider_profile,
+            parent_agent_run_id=planner_run_id,
+            correlation_id=correlation_id,
+        )
+        try:
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            proposals = self._build_branch_proposals(
+                branch_key=branch_key,
+                run_id=node.run_id,
+                request=request,
+                summary_id=summary_id,
+                collected=summary.collected,
+                summary_text=summary.summary_text,
+                planning_provider=provider_name,
+                planner_agent=planner_agent,
+                correlation_id=correlation_id,
+            )
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            serialized = [proposal.model_dump(mode="json") for proposal in proposals]
+            self.agent_service.complete_run(
+                branch_run.id,
+                status="completed",
+                provider_name=provider_name,
+                output_payload=self._sanitize_agent_payload(
+                    {
+                        "branch_key": branch_key,
+                        "proposal_titles": [proposal.title for proposal in proposals],
+                        "proposal_count": len(proposals),
+                        "result": {"branch_reasoning": branch_reasoning},
+                    },
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="completed",
+                details=self._sanitize_task_node_details(
+                    {
+                        "branch_key": branch_key,
+                        "proposal_titles": [proposal.title for proposal in proposals],
+                        "proposal_count": len(proposals),
+                        "branch_reasoning": branch_reasoning,
+                        "context_namespace": node.context_namespace,
+                    }
+                ),
+                provider_name=provider_name,
+                agent_run_id=branch_run.id,
+            )
+            return {
+                "status": "completed",
+                "branch_key": branch_key,
+                "proposals": serialized,
+                "provider_name": provider_name,
+                "provider_profile": provider_profile,
+                "agent_run_id": branch_run.id,
+                "context_namespace": node.context_namespace,
+                "branch_reasoning": branch_reasoning,
+            }
+        except CancellationRequestedError as exc:
+            self.agent_service.complete_run(
+                branch_run.id,
+                status="cancelled",
+                provider_name=provider_name,
+                output_payload=self._sanitize_agent_payload(
+                    {"error": str(exc), "branch_key": branch_key},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="cancelled",
+                details=self._sanitize_task_node_details(
+                    {"error": str(exc), "branch_key": branch_key, "cancel_mode": "cooperative"}
+                ),
+                provider_name=provider_name,
+                agent_run_id=branch_run.id,
+            )
+            raise
+        except Exception as exc:
+            self.agent_service.complete_run(
+                branch_run.id,
+                status="failed",
+                provider_name=provider_name,
+                output_payload=self._sanitize_agent_payload(
+                    {"error": str(exc), "branch_key": branch_key},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="failed",
+                details=self._sanitize_task_node_details(
+                    {"error": str(exc), "branch_key": branch_key}
+                ),
+                provider_name=provider_name,
+                agent_run_id=branch_run.id,
+            )
+            raise
+
+    def execute_review_node(
+        self,
+        *,
+        node,
+        planner_result: dict,
+        reviewer_run_id: str,
+        correlation_id: str,
+        effective_settings,
+        heartbeat_callback=None,
+        cancel_check=None,
+    ) -> dict:
+        reviewer_agent = self.agent_service.get_by_role(AgentRole.REVIEWER)
+        branch_key = node.branch_key or planner_result.get("branch_key") or "general"
+        provider_profile = node.provider_profile or self._provider_profile_for_role(AgentRole.REVIEWER, effective_settings)
+        self.agent_service.update_task_node(
+            node.id,
+            status="running",
+            details=self._sanitize_task_node_details(
+                {
+                    "branch_key": branch_key,
+                    "review_target": planner_result.get("branch_key"),
+                    "context_namespace": node.context_namespace,
+                    "attempt_count": int(node.details.get("attempt_count", 0)) + 1,
+                }
+            ),
+            clear_completion=True,
+        )
+        proposals = [ActionProposal.model_validate(payload) for payload in planner_result.get("proposals", [])]
+        review_run = self.agent_service.start_run(
+            node.run_id,
+            reviewer_agent,
+            input_payload=self._sanitize_agent_payload(
+                {
+                    "branch_key": branch_key,
+                    "proposal_titles": [proposal.title for proposal in proposals],
+                    "context_namespace": node.context_namespace,
+                },
+                object_type="agent_input",
+            ),
+            provider_profile=provider_profile,
+            parent_agent_run_id=reviewer_run_id,
+            correlation_id=correlation_id,
+        )
+        try:
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            reviewed_proposals = []
+            for proposal in proposals:
+                self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+                reviewed_proposals.append(self._review_proposal(proposal, reviewer_agent))
+            serialized = [proposal.model_dump(mode="json") for proposal in reviewed_proposals]
+            self.agent_service.complete_run(
+                review_run.id,
+                status="completed",
+                output_payload=self._sanitize_agent_payload(
+                    {
+                        "branch_key": branch_key,
+                        "proposal_titles": [proposal.title for proposal in reviewed_proposals],
+                        "proposal_count": len(reviewed_proposals),
+                    },
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="completed",
+                details=self._sanitize_task_node_details(
+                    {
+                        "branch_key": branch_key,
+                        "proposal_titles": [proposal.title for proposal in reviewed_proposals],
+                        "proposal_count": len(reviewed_proposals),
+                        "context_namespace": node.context_namespace,
+                    }
+                ),
+                agent_run_id=review_run.id,
+            )
+            return {
+                "status": "completed",
+                "branch_key": branch_key,
+                "reviewed_proposals": serialized,
+                "agent_run_id": review_run.id,
+            }
+        except CancellationRequestedError as exc:
+            self.agent_service.complete_run(
+                review_run.id,
+                status="cancelled",
+                output_payload=self._sanitize_agent_payload(
+                    {"error": str(exc), "branch_key": branch_key},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="cancelled",
+                details=self._sanitize_task_node_details(
+                    {"error": str(exc), "branch_key": branch_key, "cancel_mode": "cooperative"}
+                ),
+                agent_run_id=review_run.id,
+            )
+            raise
+        except Exception as exc:
+            self.agent_service.complete_run(
+                review_run.id,
+                status="failed",
+                output_payload=self._sanitize_agent_payload(
+                    {"error": str(exc), "branch_key": branch_key},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="failed",
+                details=self._sanitize_task_node_details(
+                    {"error": str(exc), "branch_key": branch_key}
+                ),
+                agent_run_id=review_run.id,
+            )
+            raise
+
+    def execute_merge_node(
+        self,
+        *,
+        node,
+        request_payload: dict,
+        summary_id: str | None,
+        reviewer_run_id: str | None,
+        planner_run_id: str,
+        correlation_id: str,
+        effective_settings,
+        reviewed_results: list[dict],
+        existing_proposal_ids: list[str] | None = None,
+        heartbeat_callback=None,
+        cancel_check=None,
+    ) -> dict:
+        request = AgentRunRequest.model_validate(request_payload)
+        summary = self.summary_service.get_by_run_id(node.run_id)
+        if summary is None:
+            raise ValueError(f"Planning summary for run {node.run_id} is missing.")
+        summary_id = summary_id or summary.id
+        self.agent_service.update_task_node(
+            node.id,
+            status="running",
+            details=self._sanitize_task_node_details(
+                {
+                    "merge_key": node.merge_key,
+                    "reviewed_branch_count": len(reviewed_results),
+                    "attempt_count": int(node.details.get("attempt_count", 0)) + 1,
+                }
+            ),
+            clear_completion=True,
+        )
+        if existing_proposal_ids:
+            created = [self.proposal_service.get(proposal_id) for proposal_id in existing_proposal_ids]
+        else:
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            reviewed = [
+                ActionProposal.model_validate(payload)
+                for result in reviewed_results
+                for payload in result.get("reviewed_proposals", [])
+            ]
+            if not reviewed:
+                planner_agent = self.agent_service.get_by_role(AgentRole.PLANNER)
+                reviewer_agent = self.agent_service.get_by_role(AgentRole.REVIEWER)
+                fallback_provider = request.provider_name or self.provider_service.resolve_profile_provider(
+                    self._provider_profile_for_role(AgentRole.PLANNER, effective_settings)
+                )
+                raw_proposals = self._build_proposals(
+                    run_id=node.run_id,
+                    request=request,
+                    summary_id=summary_id,
+                    collected=summary.collected,
+                    summary_text=summary.summary_text,
+                    planning_provider=fallback_provider,
+                    planner_agent=planner_agent,
+                    correlation_id=correlation_id,
+                )
+                reviewed = [self._review_proposal(proposal, reviewer_agent) for proposal in raw_proposals]
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            created = self.materialize_reviewed_proposals(
+                run_id=node.run_id,
+                reviewed=reviewed,
+                planner_run_id=planner_run_id,
+                effective_settings=effective_settings,
+                correlation_id=correlation_id,
+            )
+        self.agent_service.complete_task_node(
+            node.id,
+            status="completed",
+            details=self._sanitize_task_node_details(
+                {
+                    "merge_key": node.merge_key,
+                    "proposal_count": len(created),
+                    "proposal_ids": [proposal.id for proposal in created],
+                }
+            ),
+            agent_run_id=reviewer_run_id,
+        )
+        return {
+            "status": "completed",
+            "proposal_ids": [proposal.id for proposal in created],
+            "proposal_titles": [proposal.title for proposal in created],
+        }
+
+    def execute_reporter_node(
+        self,
+        *,
+        node,
+        request_payload: dict,
+        proposal_ids: list[str],
+        reporter_run_id: str,
+        correlation_id: str,
+        effective_settings,
+        heartbeat_callback=None,
+        cancel_check=None,
+    ) -> dict:
+        request = AgentRunRequest.model_validate(request_payload)
+        summary = self.summary_service.get_by_run_id(node.run_id)
+        if summary is None:
+            raise ValueError(f"Planning summary for run {node.run_id} is missing.")
+        proposals = [self.proposal_service.get(proposal_id) for proposal_id in proposal_ids]
+        try:
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            operator_summary, reporter_provider, reporter_routing = self._report_plan(
+                request,
+                proposals,
+                summary,
+                self._provider_profile_for_role(AgentRole.REPORTER, effective_settings),
+                correlation_id,
+            )
+            self._execution_checkpoint(heartbeat_callback=heartbeat_callback, cancel_check=cancel_check)
+            self.agent_service.complete_run(
+                reporter_run_id,
+                status="completed",
+                provider_name=reporter_provider,
+                output_payload=self._sanitize_agent_payload(
+                    {
+                        "operator_summary": operator_summary,
+                        "proposal_ids": proposal_ids,
+                        "provider_routing": reporter_routing,
+                    },
+                    object_type="agent_output",
+                ),
+            )
+            if node.handoff_id:
+                self.agent_service.complete_handoff(node.handoff_id)
+            self.agent_service.complete_task_node(
+                node.id,
+                status="completed",
+                details=self._sanitize_task_node_details(
+                    {
+                        "operator_summary": operator_summary,
+                        "memory_namespace": self.agent_service.get_by_role(AgentRole.REPORTER).memory_namespace,
+                        "provider_routing": reporter_routing,
+                    }
+                ),
+                agent_run_id=reporter_run_id,
+                handoff_id=node.handoff_id,
+                provider_name=reporter_provider,
+            )
+            return {
+                "status": "completed",
+                "operator_summary": operator_summary,
+                "provider_name": reporter_provider,
+                "provider_routing": reporter_routing,
+            }
+        except CancellationRequestedError as exc:
+            self.agent_service.complete_run(
+                reporter_run_id,
+                status="cancelled",
+                output_payload=self._sanitize_agent_payload(
+                    {"error": str(exc), "proposal_ids": proposal_ids},
+                    object_type="agent_output",
+                ),
+            )
+            self.agent_service.complete_task_node(
+                node.id,
+                status="cancelled",
+                details=self._sanitize_task_node_details(
+                    {"error": str(exc), "cancel_mode": "cooperative"}
+                ),
+                agent_run_id=reporter_run_id,
+                handoff_id=node.handoff_id,
+            )
+            raise
+
+    def materialize_reviewed_proposals(
+        self,
+        *,
+        run_id: str,
+        reviewed: list[ActionProposal],
+        planner_run_id: str,
+        effective_settings,
+        correlation_id: str,
+    ):
+        created = self.proposal_service.create_many(reviewed)
+        nodes = self.agent_service.list_task_nodes(run_id)
+        objective_node = next((node for node in nodes if node.role == AgentRole.SUPERVISOR), None)
+        planner_agent = self.agent_service.get_by_role(AgentRole.PLANNER)
+        executor_agent = self.agent_service.get_by_role(AgentRole.EXECUTOR)
+        proposal_dependency = [
+            node.id for node in nodes if node.role == AgentRole.REVIEWER and node.node_type in {"review", "merge"}
+        ]
+        existing_nodes = {(node.proposal_id, node.role.value, node.node_type) for node in nodes if node.proposal_id}
+        for proposal in created:
+            if (proposal.id, AgentRole.PLANNER.value, "proposal") in existing_nodes:
+                continue
+            executor_context_namespace = f"{executor_agent.memory_namespace}:{run_id}:{proposal.id}:{proposal.connector}"
+            proposal_parent = self._proposal_parent_node(proposal.connector, nodes, objective_node.id if objective_node else "")
+            proposal_node = self.agent_service.create_task_node(
+                run_id,
+                role=AgentRole.PLANNER,
+                node_type="proposal",
+                title=proposal.title,
+                details=self._sanitize_task_node_details(
+                    {
+                        "proposal_id": proposal.id,
+                        "connector": proposal.connector,
+                        "action_type": proposal.action_type,
+                        "risk_level": proposal.risk_level.value,
+                        "status": proposal.status.value,
+                        "requires_approval": proposal.requires_approval,
+                        "created_by": proposal.created_by_agent_role,
+                        "reviewed_by": proposal.reviewed_by_agent_role,
+                        "approval_wait": proposal.requires_approval and proposal.status.value in {"pending", "stale"},
+                        "capabilities": planner_agent.capabilities,
+                        "allowed_connectors": planner_agent.allowed_connectors,
+                        "branch_key": proposal.connector,
+                        "context_namespace": f"{planner_agent.memory_namespace}:{run_id}:{proposal.connector}",
+                    }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=planner_agent,
+                        context_namespace=f"{planner_agent.memory_namespace}:{run_id}:{proposal.connector}",
+                        branch_key=proposal.connector,
+                        promotion_target_hint=proposal.payload.get("path")
+                        or proposal.payload.get("destination_path")
+                        or proposal.payload.get("url"),
+                    )
+                ),
+                status="waiting_approval" if proposal.requires_approval and proposal.status.value in {"pending", "stale"} else proposal.status.value,
+                parent_task_node_id=proposal_parent,
+                proposal_id=proposal.id,
+                branch_key=proposal.connector,
+                context_namespace=f"{planner_agent.memory_namespace}:{run_id}:{proposal.connector}",
+                agent=planner_agent,
+                agent_run_id=planner_run_id,
+                provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, effective_settings),
+                provider_name=proposal.provider_name,
+                correlation_id=correlation_id,
+                depends_on=proposal_dependency,
+            )
+            self.agent_service.create_task_node(
+                run_id,
+                role=AgentRole.EXECUTOR,
+                node_type="execute",
+                title=f"Execute approved action for {proposal.title}",
+                details=self._sanitize_task_node_details(
+                    {
+                        "proposal_id": proposal.id,
+                        "connector": proposal.connector,
+                        "action_type": proposal.action_type,
+                        "memory_namespace": executor_agent.memory_namespace,
+                        "context_namespace": executor_context_namespace,
+                        "capabilities": executor_agent.capabilities,
+                        "allowed_connectors": executor_agent.allowed_connectors,
+                        "approval_wait": proposal.requires_approval,
+                    }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=executor_agent,
+                        context_namespace=executor_context_namespace,
+                        branch_key=proposal.connector,
+                        proposal_id=proposal.id,
+                        promotion_target_hint=proposal.payload.get("path")
+                        or proposal.payload.get("destination_path")
+                        or proposal.payload.get("url"),
+                    )
+                ),
+                status="waiting_approval" if proposal.requires_approval else "ready",
+                parent_task_node_id=proposal_node.id,
+                proposal_id=proposal.id,
+                branch_key=proposal.connector,
+                context_namespace=executor_context_namespace,
+                agent=executor_agent,
+                provider_profile=self._provider_profile_for_role(AgentRole.EXECUTOR, effective_settings),
+                correlation_id=correlation_id,
+                depends_on=[proposal_node.id],
+            )
+        return created
 
     def _schedule_planner_branches(
         self,
@@ -1554,18 +2079,34 @@ class RuntimePlanner:
             )
             return response.content, response.provider_name, response.raw_response.get("_routing", {})
         except Exception:
-            deferred = local_collected_context.get("deferred_evidence") or []
-            deferred_note = (
-                f" Planning deferred {len(deferred)} evidence-gathering step(s) until approval."
-                if deferred
-                else ""
-            )
+            deferred = summary.collected.get("deferred_evidence") or []
+            proposal_count = len(proposals)
+            fragments = [
+                "Plan ready.",
+                (
+                    f"{proposal_count} bounded action(s) are ready for operator review."
+                    if proposal_count
+                    else "No bounded actions were generated yet."
+                ),
+                "Local-only planning context remained on this machine.",
+                "All actions remain approval-gated before execution.",
+            ]
+            if deferred:
+                fragments.append(
+                    f"Planning deferred {len(deferred)} evidence-gathering step(s) until approval."
+                )
             return (
-                "Plan ready. Review the proposed steps, inspect high-risk actions, and approve only the bounded actions you want executed."
-                f"{deferred_note}",
+                " ".join(fragments),
                 provider_name or "offline-fallback",
                 {"mode": "offline-fallback"},
             )
+
+    @staticmethod
+    def _execution_checkpoint(*, heartbeat_callback=None, cancel_check=None) -> None:
+        if heartbeat_callback:
+            heartbeat_callback()
+        if cancel_check:
+            cancel_check()
 
     @staticmethod
     def _parse_headers(raw_headers: str | None) -> dict:
@@ -1679,12 +2220,92 @@ class RuntimePlanner:
             return "local-only"
         return "strong"
 
-    def _create_subtask_nodes(self, run_id, subtasks, parent_node_id, correlation_id, settings):
+    def _ensure_graph_planning_nodes(
+        self,
+        *,
+        run_id,
+        request: AgentRunRequest,
+        objective_node,
+        subtasks,
+        correlation_id,
+        settings,
+    ):
+        nodes = self.agent_service.list_task_nodes(run_id)
+        summary_node = next(
+            (node for node in nodes if node.role == AgentRole.PLANNER and node.node_type == "summary"),
+            None,
+        )
+        created_nodes = []
+        planner_agent = self.agent_service.get_by_role(AgentRole.PLANNER)
+        if summary_node is None:
+            summary_namespace = f"{planner_agent.memory_namespace}:{run_id}:summary"
+            summary_node = self.agent_service.create_task_node(
+                run_id,
+                role=AgentRole.PLANNER,
+                node_type="summary",
+                title=f"Generate planning summary for {request.objective}",
+                details=self._sanitize_task_node_details(
+                    {
+                        "sequence": 1,
+                        "phase": "planning-summary",
+                        "memory_namespace": planner_agent.memory_namespace,
+                        "planned_provider_profile": self._provider_profile_for_role(AgentRole.PLANNER, settings),
+                        "capabilities": planner_agent.capabilities,
+                        "allowed_connectors": planner_agent.allowed_connectors,
+                        "input_source": "objective-decomposition",
+                        "context_namespace": summary_namespace,
+                    }
+                    | self._agent_work_area_details(
+                        run_id=run_id,
+                        agent=planner_agent,
+                        context_namespace=summary_namespace,
+                        branch_key="summary",
+                    )
+                ),
+                status="blocked",
+                parent_task_node_id=objective_node.id,
+                branch_key="summary",
+                context_namespace=summary_namespace,
+                agent=planner_agent,
+                provider_profile=self._provider_profile_for_role(AgentRole.PLANNER, settings),
+                correlation_id=correlation_id,
+                depends_on=[objective_node.id],
+            )
+            created_nodes.append(summary_node)
+        branch_nodes = [
+            node
+            for node in self.agent_service.list_task_nodes(run_id)
+            if node.parent_task_node_id == objective_node.id and node.node_type != "summary"
+        ]
+        if not branch_nodes:
+            created_nodes.extend(
+                self._create_subtask_nodes(
+                    run_id,
+                    subtasks,
+                    objective_node.id,
+                    summary_node.id,
+                    correlation_id,
+                    settings,
+                    start_sequence=2,
+                )
+            )
+        return summary_node, created_nodes
+
+    def _create_subtask_nodes(
+        self,
+        run_id,
+        subtasks,
+        parent_node_id,
+        planning_dependency_node_id,
+        correlation_id,
+        settings,
+        start_sequence=1,
+    ):
         nodes = []
-        planner_dependencies = [parent_node_id]
+        planner_dependencies = [planning_dependency_node_id]
         planner_nodes = []
         review_nodes = []
-        sequence = 1
+        sequence = start_sequence
 
         for subtask in subtasks:
             role = AgentRole(subtask["role"])
@@ -1853,18 +2474,32 @@ class RuntimePlanner:
         agent: AgentDefinition,
         context_namespace: str,
         branch_key: str | None,
+        proposal_id: str | None = None,
         promotion_target_hint: str | None = None,
     ) -> dict[str, object]:
-        return {
-            "agent_work_area": self.agent_workspace_service.describe_layout(
-                run_id=run_id,
-                agent_role=agent.role.value,
-                memory_namespace=agent.memory_namespace,
-                context_namespace=context_namespace,
-                branch_key=branch_key,
-                promotion_target_hint=promotion_target_hint,
-            )
-        }
+        work_area = self.agent_workspace_service.describe_layout(
+            run_id=run_id,
+            agent_role=agent.role.value,
+            memory_namespace=agent.memory_namespace,
+            context_namespace=context_namespace,
+            branch_key=branch_key,
+            promotion_target_hint=promotion_target_hint,
+        )
+        self.artifact_lineage_service.record_work_area_scope(
+            run_id=run_id,
+            proposal_id=proposal_id,
+            agent_role=agent.role.value,
+            context_namespace=context_namespace,
+            artifact_path=work_area["scratch_root"],
+            details={
+                "branch_key": branch_key,
+                "reports_root": work_area["reports_root"],
+                "promotion_root": work_area["promotion_root"],
+                "shared_workspace_root": work_area["shared_workspace_root"],
+                "promotion_policy": work_area["promotion_policy"],
+            },
+        )
+        return {"agent_work_area": work_area}
 
     def _complete_role_nodes(
         self,

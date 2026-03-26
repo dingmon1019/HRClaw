@@ -64,16 +64,17 @@ The following records make the multi-agent model visible:
 
 ## Current Orchestration Pattern
 
-Today the orchestration is bounded, explicit, and graph-shaped rather than a flat step log:
+The graph is now the primary lifecycle engine from run admission onward:
 
-1. supervisor run starts and writes the objective root node
-2. planner subtask nodes are created as child branches under the objective
-3. a local graph scheduler finds planner branches whose dependencies are satisfied and can run them as bounded parallel-ready nodes
-4. reviewer nodes are created per branch, so risk and egress checks are visible on each branch instead of only once globally
-5. a merge node waits for the reviewed branches before reporter synthesis proceeds
-6. proposal nodes are attached under the relevant reviewed branch with explicit proposal IDs
-7. executor nodes are created per proposal and sit in `waiting_approval`, `queued`, `running`, `completed`, or `failed` states
-8. executor work later runs inside the worker child-process boundary after approval
+1. the run is registered in `graph_runs` as soon as the operator objective is accepted
+2. a supervisor objective node performs durable decomposition and creates the downstream planning scaffold
+3. a planning-summary node collects descriptor-only context, generates the planning summary, and persists it durably
+4. planner branch nodes create candidate actions once the summary node completes
+5. reviewer nodes are created per branch, so risk and egress checks are visible on each branch instead of only once globally
+6. a merge node waits for the reviewed branches before reporter synthesis proceeds
+7. proposal nodes are attached under the relevant reviewed branch with explicit proposal IDs
+8. executor nodes are created per proposal and sit in `waiting_approval`, `queued`, `running`, `completed`, or `failed` states
+9. executor work later runs inside the worker child-process boundary after approval
 
 The persisted graph is now reconciled against durable runtime state:
 
@@ -95,8 +96,19 @@ Persisted task nodes track:
 - lifecycle state
 - reasoning summary
 - agent work-area metadata (shared workspace root, scratch root, promotion root)
+- proposal-scoped executor scratch areas so same-connector proposals in one run do not silently share writable scratch state
+- artifact-lineage records for work-area assignment and explicit promotion-style filesystem transfers
 
 This is a practical local-first orchestration layer. It is not a distributed agent mesh.
+
+Execution mode is explicit:
+
+- `inline_compat`
+  The graph is admitted first, then the caller drains non-executor graph jobs inline for compatibility.
+- `background_preferred`
+  The graph is admitted and queued immediately. Startup/restart reconciliation restores graph state but does not silently execute provider-backed graph work inline.
+- `background_only`
+  Same admission model as `background_preferred`, intended for worker-driven orchestration only.
 
 ## Current Limits
 

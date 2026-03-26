@@ -9,6 +9,7 @@ from app.schemas.actions import ExecutionJobStatus, ProposalStatus
 from app.schemas.agents import AgentRole
 from app.services.data_governance_service import DataGovernanceService
 from app.services.execution_queue_service import ExecutionQueueService
+from app.services.graph_node_queue_service import GraphNodeQueueService
 from app.services.proposal_service import ProposalService
 
 
@@ -18,6 +19,7 @@ class ExecutionWorker:
         worker_id: str,
         base_settings: AppSettings,
         queue_service: ExecutionQueueService,
+        graph_node_queue_service: GraphNodeQueueService,
         proposal_service: ProposalService,
         dispatcher: ExecutionDispatcher,
         audit_service: AuditService,
@@ -28,14 +30,45 @@ class ExecutionWorker:
         self.worker_id = worker_id
         self.base_settings = base_settings
         self.queue_service = queue_service
+        self.graph_node_queue_service = graph_node_queue_service
         self.proposal_service = proposal_service
         self.dispatcher = dispatcher
         self.audit_service = audit_service
         self.agent_service = agent_service
         self.data_governance_service = data_governance_service
         self.graph_runtime = graph_runtime
+        self._next_queue_preference = "graph"
 
     def run_once(self) -> dict | None:
+        graph_pending = self.graph_node_queue_service.has_claimable_job()
+        execution_pending = self.queue_service.has_claimable_job()
+        if graph_pending and execution_pending:
+            queue_order = [
+                self._next_queue_preference,
+                "executor" if self._next_queue_preference == "graph" else "graph",
+            ]
+        elif graph_pending:
+            queue_order = ["graph"]
+        elif execution_pending:
+            queue_order = ["executor"]
+        else:
+            return None
+        for queue_kind in queue_order:
+            if queue_kind == "graph":
+                graph_result = self.graph_runtime.run_next_non_executor_job(worker_id=self.worker_id)
+                if graph_result is not None:
+                    if graph_pending and execution_pending:
+                        self._next_queue_preference = "executor"
+                    return graph_result
+                continue
+            execution_result = self._run_executor_once()
+            if execution_result is not None:
+                if graph_pending and execution_pending:
+                    self._next_queue_preference = "graph"
+                return execution_result
+        return None
+
+    def _run_executor_once(self) -> dict | None:
         claimed = self.queue_service.claim_next_job(
             worker_id=self.worker_id,
             lease_seconds=self.base_settings.worker_lease_seconds,

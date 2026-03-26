@@ -69,6 +69,8 @@ The queue job and execution attempt also carry the execution bundle hash and bou
 
 Planning no longer performs file-content reads, HTTP response fetches, or bounded system text reads by default. The planner works from operator-supplied inputs plus descriptor-only evidence, then creates explicit approval-gated proposals when more evidence is needed.
 
+Run admission is graph-first. The runtime registers a graph run before summary generation or proposal materialization, so provider failures, protected-storage refusals, retry, and cancellation are recorded as durable graph-node outcomes rather than living only in request-path state.
+
 ### Filesystem
 
 - dedicated workspace root
@@ -154,9 +156,15 @@ When a proposal payload includes sensitive fields such as file content, HTTP bod
 
 On Windows with `pywin32` available, DPAPI protection is used. Without it, the runtime reports `unprotected-local` posture and sensitive blob writes fail closed unless the operator explicitly enables insecure local storage override for development.
 
+Derived runtime summaries follow the same rule. `EXTERNAL_OK` summaries may remain inline, but local-only or restricted summaries are stored as protected blobs when host protection is available and degrade to preview-only persistence when stronger at-rest protection is unavailable.
+
 Session secrets, provider auth env references, and protected token files all live under the runtime secrets directory outside the repository by default.
 
 When `pywin32` exposes `win32cred`, provider auth material can be stored in and resolved from Windows Credential Manager. Without strong local protection, new secret writes fail closed unless an explicit insecure development override is enabled.
+
+Windows helper integrations are also capability-aware. If PowerShell or host support is unavailable, the dashboard, settings, and workspace-picker routes expose an explicit unsupported state instead of throwing a helper-launch error into the operator flow.
+
+Startup no longer silently drains provider-backed graph work inline by default. In `background_preferred`, restart reconciliation restores graph state and queues ready work, but a worker must execute provider-backed planning nodes.
 
 ## Remaining Limits
 

@@ -132,6 +132,14 @@ def verify_working_tree(root: Path, *, include_dist: bool = False) -> list[str]:
     return findings
 
 
+def validate_source_tree(root: Path, *, mode: str = "release") -> list[str]:
+    findings = verify_working_tree(root, include_dist=mode == "handoff")
+    if findings:
+        joined = ", ".join(findings)
+        raise ValueError(f"Working tree still contains ignored local artifacts: {joined}")
+    return findings
+
+
 def build_archive(
     root: Path,
     *,
@@ -274,6 +282,11 @@ def main() -> None:
         help="Verify an existing archive path instead of creating a new one.",
     )
     parser.add_argument(
+        "--validate-source-only",
+        action="store_true",
+        help="Validate the current source tree for the selected artifact mode and exit without building an archive.",
+    )
+    parser.add_argument(
         "--ci",
         action="store_true",
         help="CI-oriented mode: clean dist, verify working tree artifacts, then build and verify the release archive.",
@@ -297,10 +310,13 @@ def main() -> None:
     if args.clean:
         clean_dist()
     if args.verify_working_tree or verify_working_tree_by_default:
-        findings = verify_working_tree(ROOT_DIR, include_dist=args.mode == "handoff")
-        if findings:
-            joined = ", ".join(findings)
-            raise SystemExit(f"Working tree still contains ignored local artifacts: {joined}")
+        try:
+            validate_source_tree(ROOT_DIR, mode=args.mode)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    if args.validate_source_only:
+        print(f"Validated {args.mode} source tree preflight.")
+        return
     if args.mode == "handoff":
         result = build_handoff_archive(ROOT_DIR, version=args.version)
     else:

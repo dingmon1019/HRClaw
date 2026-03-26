@@ -357,6 +357,13 @@
                 <div class="panel">
                     <h3>Worker Task Control</h3>
                     <p class="small muted">Manage the current-user Windows Scheduled Task used for background worker execution without leaving the operator console.</p>
+                    <p class="small muted">
+                        {% if windows_helper_status.supported %}
+                        Windows helper support is available on this host.
+                        {% else %}
+                        {{ windows_helper_status.reason }}
+                        {% endif %}
+                    </p>
                     <form method="post" action="/settings/windows/worker-task" class="stack form-grid mt-16">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                         <div class="grid three">
@@ -384,11 +391,11 @@
                             </label>
                         </div>
                         <div class="actions">
-                            <button type="submit" class="button ghost" name="action" value="install">Install Task</button>
-                            <button type="submit" class="button ghost" name="action" value="start">Start Task</button>
-                            <button type="submit" class="button ghost" name="action" value="stop">Stop Task</button>
-                            <button type="submit" class="button ghost" name="action" value="status">Refresh Status</button>
-                            <button type="submit" class="button danger" name="action" value="remove">Remove Task</button>
+                            <button type="submit" class="button ghost" name="action" value="install" {% if not windows_helper_status.supported %}disabled{% endif %}>Install Task</button>
+                            <button type="submit" class="button ghost" name="action" value="start" {% if not windows_helper_status.supported %}disabled{% endif %}>Start Task</button>
+                            <button type="submit" class="button ghost" name="action" value="stop" {% if not windows_helper_status.supported %}disabled{% endif %}>Stop Task</button>
+                            <button type="submit" class="button ghost" name="action" value="status" {% if not windows_helper_status.supported %}disabled{% endif %}>Refresh Status</button>
+                            <button type="submit" class="button danger" name="action" value="remove" {% if not windows_helper_status.supported %}disabled{% endif %}>Remove Task</button>
                         </div>
                     </form>
                     {% if worker_task_result %}

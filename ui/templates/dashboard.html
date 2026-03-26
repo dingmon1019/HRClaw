@@ -138,6 +138,12 @@
                 <span>Next Run</span>
                 <strong>{{ worker_task_status.NextRunTime }}</strong>
             </div>
+            {% if worker_task_status.Reason %}
+            <div class="metric-row">
+                <span>Helper Support</span>
+                <strong>{{ worker_task_status.Reason }}</strong>
+            </div>
+            {% endif %}
             {% endif %}
         </div>
         <p class="small muted mt-16">Scratch work stays under the agent work root. Promote anything into the shared workspace only through an approved filesystem copy or move action.</p>
@@ -263,7 +269,7 @@
             <div class="list-item">
                 <strong><a href="/runs/{{ summary.run_id }}">{{ summary.objective }}</a></strong>
                 <p>{{ summary.summary_text }}</p>
-                <small>{{ summary.created_at }} via {{ summary.provider_name }}</small>
+                <small>{{ summary.created_at }} via {{ summary.provider_name }} / at-rest {{ summary.summary_storage_mode or "direct" }}</small>
             </div>
             {% else %}
             <p class="muted">No summaries yet.</p>

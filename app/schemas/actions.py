@@ -159,6 +159,21 @@ class ConnectorRunRecord(BaseModel):
     created_at: str
 
 
+class ArtifactEventRecord(BaseModel):
+    id: str
+    run_id: str
+    proposal_id: str | None = None
+    agent_role: str
+    context_namespace: str | None = None
+    event_type: str
+    artifact_path: str | None = None
+    source_path: str | None = None
+    destination_path: str | None = None
+    status: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
 class SummaryRecord(BaseModel):
     id: str
     run_id: str
@@ -169,13 +184,26 @@ class SummaryRecord(BaseModel):
     data_classification: DataClassification = DataClassification.LOCAL_ONLY
     lineage: dict[str, Any] = Field(default_factory=dict)
     outbound_summary_text: str | None = None
+    summary_storage_mode: str | None = None
+    outbound_storage_mode: str | None = None
     created_at: str
+
+
+class PlanningStatus(str, Enum):
+    ACCEPTED = "accepted"
+    PLANNING_QUEUED = "planning_queued"
+    PLANNING_RUNNING = "planning_running"
+    PLANNING_COMPLETED = "planning_completed"
+    PLANNING_FAILED = "planning_failed"
 
 
 class AgentRunResult(BaseModel):
     run_id: str
-    summary: SummaryRecord
-    proposals: list[ProposalRecord]
+    planning_status: PlanningStatus
+    graph_status: str
+    message: str
+    summary: SummaryRecord | None = None
+    proposals: list[ProposalRecord] = Field(default_factory=list)
 
 
 class ExecutionJobStatus(str, Enum):

@@ -4,6 +4,11 @@ import base64
 from pathlib import Path
 
 from app.config.settings import AppSettings
+from app.core.errors import (
+    FailClosedStorageRefusalError,
+    InsecureSecretStorageRefusalError,
+    ProtectedBlobIntegrityError,
+)
 from app.core.utils import ensure_parent_dir, new_id, random_token, sha256_hex
 
 try:  # pragma: no cover - exercised on Windows hosts
@@ -61,7 +66,7 @@ class ProtectedStorageService:
         blob_path = self.base_settings.resolved_protected_blob_dir / f"{blob_id}.bin"
         text = self._unprotect(blob_path.read_bytes()).decode("utf-8")
         if expected_digest and sha256_hex(text) != expected_digest:
-            raise ValueError(f"Protected blob digest mismatch for {blob_id}.")
+            raise ProtectedBlobIntegrityError(f"Protected blob digest mismatch for {blob_id}.")
         return text
 
     @property
@@ -116,7 +121,7 @@ class ProtectedStorageService:
             return
         if self.base_settings.allow_insecure_local_storage:
             return
-        raise ValueError(
+        raise FailClosedStorageRefusalError(
             "Strong local protection is required to store "
             f"{classification} data for {purpose}. Enable DPAPI or explicitly opt into insecure local storage."
         )
@@ -124,7 +129,7 @@ class ProtectedStorageService:
     def _ensure_secret_storage_allowed(self, purpose: str) -> None:
         if self.can_persist_secrets:
             return
-        raise ValueError(
+        raise FailClosedStorageRefusalError(
             "Strong local protection is required to store "
             f"{purpose}. Provide a runtime secret through the environment, enable DPAPI, "
             "or explicitly opt into insecure local storage for development-only use."
@@ -135,7 +140,7 @@ class ProtectedStorageService:
             return
         if self.base_settings.allow_insecure_local_storage:
             return
-        raise ValueError(
+        raise InsecureSecretStorageRefusalError(
             f"{purpose} is stored with unprotected local fallback. Enable DPAPI or explicitly allow insecure local storage before using it."
         )
 

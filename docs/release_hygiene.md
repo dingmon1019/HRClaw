@@ -54,6 +54,12 @@ Safe collaborator handoff uses a separate artifact mode:
 .\scripts\export-handoff.ps1 -Version handoff -Clean
 ```
 
+Validate a handoff source tree without building an archive:
+
+```powershell
+.\scripts\validate-handoff.ps1
+```
+
 Handoff bundles exclude the same forbidden runtime artifacts as release zips and also fail preflight when stale `dist/` outputs are still present in the working tree.
 
 Existing archives can be re-verified:

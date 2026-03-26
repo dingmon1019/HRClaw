@@ -19,10 +19,12 @@ from app.security.protected_storage import ProtectedStorageService
 from app.security.rate_limit import RateLimiter
 from app.security.windows_credential_store import WindowsCredentialStore
 from app.services.auth_service import AuthService
+from app.services.artifact_lineage_service import ArtifactLineageService
 from app.services.agent_workspace_service import AgentWorkspaceService
 from app.services.cli_token_service import CliTokenService
 from app.services.data_governance_service import DataGovernanceService
 from app.services.execution_queue_service import ExecutionQueueService
+from app.services.graph_node_queue_service import GraphNodeQueueService
 from app.services.history_service import HistoryService
 from app.services.proposal_service import ProposalService
 from app.services.proposal_snapshot_service import ProposalSnapshotService
@@ -51,6 +53,7 @@ class AppContainer:
         self.admin_token_service = AdminTokenService(self.database, self.auth_service, self.base_settings)
         self.data_governance_service = DataGovernanceService(self.protected_storage)
         self.agent_workspace_service = AgentWorkspaceService(self.base_settings)
+        self.artifact_lineage_service = ArtifactLineageService(self.database, self.base_settings)
         self.cli_token_service = CliTokenService(self.database, self.auth_service, self.base_settings)
         self.rate_limiter = RateLimiter()
         self.history_service = HistoryService(self.database)
@@ -73,12 +76,14 @@ class AppContainer:
             self.data_governance_service,
         )
         self.execution_queue_service = ExecutionQueueService(self.database)
-        self.summary_service = SummaryService(self.database)
+        self.graph_node_queue_service = GraphNodeQueueService(self.database)
+        self.summary_service = SummaryService(self.database, self.protected_storage)
         self.policy_engine = PolicyEngine(self.base_settings, self.settings_service)
         self.graph_runtime = GraphRuntimeService(
             self.database,
             self.proposal_service,
             self.execution_queue_service,
+            self.graph_node_queue_service,
             self.agent_service,
         )
 
@@ -104,7 +109,10 @@ class AppContainer:
             agent_service=self.agent_service,
             data_governance_service=self.data_governance_service,
             agent_workspace_service=self.agent_workspace_service,
+            artifact_lineage_service=self.artifact_lineage_service,
         )
+        self.planner.attach_graph_runtime(self.graph_runtime)
+        self.graph_runtime.attach_planner(self.planner)
         self.execution_boundary_runner = ConstrainedExecutionRunner(self.base_settings)
         self.executor = ExecutionDispatcher(
             connector_registry=self.connector_registry,
@@ -116,11 +124,13 @@ class AppContainer:
             agent_service=self.agent_service,
             data_governance_service=self.data_governance_service,
             boundary_runner=self.execution_boundary_runner,
+            artifact_lineage_service=self.artifact_lineage_service,
         )
         self.worker = ExecutionWorker(
             worker_id="local-worker",
             base_settings=self.base_settings,
             queue_service=self.execution_queue_service,
+            graph_node_queue_service=self.graph_node_queue_service,
             proposal_service=self.proposal_service,
             dispatcher=self.executor,
             audit_service=self.audit_service,
@@ -137,3 +147,4 @@ class AppContainer:
             graph_runtime=self.graph_runtime,
         )
         self.graph_runtime.reconcile_all()
+        self.graph_runtime.resume_all()
